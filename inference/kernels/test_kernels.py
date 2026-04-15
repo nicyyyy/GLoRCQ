@@ -92,7 +92,7 @@ def run_test(name, B, N, K, with_lora=False, tol=0.01):
                                   lora_out if lora_out.numel() > 0 else None)
 
     # CUDA kernel
-    from glorcq.inference.kernels._turbo_matmul_cuda import turbo_dequant_matmul
+    from _turbo_matmul_cuda import turbo_dequant_matmul
     out = turbo_dequant_matmul(x_rot, packed, norms, centroids, lora_out)
     torch.cuda.synchronize()
 
@@ -127,7 +127,7 @@ def main():
         sys.exit(0)
 
     try:
-        from glorcq.inference.kernels._turbo_matmul_cuda import turbo_dequant_matmul
+        from _turbo_matmul_cuda import turbo_dequant_matmul
     except ImportError as e:
         print(f"Failed to import CUDA extension: {e}")
         print("Please build first: cd glorcq/inference/kernels && pip install -e .")

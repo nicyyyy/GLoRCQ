@@ -50,7 +50,7 @@ def main():
 
     # Load model
     if args.real_quant:
-        from glorcq.inference.model_builder import load_glorcq_model
+        from inference.model_builder import load_glorcq_model
         model = load_glorcq_model(args.model_path, device=args.device)
     else:
         from transformers import AutoModelForCausalLM, AutoConfig
@@ -77,7 +77,7 @@ def main():
     )
 
     # Run benchmark
-    from glorcq.inference.graph_wrapper import run_speed_benchmark
+    from inference.graph_wrapper import run_speed_benchmark
     results = run_speed_benchmark(
         model, tokenizer,
         max_batch_size=args.batch_size,

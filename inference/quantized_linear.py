@@ -12,14 +12,14 @@ import torch.nn as nn
 
 # Try to import fused CUDA kernel for TurboQuant
 try:
-    from glorcq.inference.kernels import turbo_dequant_matmul_fused, is_cuda_available
+    from inference.kernels import turbo_dequant_matmul_fused, is_cuda_available
     _HAS_FUSED_KERNEL = is_cuda_available()
 except ImportError:
     _HAS_FUSED_KERNEL = False
 
 # Try to import fused CUDA kernel for GPTQ
 try:
-    from glorcq.inference.kernels import gptq_dequant_matmul_fused, is_gptq_cuda_available
+    from inference.kernels import gptq_dequant_matmul_fused, is_gptq_cuda_available
     _HAS_GPTQ_FUSED_KERNEL = is_gptq_cuda_available()
 except ImportError:
     _HAS_GPTQ_FUSED_KERNEL = False

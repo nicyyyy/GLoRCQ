@@ -2,7 +2,7 @@
 # End-to-end test: quantize → save → evaluate PPL → benchmark speed
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "$SCRIPT_DIR/../.."
+cd "$SCRIPT_DIR/.."
 
 # export HF_HOME=/nvme1/yqy/huggingface
 export HF_HOME=/nvme1/yqy/huggingface
@@ -23,19 +23,19 @@ N_ITER=1
 save_dir="./output"
 tag="${MODEL}-glorcq-${QBIT}bit-rank${RANK}"
 
-mkdir -p ./glorcq/logs
+mkdir -p ./logs
 
 echo "=== Step 1: Fake-quant quantization ==="
-uv run python glorcq/run_quantize.py \
+uv run python run_quantize.py \
     --model_path $MODEL \
     --output_path "${save_dir}/${tag}-fakequant" \
     --qbit $QBIT --rank $RANK --G_moe $G_moe \
     --nsamples $NSAMPLES --n_iter $N_ITER --w_clip \
     --hessian_svd --use_turboquant --search_act_alpha \
-     2>&1 | tee "./glorcq/logs/e2e_${QBIT}bit_rank${RANK}.log"
+     2>&1 | tee "./logs/e2e_${QBIT}bit_rank${RANK}.log"
 
 echo "=== Step 2: Real-quant quantization ==="
-uv run python glorcq/run_quantize.py \
+uv run python run_quantize.py \
     --model_path $MODEL \
     --output_path "${save_dir}/${tag}-realquant" \
     --qbit $QBIT --rank $RANK --G_moe $G_moe \

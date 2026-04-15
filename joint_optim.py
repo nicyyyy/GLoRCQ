@@ -159,7 +159,16 @@ class GPTQJoint:
                 eigvals = eigvals.clamp(min=max(damp.item(), 1e-6))
                 H_eq_d = eigvecs @ torch.diag(eigvals) @ eigvecs.T
                 H_chol = torch.linalg.cholesky(H_eq_d)
-            self.Hinv = torch.linalg.cholesky(torch.cholesky_inverse(H_chol), upper=True)
+            Hinv_raw = torch.cholesky_inverse(H_chol)
+            Hinv_raw = (Hinv_raw + Hinv_raw.T) / 2
+            Hinv_raw.diagonal().clamp_(min=1e-10)
+            try:
+                self.Hinv = torch.linalg.cholesky(Hinv_raw, upper=True)
+            except torch._C._LinAlgError:
+                eigvals, eigvecs = torch.linalg.eigh(Hinv_raw)
+                eigvals = eigvals.clamp(min=1e-10)
+                Hinv_raw = eigvecs @ torch.diag(eigvals) @ eigvecs.T
+                self.Hinv = torch.linalg.cholesky(Hinv_raw, upper=True)
 
         # ── Cache L_lower for hessian_weighted_svd (based on H_eq) ────────────
         # Skip when using TurboQuant (no Hessian-weighted SVD needed)
@@ -644,8 +653,9 @@ def quantize_joint(model, layers, dataloader, args, use_turboquant: bool = False
         do_search = getattr(args, 'search_act_alpha', False)
 
         for name, g in gptq.items():
-            if use_turboquant and _expert_idx_from_name(name) >= 0:
-                # MoE: TurboQuant, no act_scale
+            eidx = _expert_idx_from_name(name)
+            if use_turboquant and eidx != -1:
+                # MoE expert or shared expert: TurboQuant, no act_scale
                 g.prepare_hessian(percdamp=args.percdamp, act_alpha=default_alpha,
                                   use_turboquant=True)
                 continue
@@ -671,7 +681,7 @@ def quantize_joint(model, layers, dataloader, args, use_turboquant: bool = False
             # HYBRID: GPTQ(attn) + TurboQuant(MoE)
             # ==============================================================
             attn_names = [n for n in gptq if _expert_idx_from_name(n) == -1]
-            moe_names  = [n for n in gptq if _expert_idx_from_name(n) >= 0]
+            moe_names  = [n for n in gptq if _expert_idx_from_name(n) != -1]
 
             # Phase A: GPTQ alternating for attention
             lora_state_attn = {name: (None, None, None) for name in attn_names}

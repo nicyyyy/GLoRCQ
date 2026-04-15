@@ -1,11 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "$SCRIPT_DIR/../.."
+cd "$SCRIPT_DIR/.."
 
 if [ ! -d ".venv" ]; then
-    uv venv --python /nvme3/miniconda3/bin/python .venv
-    uv pip install -r requirements.txt
+    bash scripts/setup_env.sh
 fi
 
 export HF_HOME=/nvme1/yqy/huggingface
@@ -23,10 +22,10 @@ n_iter=10
 G_moe=128
 G_attn=4
 
-mkdir -p ./glorcq/logs
+mkdir -p ./logs
 
 CUDA_VISIBLE_DEVICES=1 \
-uv run python glorcq/run_quantize.py \
+uv run python run_quantize.py \
     --model_path "$model_path" \
     --output_path "$save_dir/${model_path}-glorcq-${qbit}bit-rank${rank}-hybrid" \
     --qbit $qbit \
@@ -39,10 +38,9 @@ uv run python glorcq/run_quantize.py \
     --hessian_svd \
     --use_turboquant \
     --search_act_alpha \
-    2>&1 | tee ./glorcq/logs/glorcq_${qbit}bit_rank${rank}_hybrid.log
+    2>&1 | tee ./logs/glorcq_${qbit}bit_rank${rank}_hybrid.log
 
 CUDA_VISIBLE_DEVICES=1 \
-uv run python eval/evaluation.py \
-    "$save_dir/${model_path}-glorcq-${qbit}bit-rank${rank}-hybrid" \
-    "wikitext2" \
-    2>&1 | tee -a ./glorcq/logs/glorcq_${qbit}bit_rank${rank}_hybrid.log
+uv run python evaluate/eval_ppl.py \
+    --model_path "$save_dir/${model_path}-glorcq-${qbit}bit-rank${rank}-hybrid" \
+    2>&1 | tee -a ./logs/glorcq_${qbit}bit_rank${rank}_hybrid.log

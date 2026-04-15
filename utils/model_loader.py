@@ -36,7 +36,7 @@ def load_model_and_tokenizer(model_path, device="cuda:0", real_quant=False):
 
 def _load_real_quant(model_path, device):
     """Load packed GLoRCQ real-quantized model."""
-    from glorcq.inference.model_builder import load_glorcq_model
+    from inference.model_builder import load_glorcq_model
     return load_glorcq_model(model_path, device=device)
 
 

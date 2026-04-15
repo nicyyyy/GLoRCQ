@@ -111,7 +111,7 @@ def run_test(name, B, N, K, groupsize=128, sym=False, bits=2,
         lora_out if lora_out.numel() > 0 else None)
 
     # CUDA kernel
-    from glorcq.inference.kernels._gptq_matmul_cuda import gptq_dequant_matmul
+    from _gptq_matmul_cuda import gptq_dequant_matmul
     out = gptq_dequant_matmul(
         x.contiguous(), qweight_i8.contiguous(),
         scales.contiguous(), zeros.contiguous(),
@@ -148,7 +148,7 @@ def main():
         sys.exit(0)
 
     try:
-        from glorcq.inference.kernels._gptq_matmul_cuda import gptq_dequant_matmul
+        from _gptq_matmul_cuda import gptq_dequant_matmul
     except ImportError as e:
         print(f"Failed to import CUDA extension: {e}")
         print("Please build first: cd glorcq/inference/kernels && pip install -e .")
@@ -205,7 +205,7 @@ def main():
         x, qw, sc, zr, gs, sym, lora = make_gptq_test_data(
             1, 14336, 4096, sym=False)
 
-        from glorcq.inference.kernels._gptq_matmul_cuda import gptq_dequant_matmul
+        from _gptq_matmul_cuda import gptq_dequant_matmul
 
         # Warmup
         for _ in range(10):
