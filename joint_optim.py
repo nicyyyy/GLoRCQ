@@ -732,7 +732,7 @@ def quantize_joint(model, layers, dataloader, args, use_turboquant: bool = False
                 W_lora_sym = U_sym.float() @ (S_sym.unsqueeze(1) * V_sym.T.float())
                 full[name].weight.data = (Q_W_final.to(DEV).float() + W_lora_sym).half()
 
-                if expert_idx >= 0 or expert_idx == -1:
+                if expert_idx != -3:
                     record = {
                         "layer":        layer_idx,
                         "expert":       expert_idx,
@@ -778,7 +778,7 @@ def quantize_joint(model, layers, dataloader, args, use_turboquant: bool = False
                 W_lora = U.float() @ (S.unsqueeze(1) * V.T.float())
                 full[name].weight.data = (Q_W.to(DEV).float() + W_lora).half()
 
-                if expert_idx >= 0 or expert_idx == -1:
+                if expert_idx != -3:
                     record = {
                         "layer":        layer_idx,
                         "expert":       expert_idx,
@@ -874,7 +874,7 @@ def quantize_joint(model, layers, dataloader, args, use_turboquant: bool = False
                 W_lora_sym = U_sym.float() @ (S_sym.unsqueeze(1) * V_sym.T.float())
                 full[name].weight.data = (Q_W_final.to(DEV).float() + W_lora_sym).half()
 
-                if expert_idx >= 0 or expert_idx == -1:
+                if expert_idx != -3:
                     record = {
                         "layer":        layer_idx,
                         "expert":       expert_idx,
