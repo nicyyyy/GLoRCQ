@@ -1,0 +1,40 @@
+[project]
+name = "glorcq"
+version = "0.1.0"
+description = "GLoRCQ: Global shared Low-Rank Compensation for Quantization of MoE models"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.5.0",
+    "transformers>=4.45.0",
+    "accelerate>=1.8.0",
+    "datasets>=2.20.0",
+    "peft>=0.10.0",
+    "lm-eval>=0.4.5",
+    "scikit-learn>=1.5.0",
+    "matplotlib",
+    "numpy",
+    "tqdm",
+]
+
+[project.optional-dependencies]
+turboquant = ["scipy"]
+
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = []
+
+[tool.uv]
+dev-dependencies = []
+
+# Force torch to install from PyTorch CUDA 12.4 index
+[[tool.uv.index]]
+name = "pytorch-cu124"
+url = "https://download.pytorch.org/whl/cu124"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu124" }

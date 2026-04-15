@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# First-time environment setup for GLoRCQ.
+#
+# Usage:
+#   cd glorcq/
+#   bash scripts/setup_env.sh
+#
+# What it does:
+#   1. Creates a uv virtualenv (.venv)
+#   2. Installs Python dependencies from pyproject.toml
+#   3. Installs TurboQuant (thirdpart dependency)
+#   4. Builds CUDA inference kernels
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+GLORCQ_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+cd "$GLORCQ_ROOT"
+
+echo "============================================================"
+echo "  GLoRCQ Environment Setup"
+echo "  Root: $GLORCQ_ROOT"
+echo "============================================================"
+
+# 1. Create virtualenv
+if [ ! -d ".venv" ]; then
+    echo "[1/4] Creating virtualenv ..."
+    uv venv .venv
+else
+    echo "[1/4] Virtualenv already exists, skipping."
+fi
+
+# 2. Install Python dependencies
+echo "[2/4] Installing Python dependencies ..."
+uv pip install -e ".[turboquant]"
+
+# 3. Install TurboQuant if thirdpart/ exists
+TURBOQUANT_DIR="$GLORCQ_ROOT/thirdpart/turboquant"
+if [ -d "$TURBOQUANT_DIR" ]; then
+    echo "[3/4] Installing TurboQuant from thirdpart/ ..."
+    uv pip install -e "$TURBOQUANT_DIR"
+else
+    echo "[3/4] thirdpart/turboquant not found, skipping."
+    echo "       (TurboQuant is optional; only needed for --use_turboquant mode)"
+fi
+
+# 4. Build CUDA kernels
+echo "[4/4] Building CUDA inference kernels ..."
+bash "$SCRIPT_DIR/build_kernels.sh"
+
+echo ""
+echo "============================================================"
+echo "  Setup complete!"
+echo "  Activate with: source .venv/bin/activate"
+echo "  Or use:        uv run python ..."
+echo "============================================================"
