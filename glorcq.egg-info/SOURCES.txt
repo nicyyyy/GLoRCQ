@@ -1,0 +1,7 @@
+README.md
+pyproject.toml
+glorcq.egg-info/PKG-INFO
+glorcq.egg-info/SOURCES.txt
+glorcq.egg-info/dependency_links.txt
+glorcq.egg-info/requires.txt
+glorcq.egg-info/top_level.txt

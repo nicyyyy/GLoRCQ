@@ -69,10 +69,13 @@ __global__ void turbo_dequant_gemv_2bit_kernel(
 
     // Process in chunks of 32*4 = 128 bytes = 512 indices at a time.
     // Each lane reads 4 consecutive bytes (uint32) per iteration — coalesced.
+    // For K not divisible by 512, we use a smaller final iteration count to
+    // avoid reading beyond packed_cols, then fall through to the scalar
+    // remainder loop for any leftover elements.
     const int total_uint32s = packed_cols / 4;  // (K/4) / 4 = K/16
-    const int iters = total_uint32s / 32;
+    const int full_iters = total_uint32s / 32;  // full iterations where all 32 lanes are valid
 
-    for (int it = 0; it < iters; it++) {
+    for (int it = 0; it < full_iters; it++) {
         int byte_offset = (it * 32 + lane) * 4;
         uint32_t packed4 = *reinterpret_cast<const uint32_t*>(packed_row + byte_offset);
 
@@ -90,10 +93,35 @@ __global__ void turbo_dequant_gemv_2bit_kernel(
         }
     }
 
-    // Handle remaining elements (K not divisible by 512)
-    int processed = iters * 512;
-    // Distribute remainder across lanes
-    for (int k = processed + lane; k < K; k += 32) {
+    // Partial iteration: remaining uint32s that don't fill a full warp-width.
+    // Each lane checks bounds before the uint32 read to avoid OOB access.
+    {
+        int remaining_u32 = total_uint32s - full_iters * 32;
+        if (remaining_u32 > 0 && lane < remaining_u32) {
+            int byte_offset = (full_iters * 32 + lane) * 4;
+            uint32_t packed4 = *reinterpret_cast<const uint32_t*>(packed_row + byte_offset);
+
+            int elem_base = byte_offset * 4;
+
+            #pragma unroll
+            for (int bi = 0; bi < 4; bi++) {
+                uint8_t byte_val = (packed4 >> (bi * 8)) & 0xFF;
+                #pragma unroll
+                for (int pi = 0; pi < 4; pi++) {
+                    int idx = (byte_val >> (pi * 2)) & 3;
+                    int k = elem_base + bi * 4 + pi;
+                    if (k < K) {
+                        acc += centroid_lookup(c0, c1, c2, c3, idx) * x_row[k];
+                    }
+                }
+            }
+        }
+    }
+
+    // Handle remaining elements not covered by uint32 reads.
+    // This covers any tail bytes where packed_cols is not divisible by 4.
+    int processed_by_u32 = total_uint32s * 16;  // elements covered by all uint32 reads
+    for (int k = processed_by_u32 + lane; k < K; k += 32) {
         int byte_idx = k / 4;
         int pos = k % 4;
         int idx = (packed_row[byte_idx] >> (pos * 2)) & 3;
@@ -278,6 +306,13 @@ torch::Tensor turbo_dequant_matmul_cuda(
     }
 
     auto y = torch::zeros({B, N}, x_rot.options());
+
+    // Early return for empty batch (B=0) or empty output (N=0).
+    // Launching CUDA kernels with a zero grid dimension is illegal and
+    // corrupts the CUDA context, causing later operations to fail.
+    if (B == 0 || N == 0) {
+        return y;
+    }
 
     // Copy centroids to host (only 4 floats, negligible overhead)
     float c0, c1, c2, c3;

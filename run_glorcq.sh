@@ -19,7 +19,7 @@ model_path="mistralai/Mixtral-8x7B-v0.1"
 save_dir="./output"
 qbit=2
 rank=64
-n_iter=10
+n_iter=3
 G_moe=128
 G_attn=4
 

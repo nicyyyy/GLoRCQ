@@ -42,15 +42,26 @@ _ATTN_WTYPES = {"q_proj", "k_proj", "v_proj", "o_proj"}
 _MOE_WTYPES  = {"gate_proj", "up_proj", "down_proj"}
 _ALL_WTYPES  = _ATTN_WTYPES | _MOE_WTYPES
 
+# Mixtral uses w1/w2/w3 instead of gate_proj/up_proj/down_proj.
+# Map them to canonical names so all downstream code works unchanged.
+_MIXTRAL_WTYPE_MAP = {"w1": "gate_proj", "w3": "up_proj", "w2": "down_proj"}
+
 
 # ---------------------------------------------------------------------------
 # Helpers: layer-name parsing
 # ---------------------------------------------------------------------------
 def _wtype_from_name(name: str):
-    """Return the weight type suffix if name ends with a tracked type, else None."""
+    """Return the canonical weight type suffix, else None.
+
+    Handles both Qwen (gate_proj/up_proj/down_proj) and Mixtral (w1/w2/w3).
+    """
     for wt in _ALL_WTYPES:
         if name == wt or name.endswith("." + wt):
             return wt
+    # Mixtral aliases
+    suffix = name.rsplit(".", 1)[-1] if "." in name else name
+    if suffix in _MIXTRAL_WTYPE_MAP:
+        return _MIXTRAL_WTYPE_MAP[suffix]
     return None
 
 

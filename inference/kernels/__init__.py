@@ -2,10 +2,15 @@
 Python wrappers for fused dequant+matmul CUDA kernels.
 
 Tries to import the compiled CUDA extensions; falls back to pure-PyTorch
-implementations if not available.
+implementations if not available.  If a CUDA kernel fails at runtime (e.g.
+unsupported dimensions), the wrapper catches the error, logs a diagnostic
+warning, and transparently retries with the pure-PyTorch path.
 """
 
+import logging
 import torch
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # TurboQuant CUDA extension
@@ -37,6 +42,52 @@ except ImportError:
 def is_gptq_cuda_available():
     """Check whether the compiled GPTQ CUDA kernel is available."""
     return _gptq_cuda_ext is not None
+
+
+# ---------------------------------------------------------------------------
+# torch.compile custom op wrappers (allows Dynamo to trace through CUDA calls)
+# ---------------------------------------------------------------------------
+if _cuda_ext is not None:
+    @torch.library.custom_op("glorcq::turbo_dequant_matmul", mutates_args=())
+    def _turbo_dequant_matmul_op(
+        x_rot: torch.Tensor,
+        packed_indices: torch.Tensor,
+        norms: torch.Tensor,
+        centroids: torch.Tensor,
+        lora_out: torch.Tensor,
+    ) -> torch.Tensor:
+        return _cuda_ext.turbo_dequant_matmul(
+            x_rot, packed_indices, norms, centroids, lora_out,
+        )
+
+    @_turbo_dequant_matmul_op.register_fake
+    def _turbo_fake(x_rot, packed_indices, norms, centroids, lora_out):
+        return torch.empty(
+            x_rot.shape[0], packed_indices.shape[0],
+            dtype=torch.float32, device=x_rot.device,
+        )
+
+if _gptq_cuda_ext is not None:
+    @torch.library.custom_op("glorcq::gptq_dequant_matmul", mutates_args=())
+    def _gptq_dequant_matmul_op(
+        x: torch.Tensor,
+        qweight_i8: torch.Tensor,
+        scales: torch.Tensor,
+        zeros: torch.Tensor,
+        groupsize: int,
+        sym: bool,
+        lora_out: torch.Tensor,
+    ) -> torch.Tensor:
+        return _gptq_cuda_ext.gptq_dequant_matmul(
+            x, qweight_i8, scales, zeros, groupsize, sym, lora_out,
+        )
+
+    @_gptq_dequant_matmul_op.register_fake
+    def _gptq_fake(x, qweight_i8, scales, zeros, groupsize, sym, lora_out):
+        return torch.empty(
+            x.shape[0], qweight_i8.shape[0],
+            dtype=torch.float32, device=x.device,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -147,13 +198,23 @@ def turbo_dequant_matmul_fused(x, packed_indices, norms, Pi, centroids,
     # 3. CUDA kernel or fallback
     K = x_rot.shape[1]
     if _cuda_ext is not None and bits == 2:
-        y = _cuda_ext.turbo_dequant_matmul(
-            x_rot.contiguous(),
-            packed_indices.contiguous(),
-            norms.contiguous(),
-            centroids.contiguous(),
-            lora_out.contiguous(),
-        )
+        try:
+            y = _turbo_dequant_matmul_op(
+                x_rot.contiguous(),
+                packed_indices.contiguous(),
+                norms.contiguous(),
+                centroids.contiguous(),
+                lora_out.contiguous(),
+            )
+        except RuntimeError as e:
+            B = x_rot.shape[0]
+            N = packed_indices.shape[0]
+            logger.warning(
+                "TurboQuant CUDA kernel failed (B=%d, K=%d, N=%d): %s  "
+                "— falling back to PyTorch", B, K, N, e)
+            y = _pytorch_fallback(x_rot, packed_indices, norms, centroids, K)
+            if lora_out.numel() > 0:
+                y += lora_out
     else:
         y = _pytorch_fallback(x_rot, packed_indices, norms, centroids, K)
         if lora_out.numel() > 0:
@@ -200,15 +261,27 @@ def gptq_dequant_matmul_fused(x, qweight_int, scales, zeros,
 
     # 3. CUDA kernel or fallback
     if _gptq_cuda_ext is not None:
-        y = _gptq_cuda_ext.gptq_dequant_matmul(
-            x.float().contiguous(),
-            qweight_i8.contiguous(),
-            scales.contiguous(),
-            zeros.contiguous(),
-            groupsize,
-            sym,
-            lora_out.contiguous(),
-        )
+        try:
+            y = _gptq_dequant_matmul_op(
+                x.float().contiguous(),
+                qweight_i8.contiguous(),
+                scales.contiguous(),
+                zeros.contiguous(),
+                groupsize,
+                sym,
+                lora_out.contiguous(),
+            )
+        except RuntimeError as e:
+            B = x.shape[0]
+            K = x.shape[1]
+            N = qweight_i8.shape[0]
+            logger.warning(
+                "GPTQ CUDA kernel failed (B=%d, K=%d, N=%d, gs=%d): %s  "
+                "— falling back to PyTorch", B, K, N, groupsize, e)
+            y = _gptq_pytorch_fallback(
+                x.float(), qweight_i8, scales, zeros, groupsize, sym)
+            if lora_out.numel() > 0:
+                y += lora_out
     else:
         y = _gptq_pytorch_fallback(
             x.float(), qweight_i8, scales, zeros, groupsize, sym)

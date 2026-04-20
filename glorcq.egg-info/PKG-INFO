@@ -1,0 +1,205 @@
+Metadata-Version: 2.4
+Name: glorcq
+Version: 0.1.0
+Summary: GLoRCQ: Global shared Low-Rank Compensation for Quantization of MoE models
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+Requires-Dist: torch>=2.5.0
+Requires-Dist: transformers==4.45.2
+Requires-Dist: accelerate>=1.8.0
+Requires-Dist: datasets>=2.20.0
+Requires-Dist: peft>=0.10.0
+Requires-Dist: lm-eval>=0.4.5
+Requires-Dist: scikit-learn>=1.5.0
+Requires-Dist: matplotlib
+Requires-Dist: numpy
+Requires-Dist: tqdm
+Requires-Dist: SentencePiece
+Provides-Extra: turboquant
+Requires-Dist: scipy; extra == "turboquant"
+
+# GLoRCQ
+
+**G**lobal shared **Lo**w-**R**ank **C**ompensation for **Q**uantization
+
+GLoRCQ combines GPTQ quantization with LoRA residual compensation and cross-layer expert sharing on MoE models (Qwen1.5-MoE-A2.7B, Mixtral-8x7B). The core innovation is clustering similar experts across layers using Grassmannian manifold distance, then sharing their LoRA U matrices to reduce storage overhead.
+
+## Quick Start
+
+```bash
+# 1. Setup environment (creates .venv, installs deps, builds CUDA kernels)
+cd glorcq/
+bash scripts/setup_env.sh
+
+# 2. Run quantization
+uv run python run_quantize.py \
+    --model_path Qwen/Qwen1.5-MoE-A2.7B \
+    --output_path ./output/qwen-moe-2bit-rank64 \
+    --qbit 2 --w_clip --rank 64 \
+    --G_moe 128 --n_iter 10 \
+    --hessian_svd --use_turboquant --search_act_alpha
+
+# 3. Evaluate
+uv run python ../evaluate/eval_ppl.py --model_path ./output/qwen-moe-2bit-rank64
+```
+
+## Environment Setup
+
+### Prerequisites
+
+- Python >= 3.10
+- CUDA toolkit (for kernel compilation)
+- [uv](https://github.com/astral-sh/uv) package manager
+
+### Automated Setup
+
+```bash
+bash scripts/setup_env.sh
+```
+
+This will:
+1. Create a `.venv` virtualenv via `uv`
+2. Install all Python dependencies from `pyproject.toml`
+3. Install TurboQuant from `thirdpart/turboquant/` (if present)
+4. Compile CUDA inference kernels (GPTQ + TurboQuant fused matmul)
+
+### Manual Setup
+
+```bash
+# Create virtualenv
+uv venv .venv
+
+# Install dependencies
+uv pip install -e ".[turboquant]"
+
+# (Optional) Install TurboQuant
+uv pip install -e thirdpart/turboquant
+
+# Build CUDA kernels
+cd inference/kernels
+uv run python setup.py build_ext --inplace
+cd ../..
+```
+
+### CUDA Kernels
+
+The fused dequant+matmul kernels live in `inference/kernels/`. They support:
+- **GPTQ kernel**: int8 dequant + GEMV/GEMM with optional LoRA fusion
+- **TurboQuant kernel**: 2-bit packed dequant + GEMV/GEMM with optional LoRA fusion
+
+Target architectures: sm_80 (A100), sm_86 (3090), sm_89 (4090), sm_90 (H100/H20).
+
+To rebuild:
+```bash
+bash scripts/build_kernels.sh          # incremental build
+bash scripts/build_kernels.sh --clean  # clean rebuild
+```
+
+If CUDA kernels are not built, inference falls back to pure-PyTorch implementations automatically.
+
+## Project Structure
+
+```
+glorcq/
+├── run_quantize.py              # Pipeline entry point (Stages 1-5)
+├── joint_optim.py               # Stage 1: Joint GPTQ + Hessian-weighted LoRA
+├── cross_layer_share.py         # Stages 2-5: Clustering + shared U/V
+├── turbo_weight_quantizer.py    # TurboQuant 2-bit quantizer wrapper
+│
+├── quantizer/                   # Quantization primitives
+│   ├── quantizer.py             #   WeightQuantizer (MSE clipping, scale/zero)
+│   ├── quantizer_v.py           #   Vector quantizer variant
+│   ├── scalar_quant_utils_lora.py
+│   └── vector_quant_utils_lora.py
+│
+├── inference/                   # Real-quantized model inference
+│   ├── model_builder.py         #   load_glorcq_model() — load packed weights
+│   ├── quantized_linear.py      #   GLoRCQLinear layer (dequant + matmul + LoRA)
+│   ├── graph_wrapper.py         #   CUDA Graph acceleration for decode
+│   ├── eval_speed.py            #   Speed benchmark script
+│   └── kernels/                 #   Fused CUDA kernels
+│       ├── setup.py             #     Build script (CUDAExtension)
+│       ├── gptq_matmul.cu       #     GPTQ dequant+matmul kernel
+│       └── turbo_matmul.cu      #     TurboQuant dequant+matmul kernel
+│
+├── utils/                       # Shared utilities
+│   ├── model_loader.py          #   Unified model/tokenizer loader
+│   ├── moe_utils.py             #   Expert detection & layer info
+│   ├── get_calib_data.py        #   WikiText-2 / C4 calibration data
+│   └── ...
+│
+├── scripts/                     # Shell scripts
+│   ├── setup_env.sh             #   First-time environment setup
+│   ├── build_kernels.sh         #   Build CUDA kernels
+│   ├── run_glorcq.sh            #   Full quantization pipeline
+│   ├── run_e2e_test.sh          #   End-to-end test
+│   ├── run_eval_ppl.sh          #   PPL evaluation
+│   ├── run_eval_speed.sh        #   Speed benchmark
+│   └── run_eval_zeroshot.sh     #   Zero-shot benchmark
+│
+└── pyproject.toml               # Python project metadata & dependencies
+```
+
+## Pipeline
+
+### Quantization (5 Stages)
+
+| Stage | Function | Description |
+|-------|----------|-------------|
+| 1 | `quantize_joint()` | Per-layer alternating GPTQ + Hessian-weighted SVD |
+| 2 | `cluster_residuals()` | Grassmannian manifold clustering of expert residuals |
+| 3+4 | `compute_shared_and_reconstruct()` | Shared U computation + fake-quant reconstruction |
+| 5 | `compute_avg_bits()` | Bit-width statistics |
+
+### Key Arguments
+
+```
+--model_path          HuggingFace model name or local path
+--output_path         Output directory for quantized model
+--qbit                Weight quantization bits (2/3/4, default: 4)
+--rank                LoRA / SVD rank (default: 64)
+--G_moe               Cluster count for MoE experts (default: 128)
+--n_iter              Alternating optimization iterations (default: 3)
+--w_clip              Enable MSE clipping search
+--hessian_svd         Use Hessian-weighted SVD in Stage 3
+--use_turboquant      Hybrid: TurboQuant for MoE + GPTQ for attention
+--search_act_alpha    Per-module grid search for activation equalization
+--real_quant          Save packed int weights (for inference with CUDA kernels)
+```
+
+### Evaluation
+
+```bash
+# PPL (loads fake-quant fp16 model)
+uv run python evaluate/eval_ppl.py --model_path ./output/model
+
+# Speed benchmark (loads real-quant model, standard vs CUDA Graph)
+uv run python evaluate/eval_speed.py --model_path ./output/model
+
+# Zero-shot benchmark (loads fake-quant fp16 model, uses lm-eval-harness)
+uv run python evaluate/eval_zeroshot.py --model_path ./output/model
+```
+
+## Migration to Another Machine
+
+```bash
+# 1. Copy the project (thirdpart/turboquant is included inside glorcq/)
+scp -r glorcq/ user@remote:/path/to/glorcq/
+
+# 2. On the remote machine
+cd /path/to/glorcq/
+bash scripts/setup_env.sh
+
+# 3. Set HuggingFace cache (adjust to your paths)
+export HF_HOME=/path/to/huggingface_cache
+
+# 4. Run
+uv run python run_quantize.py --model_path ... --output_path ...
+```
+
+### Notes
+
+- CUDA kernels will be recompiled on the target machine (requires CUDA toolkit + PyTorch with CUDA support)
+- Pre-compiled `.so` files are Python-version and CUDA-version specific; do not copy them across different environments
+- The `--use_turboquant` flag requires `thirdpart/turboquant/` (bundled in the repo)
+- All shell scripts use `uv run` and auto-detect the `.venv` in the project root

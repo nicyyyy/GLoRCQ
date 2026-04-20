@@ -268,6 +268,13 @@ torch::Tensor gptq_dequant_matmul_cuda(
 
     auto y = torch::zeros({B, N}, x.options());  // (B, N) fp32
 
+    // Early return for empty batch (B=0) or empty output (N=0).
+    // Launching CUDA kernels with a zero grid dimension is illegal and
+    // corrupts the CUDA context, causing later operations to fail.
+    if (B == 0 || N == 0) {
+        return y;
+    }
+
     cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
 
     int sym_int = sym ? 1 : 0;

@@ -59,6 +59,13 @@ class GLoRCQGraphWrapper:
         self.graph = None
         self.graph_stream = torch.cuda.Stream()
 
+    def _set_moe_graph_mode(self, mode: bool):
+        """Toggle graph_mode on all GraphCompatibleMoeBlock modules."""
+        from .moe_block import GraphCompatibleMoeBlock
+        for module in self.model.modules():
+            if isinstance(module, GraphCompatibleMoeBlock):
+                module.graph_mode = mode
+
     def capture_graph(self):
         """
         Capture CUDA Graph for decode phase.
@@ -71,6 +78,7 @@ class GLoRCQGraphWrapper:
         print(f"[GLoRCQ Graph] Capturing CUDA Graph "
               f"(batch_size={self.max_batch_size}) ...")
         self.model.eval()
+        self._set_moe_graph_mode(True)
 
         # Step 0: Force memory allocation
         with torch.no_grad():
@@ -162,6 +170,7 @@ class GLoRCQGraphWrapper:
         output_ids = input_ids.clone()
 
         # Phase 1: Prefill (standard forward, no graph)
+        self._set_moe_graph_mode(False)
         self.static_cache.reset()
         cache_position = torch.arange(seq_len, device=self.device)
 
@@ -180,6 +189,7 @@ class GLoRCQGraphWrapper:
         prefill_end = time.time()
 
         # Phase 2: Decode (CUDA Graph)
+        self._set_moe_graph_mode(True)
         if self.graph is None:
             self.capture_graph()
 

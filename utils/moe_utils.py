@@ -11,14 +11,23 @@ def is_shared_expert(layer_name):
     return 'shared_expert' in layer_name
 
 
+def _has_experts_segment(layer_name):
+    """Check if name contains a '.experts.' segment (any MoE architecture).
+
+    Matches both Qwen-style ``mlp.experts.0.gate_proj`` and
+    Mixtral-style ``block_sparse_moe.experts.0.w1``.
+    """
+    return '.experts.' in layer_name or layer_name.startswith('experts.')
+
+
 def is_regular_expert(layer_name):
     """Check if layer is a regular expert."""
-    return ('mlp.experts' in layer_name) and not is_shared_expert(layer_name)
+    return _has_experts_segment(layer_name) and not is_shared_expert(layer_name)
 
 
 def extract_expert_info(layer_name):
     """Extract expert index and layer type from layer name."""
-    if 'mlp.experts' in layer_name:
+    if _has_experts_segment(layer_name):
         parts = layer_name.split('.')
         expert_idx_pos = parts.index('experts') + 1
         expert_idx = int(parts[expert_idx_pos])

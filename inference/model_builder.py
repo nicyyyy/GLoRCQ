@@ -12,6 +12,7 @@ import torch.nn as nn
 from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
 
 from .quantized_linear import GLoRCQLinear
+from .moe_block import GraphCompatibleMoeBlock
 
 # Ensure glorcq/ is importable
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -121,6 +122,23 @@ class RotationCache:
 
 
 # ---------------------------------------------------------------------------
+# MoE block replacement (CUDA Graph compatibility)
+# ---------------------------------------------------------------------------
+def _replace_moe_blocks(model):
+    """Replace Qwen2MoeSparseMoeBlock with GraphCompatibleMoeBlock."""
+    try:
+        from transformers.models.qwen2_moe.modeling_qwen2_moe import (
+            Qwen2MoeSparseMoeBlock,
+        )
+    except ImportError:
+        return
+    m = getattr(model, "model", model)
+    for layer in m.layers:
+        if hasattr(layer, "mlp") and isinstance(layer.mlp, Qwen2MoeSparseMoeBlock):
+            layer.mlp = GraphCompatibleMoeBlock(layer.mlp)
+
+
+# ---------------------------------------------------------------------------
 # Model loading
 # ---------------------------------------------------------------------------
 def load_glorcq_model(model_path, device="cuda:0"):
@@ -194,13 +212,16 @@ def load_glorcq_model(model_path, device="cuda:0"):
         u_cache, uv_bits, rotation_cache, device,
     )
 
+    # 6b. Replace MoE blocks for CUDA Graph compatibility
+    _replace_moe_blocks(model)
+
     # 7. Move non-linear components to device
     m = getattr(model, "model", model)
     for attr in ("embed_tokens", "norm", "rotary_emb"):
         if hasattr(m, attr):
             obj = getattr(m, attr)
             if obj is not None:
-                setattr(m, attr, obj.to(device))
+                setattr(m, attr, _materialize_meta_module(obj, device))
     if hasattr(model, "lm_head"):
         # lm_head shares embed_tokens weight in many models
         if model.lm_head.weight.device.type == "meta":
@@ -212,6 +233,26 @@ def load_glorcq_model(model_path, device="cuda:0"):
     model.eval()
     print(f"[GLoRCQ] Model loaded successfully on {device}")
     return model
+
+
+def _materialize_meta_module(module, device):
+    """Move a module from meta device to *device*, zero-initializing all
+    parameters and buffers.  If already on a real device, equivalent to
+    ``module.to(device)``."""
+    is_meta = any(
+        p.device.type == "meta"
+        for p in list(module.parameters()) + list(module.buffers())
+    )
+    if not is_meta:
+        return module.to(device)
+    module = module.to_empty(device=device)
+    for p in module.parameters():
+        if not p.is_meta:
+            p.data.zero_()
+    for b in module.buffers():
+        if not b.is_meta:
+            b.data.zero_()
+    return module
 
 
 def _replace_linear_layers(model, layers_data, assignments, per_expert_V,
@@ -242,7 +283,7 @@ def _replace_linear_layers(model, layers_data, assignments, per_expert_V,
     for layer_idx in range(len(layers)):
         if layer_idx not in layers_data:
             # No quantized data for this layer, move to device as-is
-            layers[layer_idx] = layers[layer_idx].to(device)
+            layers[layer_idx] = _materialize_meta_module(layers[layer_idx], device)
             continue
 
         layer = layers[layer_idx]
@@ -254,7 +295,7 @@ def _replace_linear_layers(model, layers_data, assignments, per_expert_V,
         for module_name, (parent, attr_name, linear) in linear_modules.items():
             if module_name not in layer_data:
                 # Not a quantized module, move to device
-                setattr(parent, attr_name, linear.to(device))
+                setattr(parent, attr_name, _materialize_meta_module(linear, device))
                 continue
 
             packed = layer_data[module_name]
@@ -268,7 +309,7 @@ def _replace_linear_layers(model, layers_data, assignments, per_expert_V,
                 quant_type = packed.get("quant_method", "unknown")
             else:
                 # Unknown format, skip
-                setattr(parent, attr_name, linear.to(device))
+                setattr(parent, attr_name, _materialize_meta_module(linear, device))
                 continue
 
             in_f = linear.in_features if hasattr(linear, "in_features") else packed.get("dim", 0)

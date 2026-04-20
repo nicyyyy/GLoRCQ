@@ -1,459 +1,52 @@
-Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+warning: The `tool.uv.dev-dependencies` field (used in `pyproject.toml`) is deprecated and will be removed in a future release; use `dependency-groups.dev` instead
+/nvme3/yqy/exp1/glorcq/.venv/lib/python3.10/site-packages/transformers/utils/hub.py:128: FutureWarning: Using `TRANSFORMERS_CACHE` is deprecated and will be removed in v5 of Transformers. Use `HF_HOME` instead.
+  warnings.warn(
+The attention mask and the pad token id were not set. As a consequence, you may observe unexpected behavior. Please pass your input's `attention_mask` to obtain reliable results.
+Setting `pad_token_id` to `eos_token_id`:None for open-end generation.
+The attention mask is not set and cannot be inferred from input because pad token is same as eos token. As a consequence, you may observe unexpected behavior. Please pass your input's `attention_mask` to obtain reliable results.
+/nvme3/yqy/exp1/glorcq/.venv/lib/python3.10/site-packages/torch/_inductor/compile_fx.py:194: UserWarning: TensorFloat32 tensor cores for float32 matrix multiplication available but not enabled. Consider setting `torch.set_float32_matmul_precision('high')` for better performance.
+  warnings.warn(
+W0417 11:06:01.589000 4193115 .venv/lib/python3.10/site-packages/torch/_dynamo/convert_frame.py:906] [4/8] torch._dynamo hit config.cache_size_limit (8)
+W0417 11:06:01.589000 4193115 .venv/lib/python3.10/site-packages/torch/_dynamo/convert_frame.py:906] [4/8]    function: 'forward' (/nvme3/yqy/exp1/glorcq/.venv/lib/python3.10/site-packages/transformers/models/qwen2_moe/modeling_qwen2_moe.py:809)
+W0417 11:06:01.589000 4193115 .venv/lib/python3.10/site-packages/torch/_dynamo/convert_frame.py:906] [4/8]    last reason: 4/0: L['self']._modules['self_attn'].layer_idx == 0              
+W0417 11:06:01.589000 4193115 .venv/lib/python3.10/site-packages/torch/_dynamo/convert_frame.py:906] [4/8] To log all recompilation reasons, use TORCH_LOGS="recompiles".
+W0417 11:06:01.589000 4193115 .venv/lib/python3.10/site-packages/torch/_dynamo/convert_frame.py:906] [4/8] To diagnose recompilation issues, see https://pytorch.org/docs/main/torch.compiler_troubleshooting.html.
+The attention mask and the pad token id were not set. As a consequence, you may observe unexpected behavior. Please pass your input's `attention_mask` to obtain reliable results.
+Setting `pad_token_id` to `eos_token_id`:None for open-end generation.
+The attention mask and the pad token id were not set. As a consequence, you may observe unexpected behavior. Please pass your input's `attention_mask` to obtain reliable results.
+Setting `pad_token_id` to `eos_token_id`:None for open-end generation.
+The attention mask and the pad token id were not set. As a consequence, you may observe unexpected behavior. Please pass your input's `attention_mask` to obtain reliable results.
+Setting `pad_token_id` to `eos_token_id`:None for open-end generation.
+The attention mask and the pad token id were not set. As a consequence, you may observe unexpected behavior. Please pass your input's `attention_mask` to obtain reliable results.
+Setting `pad_token_id` to `eos_token_id`:None for open-end generation.
+The attention mask and the pad token id were not set. As a consequence, you may observe unexpected behavior. Please pass your input's `attention_mask` to obtain reliable results.
+Setting `pad_token_id` to `eos_token_id`:None for open-end generation.
+Loading real-quant model from ./output/Qwen/Qwen1.5-MoE-A2.7B-glorcq-2bit-rank64-realquant ...
+[GLoRCQ] Loading real-quantized model from ./output/Qwen/Qwen1.5-MoE-A2.7B-glorcq-2bit-rank64-realquant (generic loader)
+[GLoRCQ] Loading glorcq_model.pt ...
+[GLoRCQ] Loading cross_layer_info.pt ...
+[GLoRCQ] Building SharedUCache ...
+[GLoRCQ] Building RotationCache for TurboQuant ...
+[GLoRCQ] Replacing linear layers ...
+[RotationCache] Generating Pi(2048) and centroids (bits=2, seed=42) ...
+[RotationCache] Generating Pi(1408) and centroids (bits=2, seed=42) ...
+[GLoRCQ] Model loaded successfully on cuda
+Prompt tokens: 64, Generate: 64 tokens, Batch size: 1
 
-============================================================
-  GLoRCQ: Quantization + LoRA
-  model    : Qwen/Qwen1.5-MoE-A2.7B
-  rank     : 64  n_iter: 1
-  G_moe    : 128   G_attn: 4
-  share_attn: False  (each layer independent)
-  nbits    : 2  sym=False  mse=True
-  groupsize: 128   nsamples: 128
-  no_lora  : False  (skip Stage 2-4 if set)
-  act_alpha: 0.6  (activation equalization exponent)
-  search_act_alpha: ON  (per-module grid search, default_alpha=0.6 as fallback)
-  uv_bits  : 8  (U/V quantization bits)
-  early_stop_tol: 0  (0=disabled)
-  hessian_svd: True
-  use_turboquant: True
-  real_quant: False
-============================================================
-Loading weights:   0%|          | 0/387 [00:00<?, ?it/s]Loading weights:   1%|          | 4/387 [00:00<00:17, 22.08it/s]Loading weights:   2%|▏         | 7/387 [00:00<00:16, 22.77it/s]Loading weights:   5%|▌         | 21/387 [00:00<00:07, 46.51it/s]Loading weights:  10%|▉         | 37/387 [00:00<00:06, 50.16it/s]Loading weights:  13%|█▎        | 52/387 [00:00<00:04, 70.06it/s]Loading weights:  16%|█▌        | 61/387 [00:01<00:06, 53.91it/s]Loading weights:  18%|█▊        | 68/387 [00:01<00:05, 56.53it/s]Loading weights:  19%|█▉        | 75/387 [00:01<00:06, 45.76it/s]Loading weights:  22%|██▏       | 85/387 [00:01<00:07, 38.33it/s]Loading weights:  26%|██▌       | 100/387 [00:01<00:05, 55.35it/s]Loading weights:  28%|██▊       | 108/387 [00:02<00:06, 43.45it/s]Loading weights:  30%|███       | 117/387 [00:02<00:06, 38.99it/s]Loading weights:  34%|███▍      | 132/387 [00:02<00:04, 55.04it/s]Loading weights:  36%|███▌      | 140/387 [00:02<00:05, 49.21it/s]Loading weights:  39%|███▊      | 149/387 [00:03<00:06, 38.75it/s]Loading weights:  43%|████▎     | 165/387 [00:03<00:05, 43.04it/s]Loading weights:  47%|████▋     | 181/387 [00:03<00:03, 55.05it/s]Loading weights:  51%|█████     | 197/387 [00:03<00:02, 65.39it/s]Loading weights:  55%|█████▌    | 213/387 [00:04<00:02, 73.74it/s]Loading weights:  59%|█████▉    | 229/387 [00:04<00:01, 82.65it/s]Loading weights:  63%|██████▎   | 245/387 [00:04<00:01, 91.71it/s]Loading weights:  67%|██████▋   | 261/387 [00:04<00:01, 86.08it/s]Loading weights:  72%|███████▏  | 277/387 [00:04<00:01, 82.35it/s]Loading weights:  76%|███████▌  | 293/387 [00:04<00:01, 78.79it/s]Loading weights:  80%|███████▉  | 309/387 [00:05<00:00, 87.44it/s]Loading weights:  84%|████████▍ | 325/387 [00:05<00:00, 89.82it/s]Loading weights:  88%|████████▊ | 341/387 [00:05<00:00, 94.09it/s]Loading weights:  92%|█████████▏| 357/387 [00:05<00:00, 99.93it/s]Loading weights:  96%|█████████▋| 373/387 [00:05<00:00, 94.10it/s]Loading weights: 100%|██████████| 387/387 [00:05<00:00, 67.13it/s]
-Token indices sequence length is longer than the specified maximum sequence length for this model (2518423 > 32768). Running this sequence through the model will result in indexing errors
+[compile] torch.compile (mode=default, warmup=2, runs=3) ...
+  Compiling ...
+  Compile:  7.2 ± 0.0 tok/s
 
-============================================================
-  Stage 1: Hybrid GPTQ(attn, n_iter=1) + TurboQuant(MoE) 2-bit
-============================================================
-  [TurboQuant] Enabled: 2-bit row-wise vector quantization (random rotation + Lloyd-Max codebook)
-Stage 1: Hybrid GPTQ(attn)+TurboQuant(MoE):   0%|          | 0/24 [00:00<?, ?it/s]    self_attn.q_proj: per-group AWQ [0.0:14 0.3:2]
-    self_attn.k_proj: per-group AWQ [0.0:6 0.1:2 0.2:7 0.3:1]
-    self_attn.v_proj: per-group AWQ [0.0:16]
-    self_attn.o_proj: per-group AWQ [0.0:10 0.1:3 0.2:1 0.3:2]
-    mlp.shared_expert.gate_proj: per-group AWQ [0.0:11 0.1:3 0.2:1 0.5:1]
-    mlp.shared_expert.up_proj: per-group AWQ [0.0:16]
-    mlp.shared_expert.down_proj: per-group AWQ [0.0:44]
-Stage 1: Hybrid GPTQ(attn)+TurboQuant(MoE):   4%|▍         | 1/24 [09:01<3:27:29, 541.29s/it]    self_attn.q_proj: per-group AWQ [0.0:15 0.1:1]
-    self_attn.k_proj: per-group AWQ [0.0:10 0.1:4 0.2:2]
-    self_attn.v_proj: per-group AWQ [0.0:16]
-    self_attn.o_proj: per-group AWQ [0.0:10 0.1:4 0.2:1 0.3:1]
-    mlp.shared_expert.gate_proj: per-group AWQ [0.0:12 0.1:1 0.2:3]
-    mlp.shared_expert.up_proj: per-group AWQ [0.0:16]
-    mlp.shared_expert.down_proj: per-group AWQ [0.0:44]
-Stage 1: Hybrid GPTQ(attn)+TurboQuant(MoE):   8%|▊         | 2/24 [18:29<3:24:21, 557.35s/it]    self_attn.q_proj: per-group AWQ [0.0:16]
-    self_attn.k_proj: per-group AWQ [0.0:15 0.2:1]
-    self_attn.v_proj: per-group AWQ [0.0:16]
-    self_attn.o_proj: per-group AWQ [0.0:14 0.1:1 0.4:1]
-    mlp.shared_expert.gate_proj: per-group AWQ [0.0:15 0.2:1]
-    mlp.shared_expert.up_proj: per-group AWQ [0.0:16]
-    mlp.shared_expert.down_proj: per-group AWQ [0.0:44]
-[WARN] prepare_hessian: L_lower Cholesky failed for Linear(in_features=5632, out_features=2048, bias=False), falling back to unweighted SVD.
-Stage 1: Hybrid GPTQ(attn)+TurboQuant(MoE):  12%|█▎        | 3/24 [27:33<3:12:47, 550.86s/it]    self_attn.q_proj: per-group AWQ [0.0:16]
-    self_attn.k_proj: per-group AWQ [0.0:14 0.1:1 0.2:1]
-    self_attn.v_proj: per-group AWQ [0.0:15 0.1:1]
-    self_attn.o_proj: per-group AWQ [0.0:14 0.1:2]
-    mlp.shared_expert.gate_proj: per-group AWQ [0.0:14 0.1:1 0.2:1]
-    mlp.shared_expert.up_proj: per-group AWQ [0.0:16]
-    mlp.shared_expert.down_proj: per-group AWQ [0.0:44]
-[WARN] prepare_hessian: L_lower Cholesky failed for Linear(in_features=5632, out_features=2048, bias=False), falling back to unweighted SVD.
-Stage 1: Hybrid GPTQ(attn)+TurboQuant(MoE):  17%|█▋        | 4/24 [29:09<2:03:47, 371.39s/it]    self_attn.q_proj: per-group AWQ [0.0:16]
-    self_attn.k_proj: per-group AWQ [0.0:14 0.1:1 0.2:1]
-    self_attn.v_proj: per-group AWQ [0.0:16]
-    self_attn.o_proj: per-group AWQ [0.0:15 0.1:1]
-    mlp.shared_expert.gate_proj: per-group AWQ [0.0:15 0.1:1]
-    mlp.shared_expert.up_proj: per-group AWQ [0.0:16]
-    mlp.shared_expert.down_proj: per-group AWQ [0.0:44]
-[WARN] prepare_hessian: L_lower Cholesky failed for Linear(in_features=5632, out_features=2048, bias=False), falling back to unweighted SVD.
-Stage 1: Hybrid GPTQ(attn)+TurboQuant(MoE):  21%|██        | 5/24 [29:53<1:20:16, 253.48s/it]    self_attn.q_proj: per-group AWQ [0.0:15 0.3:1]
-    self_attn.k_proj: per-group AWQ [0.0:14 0.1:1 0.2:1]
-    self_attn.v_proj: per-group AWQ [0.0:16]
-    self_attn.o_proj: per-group AWQ [0.0:16]
-    mlp.shared_expert.gate_proj: per-group AWQ [0.0:15 0.1:1]
-    mlp.shared_expert.up_proj: per-group AWQ [0.0:16]
-    mlp.shared_expert.down_proj: per-group AWQ [0.0:43 0.2:1]
-[WARN] prepare_hessian: L_lower Cholesky failed for Linear(in_features=5632, out_features=2048, bias=False), falling back to unweighted SVD.
-Stage 1: Hybrid GPTQ(attn)+TurboQuant(MoE):  25%|██▌       | 6/24 [30:38<54:43, 182.42s/it]      self_attn.q_proj: per-group AWQ [0.0:15 0.2:1]
-    self_attn.k_proj: per-group AWQ [0.0:14 0.1:2]
-    self_attn.v_proj: per-group AWQ [0.0:13 0.2:2 0.4:1]
-    self_attn.o_proj: per-group AWQ [0.0:16]
-    mlp.shared_expert.gate_proj: per-group AWQ [0.0:15 0.1:1]
-    mlp.shared_expert.up_proj: per-group AWQ [0.0:16]
-    mlp.shared_expert.down_proj: per-group AWQ [0.0:44]
-[WARN] prepare_hessian: L_lower Cholesky failed for Linear(in_features=5632, out_features=2048, bias=False), falling back to unweighted SVD.
-Stage 1: Hybrid GPTQ(attn)+TurboQuant(MoE):  29%|██▉       | 7/24 [31:23<38:59, 137.63s/it]    self_attn.q_proj: per-group AWQ [0.0:16]
-    self_attn.k_proj: per-group AWQ [0.0:16]
-    self_attn.v_proj: per-group AWQ [0.0:16]
-    self_attn.o_proj: per-group AWQ [0.0:16]
-    mlp.shared_expert.gate_proj: per-group AWQ [0.0:15 0.1:1]
-    mlp.shared_expert.up_proj: per-group AWQ [0.0:16]
-    mlp.shared_expert.down_proj: per-group AWQ [0.0:44]
-[WARN] prepare_hessian: L_lower Cholesky failed for Linear(in_features=5632, out_features=2048, bias=False), falling back to unweighted SVD.
-Stage 1: Hybrid GPTQ(attn)+TurboQuant(MoE):  33%|███▎      | 8/24 [32:08<28:49, 108.07s/it]    self_attn.q_proj: per-group AWQ [0.0:16]
-    self_attn.k_proj: per-group AWQ [0.0:16]
-    self_attn.v_proj: per-group AWQ [0.0:16]
-    self_attn.o_proj: per-group AWQ [0.0:16]
-    mlp.shared_expert.gate_proj: per-group AWQ [0.0:14 0.1:2]
-    mlp.shared_expert.up_proj: per-group AWQ [0.0:16]
-    mlp.shared_expert.down_proj: per-group AWQ [0.0:44]
-[WARN] prepare_hessian: L_lower Cholesky failed for Linear(in_features=5632, out_features=2048, bias=False), falling back to unweighted SVD.
-Stage 1: Hybrid GPTQ(attn)+TurboQuant(MoE):  38%|███▊      | 9/24 [32:52<22:03, 88.20s/it]     self_attn.q_proj: per-group AWQ [0.0:16]
-    self_attn.k_proj: per-group AWQ [0.0:16]
-    self_attn.v_proj: per-group AWQ [0.0:16]
-    self_attn.o_proj: per-group AWQ [0.0:16]
-    mlp.shared_expert.gate_proj: per-group AWQ [0.0:16]
-    mlp.shared_expert.up_proj: per-group AWQ [0.0:16]
-    mlp.shared_expert.down_proj: per-group AWQ [0.0:44]
-[WARN] prepare_hessian: L_lower Cholesky failed for Linear(in_features=5632, out_features=2048, bias=False), falling back to unweighted SVD.
-Stage 1: Hybrid GPTQ(attn)+TurboQuant(MoE):  42%|████▏     | 10/24 [33:37<17:25, 74.64s/it]    self_attn.q_proj: per-group AWQ [0.0:16]
-    self_attn.k_proj: per-group AWQ [0.0:16]
-    self_attn.v_proj: per-group AWQ [0.0:16]
-    self_attn.o_proj: per-group AWQ [0.0:16]
-    mlp.shared_expert.gate_proj: per-group AWQ [0.0:16]
-    mlp.shared_expert.up_proj: per-group AWQ [0.0:16]
-    mlp.shared_expert.down_proj: per-group AWQ [0.0:44]
-[WARN] prepare_hessian: L_lower Cholesky failed for Linear(in_features=5632, out_features=2048, bias=False), falling back to unweighted SVD.
-Stage 1: Hybrid GPTQ(attn)+TurboQuant(MoE):  46%|████▌     | 11/24 [34:21<14:10, 65.46s/it]    self_attn.q_proj: per-group AWQ [0.0:16]
-    self_attn.k_proj: per-group AWQ [0.0:16]
-    self_attn.v_proj: per-group AWQ [0.0:16]
-    self_attn.o_proj: per-group AWQ [0.0:16]
-    mlp.shared_expert.gate_proj: per-group AWQ [0.0:16]
-    mlp.shared_expert.up_proj: per-group AWQ [0.0:16]
-    mlp.shared_expert.down_proj: per-group AWQ [0.0:44]
-[WARN] prepare_hessian: L_lower Cholesky failed for Linear(in_features=5632, out_features=2048, bias=False), falling back to unweighted SVD.
-Stage 1: Hybrid GPTQ(attn)+TurboQuant(MoE):  50%|█████     | 12/24 [35:06<11:48, 59.05s/it]    self_attn.q_proj: per-group AWQ [0.0:16]
-    self_attn.k_proj: per-group AWQ [0.0:16]
-    self_attn.v_proj: per-group AWQ [0.0:16]
-    self_attn.o_proj: per-group AWQ [0.0:16]
-    mlp.shared_expert.gate_proj: per-group AWQ [0.0:16]
-    mlp.shared_expert.up_proj: per-group AWQ [0.0:16]
-    mlp.shared_expert.down_proj: per-group AWQ [0.0:44]
-[WARN] prepare_hessian: L_lower Cholesky failed for Linear(in_features=5632, out_features=2048, bias=False), falling back to unweighted SVD.
-Stage 1: Hybrid GPTQ(attn)+TurboQuant(MoE):  54%|█████▍    | 13/24 [35:50<09:59, 54.49s/it]    self_attn.q_proj: per-group AWQ [0.0:16]
-    self_attn.k_proj: per-group AWQ [0.0:16]
-    self_attn.v_proj: per-group AWQ [0.0:16]
-    self_attn.o_proj: per-group AWQ [0.0:16]
-    mlp.shared_expert.gate_proj: per-group AWQ [0.0:16]
-    mlp.shared_expert.up_proj: per-group AWQ [0.0:16]
-    mlp.shared_expert.down_proj: per-group AWQ [0.0:44]
-[WARN] prepare_hessian: L_lower Cholesky failed for Linear(in_features=5632, out_features=2048, bias=False), falling back to unweighted SVD.
-Stage 1: Hybrid GPTQ(attn)+TurboQuant(MoE):  58%|█████▊    | 14/24 [36:34<08:33, 51.37s/it]    self_attn.q_proj: per-group AWQ [0.0:16]
-    self_attn.k_proj: per-group AWQ [0.0:16]
-    self_attn.v_proj: per-group AWQ [0.0:16]
-    self_attn.o_proj: per-group AWQ [0.0:16]
-    mlp.shared_expert.gate_proj: per-group AWQ [0.0:16]
-    mlp.shared_expert.up_proj: per-group AWQ [0.0:16]
-    mlp.shared_expert.down_proj: per-group AWQ [0.0:44]
-[WARN] prepare_hessian: L_lower Cholesky failed for Linear(in_features=5632, out_features=2048, bias=False), falling back to unweighted SVD.
-Stage 1: Hybrid GPTQ(attn)+TurboQuant(MoE):  62%|██████▎   | 15/24 [37:18<07:23, 49.29s/it]    self_attn.q_proj: per-group AWQ [0.0:15 0.1:1]
-    self_attn.k_proj: per-group AWQ [0.0:16]
-    self_attn.v_proj: per-group AWQ [0.0:16]
-    self_attn.o_proj: per-group AWQ [0.0:16]
-    mlp.shared_expert.gate_proj: per-group AWQ [0.0:16]
-    mlp.shared_expert.up_proj: per-group AWQ [0.0:16]
-    mlp.shared_expert.down_proj: per-group AWQ [0.0:44]
-[WARN] prepare_hessian: L_lower Cholesky failed for Linear(in_features=5632, out_features=2048, bias=False), falling back to unweighted SVD.
-Stage 1: Hybrid GPTQ(attn)+TurboQuant(MoE):  67%|██████▋   | 16/24 [38:03<06:23, 47.93s/it]    self_attn.q_proj: per-group AWQ [0.0:15 0.2:1]
-    self_attn.k_proj: per-group AWQ [0.0:16]
-    self_attn.v_proj: per-group AWQ [0.0:16]
-    self_attn.o_proj: per-group AWQ [0.0:16]
-    mlp.shared_expert.gate_proj: per-group AWQ [0.0:16]
-    mlp.shared_expert.up_proj: per-group AWQ [0.0:16]
-    mlp.shared_expert.down_proj: per-group AWQ [0.0:44]
-[WARN] prepare_hessian: L_lower Cholesky failed for Linear(in_features=5632, out_features=2048, bias=False), falling back to unweighted SVD.
-Stage 1: Hybrid GPTQ(attn)+TurboQuant(MoE):  71%|███████   | 17/24 [38:48<05:28, 46.97s/it]    self_attn.q_proj: per-group AWQ [0.0:15 0.1:1]
-    self_attn.k_proj: per-group AWQ [0.0:15 0.1:1]
-    self_attn.v_proj: per-group AWQ [0.0:16]
-    self_attn.o_proj: per-group AWQ [0.0:16]
-    mlp.shared_expert.gate_proj: per-group AWQ [0.0:16]
-    mlp.shared_expert.up_proj: per-group AWQ [0.0:16]
-    mlp.shared_expert.down_proj: per-group AWQ [0.0:44]
-Stage 1: Hybrid GPTQ(attn)+TurboQuant(MoE):  75%|███████▌  | 18/24 [39:32<04:37, 46.25s/it]    self_attn.q_proj: per-group AWQ [0.0:15 0.2:1]
-    self_attn.k_proj: per-group AWQ [0.0:14 0.1:2]
-    self_attn.v_proj: per-group AWQ [0.0:16]
-    self_attn.o_proj: per-group AWQ [0.0:16]
-    mlp.shared_expert.gate_proj: per-group AWQ [0.0:14 0.1:2]
-    mlp.shared_expert.up_proj: per-group AWQ [0.0:16]
-    mlp.shared_expert.down_proj: per-group AWQ [0.0:43 0.1:1]
-[WARN] prepare_hessian: L_lower Cholesky failed for Linear(in_features=5632, out_features=2048, bias=False), falling back to unweighted SVD.
-Stage 1: Hybrid GPTQ(attn)+TurboQuant(MoE):  79%|███████▉  | 19/24 [40:17<03:49, 45.90s/it]    self_attn.q_proj: per-group AWQ [0.0:15 0.2:1]
-    self_attn.k_proj: per-group AWQ [0.0:16]
-    self_attn.v_proj: per-group AWQ [0.0:16]
-    self_attn.o_proj: per-group AWQ [0.0:16]
-    mlp.shared_expert.gate_proj: per-group AWQ [0.0:16]
-    mlp.shared_expert.up_proj: per-group AWQ [0.0:16]
-    mlp.shared_expert.down_proj: per-group AWQ [0.0:44]
-[WARN] prepare_hessian: L_lower Cholesky failed for Linear(in_features=5632, out_features=2048, bias=False), falling back to unweighted SVD.
-Stage 1: Hybrid GPTQ(attn)+TurboQuant(MoE):  83%|████████▎ | 20/24 [41:02<03:01, 45.49s/it]    self_attn.q_proj: per-group AWQ [0.0:14 0.1:1 0.2:1]
-    self_attn.k_proj: per-group AWQ [0.0:16]
-    self_attn.v_proj: per-group AWQ [0.0:16]
-    self_attn.o_proj: per-group AWQ [0.0:16]
-    mlp.shared_expert.gate_proj: per-group AWQ [0.0:16]
-    mlp.shared_expert.up_proj: per-group AWQ [0.0:16]
-    mlp.shared_expert.down_proj: per-group AWQ [0.0:44]
-[WARN] prepare_hessian: L_lower Cholesky failed for Linear(in_features=5632, out_features=2048, bias=False), falling back to unweighted SVD.
-Stage 1: Hybrid GPTQ(attn)+TurboQuant(MoE):  88%|████████▊ | 21/24 [41:47<02:15, 45.24s/it]    self_attn.q_proj: per-group AWQ [0.0:14 0.3:2]
-    self_attn.k_proj: per-group AWQ [0.0:16]
-    self_attn.v_proj: per-group AWQ [0.0:16]
-    self_attn.o_proj: per-group AWQ [0.0:16]
-    mlp.shared_expert.gate_proj: per-group AWQ [0.0:16]
-    mlp.shared_expert.up_proj: per-group AWQ [0.0:16]
-    mlp.shared_expert.down_proj: per-group AWQ [0.0:44]
-Stage 1: Hybrid GPTQ(attn)+TurboQuant(MoE):  92%|█████████▏| 22/24 [42:31<01:29, 44.92s/it]    self_attn.q_proj: per-group AWQ [0.0:14 0.2:1 0.3:1]
-    self_attn.k_proj: per-group AWQ [0.0:15 0.1:1]
-    self_attn.v_proj: per-group AWQ [0.0:16]
-    self_attn.o_proj: per-group AWQ [0.0:16]
-    mlp.shared_expert.gate_proj: per-group AWQ [0.0:15 0.1:1]
-    mlp.shared_expert.up_proj: per-group AWQ [0.0:15 0.1:1]
-    mlp.shared_expert.down_proj: per-group AWQ [0.0:44]
-[WARN] prepare_hessian: L_lower Cholesky failed for Linear(in_features=5632, out_features=2048, bias=False), falling back to unweighted SVD.
-Stage 1: Hybrid GPTQ(attn)+TurboQuant(MoE):  96%|█████████▌| 23/24 [43:15<00:44, 44.83s/it]    self_attn.q_proj: per-group AWQ [0.0:14 0.1:2]
-    self_attn.k_proj: per-group AWQ [0.0:16]
-    self_attn.v_proj: per-group AWQ [0.0:15 0.3:1]
-    self_attn.o_proj: per-group AWQ [0.0:15 0.2:1]
-    mlp.shared_expert.gate_proj: per-group AWQ [0.0:13 0.1:2 0.2:1]
-    mlp.shared_expert.up_proj: per-group AWQ [0.0:14 0.1:2]
-    mlp.shared_expert.down_proj: per-group AWQ [0.0:42 0.1:2]
-[WARN] prepare_hessian: L_lower Cholesky failed for Linear(in_features=5632, out_features=2048, bias=False), falling back to unweighted SVD.
-Stage 1: Hybrid GPTQ(attn)+TurboQuant(MoE): 100%|██████████| 24/24 [44:01<00:00, 44.94s/it]Stage 1: Hybrid GPTQ(attn)+TurboQuant(MoE): 100%|██████████| 24/24 [44:01<00:00, 110.05s/it]
+[3/3] FP16 baseline generation (warmup=2, runs=3) ...
+Loading FP16 model from Qwen/Qwen1.5-MoE-A2.7B ...
+Loading checkpoint shards:   0%|          | 0/8 [00:00<?, ?it/s]Loading checkpoint shards:  12%|█▎        | 1/8 [00:00<00:06,  1.03it/s]Loading checkpoint shards:  25%|██▌       | 2/8 [00:01<00:05,  1.14it/s]Loading checkpoint shards:  38%|███▊      | 3/8 [00:02<00:04,  1.04it/s]Loading checkpoint shards:  50%|█████     | 4/8 [00:04<00:04,  1.21s/it]Loading checkpoint shards:  62%|██████▎   | 5/8 [00:06<00:04,  1.41s/it]Loading checkpoint shards:  75%|███████▌  | 6/8 [00:07<00:02,  1.43s/it]Loading checkpoint shards:  88%|████████▊ | 7/8 [00:09<00:01,  1.48s/it]Loading checkpoint shards: 100%|██████████| 8/8 [00:09<00:00,  1.11s/it]Loading checkpoint shards: 100%|██████████| 8/8 [00:09<00:00,  1.20s/it]
+Starting from v4.46, the `logits` model output will have the same type as the model (except at train time, where it will always be FP32)
+FP16 prompt tokens: 64
+  FP16:     6.8 ± 0.1 tok/s
 
-[Stage 1] Collected 96 records (hybrid: GPTQ(attn, n_iter=1) + TurboQuant(MoE, sequential)).
-
-============================================================
-  Stage 2: Grassmannian clustering
-============================================================
-
-[Stage 2] k_proj: N=24  [no-share-attn] each of 24 records is its own group
-
-[Stage 2] o_proj: N=24  [no-share-attn] each of 24 records is its own group
-
-[Stage 2] q_proj: N=24  [no-share-attn] each of 24 records is its own group
-
-[Stage 2] v_proj: N=24  [no-share-attn] each of 24 records is its own group
-
-============================================================
-  Stage 3+4: Shared U + fake-quant reconstruction
-============================================================
-
-[Stage 3+4] k_proj: N=24, G=24
-  k_proj groups:   0%|          | 0/24 [00:00<?, ?it/s]    group   0: ‖E_cat‖=58.4547  S.max=17.3358  S.sum=351.5738  S[0]/S[-1]=6.2  [H-weighted]
-    group   1: ‖E_cat‖=48.9009  S.max=22.2140  S.sum=233.5519  S[0]/S[-1]=10.0  [H-weighted]
-    group   2: ‖E_cat‖=26.6899  S.max=9.9561  S.sum=111.4249  S[0]/S[-1]=5.8  [H-weighted]
-    group   3: ‖E_cat‖=24.1477  S.max=5.8393  S.sum=98.7010  S[0]/S[-1]=5.3  [H-weighted]
-    group   4: ‖E_cat‖=23.7269  S.max=5.8461  S.sum=97.3480  S[0]/S[-1]=5.6  [H-weighted]
-    group   5: ‖E_cat‖=25.4454  S.max=6.0290  S.sum=106.8115  S[0]/S[-1]=4.4  [H-weighted]
-  k_proj groups:  25%|██▌       | 6/24 [00:00<00:00, 54.43it/s]    group   6: ‖E_cat‖=23.8603  S.max=4.7094  S.sum=95.7832  S[0]/S[-1]=4.0  [H-weighted]
-    group   7: ‖E_cat‖=21.5700  S.max=2.9454  S.sum=79.8439  S[0]/S[-1]=1.8  [H-weighted]
-    group   8: ‖E_cat‖=22.7148  S.max=3.3362  S.sum=85.1462  S[0]/S[-1]=1.7  [H-weighted]
-    group   9: ‖E_cat‖=21.9379  S.max=2.7152  S.sum=81.7284  S[0]/S[-1]=1.2  [H-weighted]
-    group  10: ‖E_cat‖=21.6063  S.max=3.4711  S.sum=81.5454  S[0]/S[-1]=2.0  [H-weighted]
-    group  11: ‖E_cat‖=20.9163  S.max=2.6244  S.sum=81.0929  S[0]/S[-1]=2.1  [H-weighted]
-    group  12: ‖E_cat‖=21.3953  S.max=2.8490  S.sum=82.7311  S[0]/S[-1]=1.5  [H-weighted]
-  k_proj groups:  54%|█████▍    | 13/24 [00:00<00:00, 61.00it/s]    group  13: ‖E_cat‖=20.3676  S.max=2.8487  S.sum=78.9628  S[0]/S[-1]=1.3  [H-weighted]
-    group  14: ‖E_cat‖=18.8791  S.max=3.4169  S.sum=74.3303  S[0]/S[-1]=2.0  [H-weighted]
-    group  15: ‖E_cat‖=18.7054  S.max=2.8972  S.sum=71.9379  S[0]/S[-1]=1.4  [H-weighted]
-    group  16: ‖E_cat‖=19.1320  S.max=2.9470  S.sum=73.5666  S[0]/S[-1]=1.6  [H-weighted]
-    group  17: ‖E_cat‖=16.8921  S.max=2.5766  S.sum=68.6297  S[0]/S[-1]=2.1  [H-weighted]
-    group  18: ‖E_cat‖=16.8677  S.max=3.1669  S.sum=68.2432  S[0]/S[-1]=1.9  [H-weighted]
-    group  19: ‖E_cat‖=16.4114  S.max=2.5283  S.sum=68.0530  S[0]/S[-1]=2.5  [H-weighted]
-  k_proj groups:  83%|████████▎ | 20/24 [00:00<00:00, 63.92it/s]    group  20: ‖E_cat‖=16.2777  S.max=2.3175  S.sum=65.5589  S[0]/S[-1]=2.6  [H-weighted]
-    group  21: ‖E_cat‖=16.1681  S.max=2.6627  S.sum=65.9906  S[0]/S[-1]=2.9  [H-weighted]
-    group  22: ‖E_cat‖=15.5974  S.max=2.1205  S.sum=63.3184  S[0]/S[-1]=1.5  [H-weighted]
-    group  23: ‖E_cat‖=15.0974  S.max=1.7121  S.sum=57.0458  S[0]/S[-1]=1.8  [H-weighted]
-                                                                
-[Stage 3+4] o_proj: N=24, G=24
-  o_proj groups:   0%|          | 0/24 [00:00<?, ?it/s]    group   0: ‖E_cat‖=12.1475  S.max=3.1681  S.sum=60.0342  S[0]/S[-1]=4.4  [H-weighted]
-    group   1: ‖E_cat‖=11.4712  S.max=1.1723  S.sum=46.7720  S[0]/S[-1]=1.9  [H-weighted]
-    group   2: ‖E_cat‖=9.7643  S.max=0.7389  S.sum=34.5916  S[0]/S[-1]=1.1  [H-weighted]
-    group   3: ‖E_cat‖=9.7229  S.max=0.7855  S.sum=33.8078  S[0]/S[-1]=1.9  [H-weighted]
-    group   4: ‖E_cat‖=10.2128  S.max=0.7599  S.sum=33.8581  S[0]/S[-1]=1.3  [H-weighted]
-    group   5: ‖E_cat‖=10.4339  S.max=0.6974  S.sum=31.9679  S[0]/S[-1]=1.3  [H-weighted]
-    group   6: ‖E_cat‖=10.4684  S.max=2.3982  S.sum=23.1208  S[0]/S[-1]=8.1  [H-weighted]
-  o_proj groups:  29%|██▉       | 7/24 [00:00<00:00, 67.18it/s]    group   7: ‖E_cat‖=9.4676  S.max=0.6417  S.sum=28.9555  S[0]/S[-1]=1.3  [H-weighted]
-    group   8: ‖E_cat‖=9.8742  S.max=0.5183  S.sum=27.0826  S[0]/S[-1]=1.1  [H-weighted]
-    group   9: ‖E_cat‖=9.6520  S.max=0.6265  S.sum=27.6604  S[0]/S[-1]=1.3  [H-weighted]
-    group  10: ‖E_cat‖=9.8877  S.max=0.7533  S.sum=28.5720  S[0]/S[-1]=1.4  [H-weighted]
-    group  11: ‖E_cat‖=10.0521  S.max=0.7113  S.sum=29.5840  S[0]/S[-1]=1.3  [H-weighted]
-    group  12: ‖E_cat‖=10.3461  S.max=0.6434  S.sum=28.7482  S[0]/S[-1]=1.2  [H-weighted]
-    group  13: ‖E_cat‖=10.7644  S.max=0.8192  S.sum=29.5006  S[0]/S[-1]=1.8  [H-weighted]
-  o_proj groups:  58%|█████▊    | 14/24 [00:00<00:00, 66.77it/s]    group  14: ‖E_cat‖=11.2690  S.max=0.9076  S.sum=30.4099  S[0]/S[-1]=2.0  [H-weighted]
-    group  15: ‖E_cat‖=12.0261  S.max=0.7091  S.sum=31.6324  S[0]/S[-1]=1.0  [H-weighted]
-    group  16: ‖E_cat‖=11.4378  S.max=0.8870  S.sum=31.6179  S[0]/S[-1]=1.3  [H-weighted]
-    group  17: ‖E_cat‖=12.6051  S.max=0.7392  S.sum=35.9829  S[0]/S[-1]=1.4  [H-weighted]
-    group  18: ‖E_cat‖=13.0589  S.max=1.4129  S.sum=47.8231  S[0]/S[-1]=2.4  [H-weighted]
-    group  19: ‖E_cat‖=13.3807  S.max=1.0258  S.sum=46.1559  S[0]/S[-1]=1.3  [H-weighted]
-    group  20: ‖E_cat‖=13.4201  S.max=1.1022  S.sum=48.3316  S[0]/S[-1]=2.1  [H-weighted]
-  o_proj groups:  88%|████████▊ | 21/24 [00:00<00:00, 64.17it/s]    group  21: ‖E_cat‖=13.7992  S.max=1.0336  S.sum=48.0725  S[0]/S[-1]=1.7  [H-weighted]
-    group  22: ‖E_cat‖=14.1283  S.max=1.1477  S.sum=48.4147  S[0]/S[-1]=2.1  [H-weighted]
-    group  23: ‖E_cat‖=13.4373  S.max=2.6115  S.sum=37.4306  S[0]/S[-1]=5.7  [H-weighted]
-                                                                
-[Stage 3+4] q_proj: N=24, G=24
-  q_proj groups:   0%|          | 0/24 [00:00<?, ?it/s]    group   0: ‖E_cat‖=87.2889  S.max=32.7606  S.sum=506.4479  S[0]/S[-1]=8.0  [H-weighted]
-    group   1: ‖E_cat‖=42.7159  S.max=8.2535  S.sum=207.9385  S[0]/S[-1]=3.8  [H-weighted]
-    group   2: ‖E_cat‖=30.8876  S.max=19.2541  S.sum=117.4073  S[0]/S[-1]=16.9  [H-weighted]
-    group   3: ‖E_cat‖=29.5219  S.max=18.1509  S.sum=109.4619  S[0]/S[-1]=15.5  [H-weighted]
-    group   4: ‖E_cat‖=27.6667  S.max=15.7061  S.sum=103.9686  S[0]/S[-1]=13.4  [H-weighted]
-    group   5: ‖E_cat‖=26.6898  S.max=12.5791  S.sum=102.4026  S[0]/S[-1]=10.8  [H-weighted]
-  q_proj groups:  25%|██▌       | 6/24 [00:00<00:00, 57.26it/s]    group   6: ‖E_cat‖=23.7482  S.max=7.1958  S.sum=90.9342  S[0]/S[-1]=6.3  [H-weighted]
-    group   7: ‖E_cat‖=21.8835  S.max=4.0492  S.sum=83.9280  S[0]/S[-1]=3.9  [H-weighted]
-    group   8: ‖E_cat‖=22.2505  S.max=3.5792  S.sum=83.1438  S[0]/S[-1]=3.4  [H-weighted]
-    group   9: ‖E_cat‖=21.7477  S.max=3.0295  S.sum=81.1978  S[0]/S[-1]=2.9  [H-weighted]
-    group  10: ‖E_cat‖=21.9210  S.max=3.1839  S.sum=87.4901  S[0]/S[-1]=2.9  [H-weighted]
-    group  11: ‖E_cat‖=21.0521  S.max=2.9393  S.sum=81.2394  S[0]/S[-1]=2.9  [H-weighted]
-  q_proj groups:  50%|█████     | 12/24 [00:00<00:00, 56.35it/s]    group  12: ‖E_cat‖=21.5567  S.max=3.3545  S.sum=84.5591  S[0]/S[-1]=2.9  [H-weighted]
-    group  13: ‖E_cat‖=20.0497  S.max=2.9631  S.sum=76.0186  S[0]/S[-1]=3.3  [H-weighted]
-    group  14: ‖E_cat‖=19.3010  S.max=3.0831  S.sum=74.3556  S[0]/S[-1]=3.6  [H-weighted]
-    group  15: ‖E_cat‖=19.1338  S.max=4.2048  S.sum=72.1763  S[0]/S[-1]=4.6  [H-weighted]
-    group  16: ‖E_cat‖=19.4956  S.max=4.6855  S.sum=72.8887  S[0]/S[-1]=5.3  [H-weighted]
-    group  17: ‖E_cat‖=17.8439  S.max=4.8530  S.sum=68.2235  S[0]/S[-1]=6.2  [H-weighted]
-  q_proj groups:  75%|███████▌  | 18/24 [00:00<00:00, 54.52it/s]    group  18: ‖E_cat‖=18.2733  S.max=6.3439  S.sum=70.8267  S[0]/S[-1]=7.7  [H-weighted]
-    group  19: ‖E_cat‖=18.1355  S.max=7.3962  S.sum=72.1363  S[0]/S[-1]=9.4  [H-weighted]
-    group  20: ‖E_cat‖=18.1092  S.max=7.3473  S.sum=71.0634  S[0]/S[-1]=8.5  [H-weighted]
-    group  21: ‖E_cat‖=17.3465  S.max=6.2087  S.sum=69.8961  S[0]/S[-1]=8.0  [H-weighted]
-    group  22: ‖E_cat‖=15.6906  S.max=3.4832  S.sum=63.6131  S[0]/S[-1]=4.9  [H-weighted]
-    group  23: ‖E_cat‖=14.9182  S.max=1.6979  S.sum=55.6264  S[0]/S[-1]=2.5  [H-weighted]
-                                                                
-[Stage 3+4] v_proj: N=24, G=24
-  v_proj groups:   0%|          | 0/24 [00:00<?, ?it/s]    group   0: ‖E_cat‖=11.1123  S.max=1.0930  S.sum=49.5604  S[0]/S[-1]=1.3  [H-weighted]
-    group   1: ‖E_cat‖=10.3624  S.max=1.3061  S.sum=37.3792  S[0]/S[-1]=1.5  [H-weighted]
-    group   2: ‖E_cat‖=10.5411  S.max=1.0373  S.sum=34.2217  S[0]/S[-1]=1.0  [H-weighted]
-    group   3: ‖E_cat‖=10.5412  S.max=1.2768  S.sum=33.9205  S[0]/S[-1]=1.3  [H-weighted]
-    group   4: ‖E_cat‖=11.1210  S.max=1.4524  S.sum=37.4222  S[0]/S[-1]=1.5  [H-weighted]
-    group   5: ‖E_cat‖=11.2035  S.max=1.1408  S.sum=37.7160  S[0]/S[-1]=1.7  [H-weighted]
-    group   6: ‖E_cat‖=10.9222  S.max=0.9479  S.sum=34.5718  S[0]/S[-1]=1.1  [H-weighted]
-  v_proj groups:  29%|██▉       | 7/24 [00:00<00:00, 64.15it/s]    group   7: ‖E_cat‖=10.2160  S.max=0.9801  S.sum=33.1525  S[0]/S[-1]=2.0  [H-weighted]
-    group   8: ‖E_cat‖=10.4972  S.max=1.1864  S.sum=34.7251  S[0]/S[-1]=2.5  [H-weighted]
-    group   9: ‖E_cat‖=10.3194  S.max=1.2362  S.sum=34.0428  S[0]/S[-1]=2.5  [H-weighted]
-    group  10: ‖E_cat‖=10.5633  S.max=1.2363  S.sum=34.5489  S[0]/S[-1]=2.2  [H-weighted]
-    group  11: ‖E_cat‖=10.8972  S.max=1.1698  S.sum=36.4858  S[0]/S[-1]=2.1  [H-weighted]
-    group  12: ‖E_cat‖=11.1401  S.max=1.4269  S.sum=36.2491  S[0]/S[-1]=2.0  [H-weighted]
-    group  13: ‖E_cat‖=11.5906  S.max=1.4215  S.sum=38.8087  S[0]/S[-1]=1.3  [H-weighted]
-  v_proj groups:  58%|█████▊    | 14/24 [00:00<00:00, 58.57it/s]    group  14: ‖E_cat‖=12.1058  S.max=1.2847  S.sum=39.8354  S[0]/S[-1]=1.2  [H-weighted]
-    group  15: ‖E_cat‖=12.8961  S.max=1.6603  S.sum=42.2935  S[0]/S[-1]=0.6  [H-weighted]
-    group  16: ‖E_cat‖=12.3810  S.max=1.5249  S.sum=41.3081  S[0]/S[-1]=0.9  [H-weighted]
-    group  17: ‖E_cat‖=13.4200  S.max=1.6027  S.sum=44.7221  S[0]/S[-1]=0.7  [H-weighted]
-    group  18: ‖E_cat‖=13.9050  S.max=1.6568  S.sum=47.2763  S[0]/S[-1]=0.8  [H-weighted]
-    group  19: ‖E_cat‖=14.6575  S.max=1.9111  S.sum=50.7916  S[0]/S[-1]=0.8  [H-weighted]
-  v_proj groups:  83%|████████▎ | 20/24 [00:00<00:00, 55.64it/s]    group  20: ‖E_cat‖=14.5817  S.max=1.4354  S.sum=49.6793  S[0]/S[-1]=0.9  [H-weighted]
-    group  21: ‖E_cat‖=15.0120  S.max=1.7267  S.sum=51.3359  S[0]/S[-1]=0.7  [H-weighted]
-    group  22: ‖E_cat‖=15.4237  S.max=1.6587  S.sum=52.9647  S[0]/S[-1]=0.7  [H-weighted]
-    group  23: ‖E_cat‖=14.6050  S.max=1.3833  S.sum=48.6999  S[0]/S[-1]=1.8  [H-weighted]
-                                                                
-[Stage 4] Writing reconstructed weights to model ...
-  Writing weights:   0%|          | 0/24 [00:00<?, ?it/s]    layer   0  self_attn.k_proj: ‖ΔW‖=9.7285  ‖W‖=57.8446  rel=0.1682
-    layer   0  self_attn.o_proj: ‖ΔW‖=5.0362  ‖W‖=17.2019  rel=0.2928
-    layer   0  self_attn.q_proj: ‖ΔW‖=14.1744  ‖W‖=66.9122  rel=0.2118
-    layer   0  self_attn.v_proj: ‖ΔW‖=3.1996  ‖W‖=21.1007  rel=0.1516
-  Writing weights:   4%|▍         | 1/24 [00:00<00:09,  2.53it/s]    layer   1  self_attn.k_proj: ‖ΔW‖=18.9609  ‖W‖=72.3275  rel=0.2622
-    layer   1  self_attn.o_proj: ‖ΔW‖=5.4073  ‖W‖=20.3473  rel=0.2658
-    layer   1  self_attn.q_proj: ‖ΔW‖=17.8420  ‖W‖=72.0374  rel=0.2477
-    layer   1  self_attn.v_proj: ‖ΔW‖=4.3042  ‖W‖=21.0882  rel=0.2041
-  Writing weights:   8%|▊         | 2/24 [00:00<00:08,  2.47it/s]    layer   2  self_attn.k_proj: ‖ΔW‖=8.1130  ‖W‖=52.2743  rel=0.1552
-    layer   2  self_attn.o_proj: ‖ΔW‖=3.1930  ‖W‖=23.1854  rel=0.1377
-    layer   2  self_attn.q_proj: ‖ΔW‖=8.4676  ‖W‖=50.8572  rel=0.1665
-    layer   2  self_attn.v_proj: ‖ΔW‖=3.9627  ‖W‖=25.1562  rel=0.1575
-  Writing weights:  12%|█▎        | 3/24 [00:01<00:08,  2.44it/s]    layer   3  self_attn.k_proj: ‖ΔW‖=8.1106  ‖W‖=51.5437  rel=0.1574
-    layer   3  self_attn.o_proj: ‖ΔW‖=3.4147  ‖W‖=23.1069  rel=0.1478
-    layer   3  self_attn.q_proj: ‖ΔW‖=8.7307  ‖W‖=49.2455  rel=0.1773
-    layer   3  self_attn.v_proj: ‖ΔW‖=4.0650  ‖W‖=25.0747  rel=0.1621
-  Writing weights:  17%|█▋        | 4/24 [00:01<00:08,  2.47it/s]    layer   4  self_attn.k_proj: ‖ΔW‖=7.3754  ‖W‖=51.1092  rel=0.1443
-    layer   4  self_attn.o_proj: ‖ΔW‖=3.7292  ‖W‖=24.4778  rel=0.1524
-    layer   4  self_attn.q_proj: ‖ΔW‖=7.7382  ‖W‖=50.0608  rel=0.1546
-    layer   4  self_attn.v_proj: ‖ΔW‖=3.9560  ‖W‖=26.4163  rel=0.1498
-  Writing weights:  21%|██        | 5/24 [00:02<00:07,  2.49it/s]    layer   5  self_attn.k_proj: ‖ΔW‖=7.7630  ‖W‖=54.4939  rel=0.1425
-    layer   5  self_attn.o_proj: ‖ΔW‖=4.0810  ‖W‖=25.2075  rel=0.1619
-    layer   5  self_attn.q_proj: ‖ΔW‖=8.0134  ‖W‖=53.5860  rel=0.1495
-    layer   5  self_attn.v_proj: ‖ΔW‖=3.9858  ‖W‖=26.7340  rel=0.1491
-  Writing weights:  25%|██▌       | 6/24 [00:02<00:07,  2.53it/s]    layer   6  self_attn.k_proj: ‖ΔW‖=7.9208  ‖W‖=52.9793  rel=0.1495
-    layer   6  self_attn.o_proj: ‖ΔW‖=4.8422  ‖W‖=26.0317  rel=0.1860
-    layer   6  self_attn.q_proj: ‖ΔW‖=7.9577  ‖W‖=52.0101  rel=0.1530
-    layer   6  self_attn.v_proj: ‖ΔW‖=4.0222  ‖W‖=26.1445  rel=0.1538
-  Writing weights:  29%|██▉       | 7/24 [00:02<00:06,  2.50it/s]    layer   7  self_attn.k_proj: ‖ΔW‖=8.4032  ‖W‖=50.2123  rel=0.1674
-    layer   7  self_attn.o_proj: ‖ΔW‖=3.9682  ‖W‖=22.9385  rel=0.1730
-    layer   7  self_attn.q_proj: ‖ΔW‖=8.2784  ‖W‖=50.0139  rel=0.1655
-    layer   7  self_attn.v_proj: ‖ΔW‖=4.1622  ‖W‖=24.1645  rel=0.1722
-  Writing weights:  33%|███▎      | 8/24 [00:03<00:06,  2.47it/s]    layer   8  self_attn.k_proj: ‖ΔW‖=8.7093  ‖W‖=52.6169  rel=0.1655
-    layer   8  self_attn.o_proj: ‖ΔW‖=4.3767  ‖W‖=24.2913  rel=0.1802
-    layer   8  self_attn.q_proj: ‖ΔW‖=8.5475  ‖W‖=51.1816  rel=0.1670
-    layer   8  self_attn.v_proj: ‖ΔW‖=4.1818  ‖W‖=24.8667  rel=0.1682
-  Writing weights:  38%|███▊      | 9/24 [00:03<00:06,  2.50it/s]    layer   9  self_attn.k_proj: ‖ΔW‖=8.6365  ‖W‖=51.3831  rel=0.1681
-    layer   9  self_attn.o_proj: ‖ΔW‖=4.1838  ‖W‖=23.7082  rel=0.1765
-    layer   9  self_attn.q_proj: ‖ΔW‖=8.4456  ‖W‖=50.4647  rel=0.1674
-    layer   9  self_attn.v_proj: ‖ΔW‖=4.1846  ‖W‖=24.3320  rel=0.1720
-  Writing weights:  42%|████▏     | 10/24 [00:04<00:06,  2.14it/s]    layer  10  self_attn.k_proj: ‖ΔW‖=8.3620  ‖W‖=50.0921  rel=0.1669
-    layer  10  self_attn.o_proj: ‖ΔW‖=4.4155  ‖W‖=23.9496  rel=0.1844
-    layer  10  self_attn.q_proj: ‖ΔW‖=8.1156  ‖W‖=50.1557  rel=0.1618
-    layer  10  self_attn.v_proj: ‖ΔW‖=4.2714  ‖W‖=24.8927  rel=0.1716
-  Writing weights:  46%|████▌     | 11/24 [00:05<00:07,  1.73it/s]    layer  11  self_attn.k_proj: ‖ΔW‖=8.0128  ‖W‖=48.3982  rel=0.1656
-    layer  11  self_attn.o_proj: ‖ΔW‖=4.2808  ‖W‖=24.6310  rel=0.1738
-    layer  11  self_attn.q_proj: ‖ΔW‖=8.1639  ‖W‖=48.7708  rel=0.1674
-    layer  11  self_attn.v_proj: ‖ΔW‖=4.3191  ‖W‖=25.7443  rel=0.1678
-  Writing weights:  50%|█████     | 12/24 [00:06<00:08,  1.44it/s]    layer  12  self_attn.k_proj: ‖ΔW‖=8.2650  ‖W‖=49.1704  rel=0.1681
-    layer  12  self_attn.o_proj: ‖ΔW‖=4.7192  ‖W‖=25.2556  rel=0.1869
-    layer  12  self_attn.q_proj: ‖ΔW‖=8.1007  ‖W‖=49.0773  rel=0.1651
-    layer  12  self_attn.v_proj: ‖ΔW‖=4.5499  ‖W‖=26.2769  rel=0.1732
-  Writing weights:  54%|█████▍    | 13/24 [00:06<00:07,  1.55it/s]    layer  13  self_attn.k_proj: ‖ΔW‖=7.7810  ‖W‖=46.9644  rel=0.1657
-    layer  13  self_attn.o_proj: ‖ΔW‖=4.7321  ‖W‖=26.5355  rel=0.1783
-    layer  13  self_attn.q_proj: ‖ΔW‖=7.7671  ‖W‖=46.1627  rel=0.1683
-    layer  13  self_attn.v_proj: ‖ΔW‖=4.6235  ‖W‖=27.2821  rel=0.1695
-  Writing weights:  58%|█████▊    | 14/24 [00:07<00:06,  1.57it/s]    layer  14  self_attn.k_proj: ‖ΔW‖=6.9041  ‖W‖=43.2142  rel=0.1598
-    layer  14  self_attn.o_proj: ‖ΔW‖=5.0253  ‖W‖=27.7223  rel=0.1813
-    layer  14  self_attn.q_proj: ‖ΔW‖=7.3090  ‖W‖=44.4196  rel=0.1645
-    layer  14  self_attn.v_proj: ‖ΔW‖=4.7608  ‖W‖=28.6789  rel=0.1660
-  Writing weights:  62%|██████▎   | 15/24 [00:07<00:05,  1.52it/s]    layer  15  self_attn.k_proj: ‖ΔW‖=6.9140  ‖W‖=43.1487  rel=0.1602
-    layer  15  self_attn.o_proj: ‖ΔW‖=5.3909  ‖W‖=29.6790  rel=0.1816
-    layer  15  self_attn.q_proj: ‖ΔW‖=7.2653  ‖W‖=43.5847  rel=0.1667
-    layer  15  self_attn.v_proj: ‖ΔW‖=5.1207  ‖W‖=30.5084  rel=0.1678
-  Writing weights:  67%|██████▋   | 16/24 [00:08<00:05,  1.48it/s]    layer  16  self_attn.k_proj: ‖ΔW‖=7.0718  ‖W‖=44.2120  rel=0.1600
-    layer  16  self_attn.o_proj: ‖ΔW‖=4.9366  ‖W‖=28.1031  rel=0.1757
-    layer  16  self_attn.q_proj: ‖ΔW‖=7.3800  ‖W‖=44.0769  rel=0.1674
-    layer  16  self_attn.v_proj: ‖ΔW‖=4.9043  ‖W‖=29.1557  rel=0.1682
-  Writing weights:  71%|███████   | 17/24 [00:09<00:05,  1.35it/s]    layer  17  self_attn.k_proj: ‖ΔW‖=6.0492  ‖W‖=38.6457  rel=0.1565
-    layer  17  self_attn.o_proj: ‖ΔW‖=5.3132  ‖W‖=30.8032  rel=0.1725
-    layer  17  self_attn.q_proj: ‖ΔW‖=6.5811  ‖W‖=40.0492  rel=0.1643
-    layer  17  self_attn.v_proj: ‖ΔW‖=5.1337  ‖W‖=31.7135  rel=0.1619
-  Writing weights:  75%|███████▌  | 18/24 [00:10<00:04,  1.23it/s]    layer  18  self_attn.k_proj: ‖ΔW‖=5.6675  ‖W‖=38.7456  rel=0.1463
-    layer  18  self_attn.o_proj: ‖ΔW‖=3.9980  ‖W‖=31.3087  rel=0.1277
-    layer  18  self_attn.q_proj: ‖ΔW‖=6.1390  ‖W‖=39.6624  rel=0.1548
-    layer  18  self_attn.v_proj: ‖ΔW‖=5.1018  ‖W‖=32.8776  rel=0.1552
-  Writing weights:  79%|███████▉  | 19/24 [00:11<00:04,  1.17it/s]    layer  19  self_attn.k_proj: ‖ΔW‖=5.1920  ‖W‖=37.4979  rel=0.1385
-    layer  19  self_attn.o_proj: ‖ΔW‖=3.9634  ‖W‖=32.8369  rel=0.1207
-    layer  19  self_attn.q_proj: ‖ΔW‖=5.5509  ‖W‖=37.9204  rel=0.1464
-    layer  19  self_attn.v_proj: ‖ΔW‖=5.1913  ‖W‖=34.6121  rel=0.1500
-  Writing weights:  83%|████████▎ | 20/24 [00:11<00:02,  1.35it/s]    layer  20  self_attn.k_proj: ‖ΔW‖=5.3346  ‖W‖=37.5494  rel=0.1421
-    layer  20  self_attn.o_proj: ‖ΔW‖=3.4836  ‖W‖=32.8549  rel=0.1060
-    layer  20  self_attn.q_proj: ‖ΔW‖=5.6590  ‖W‖=37.9854  rel=0.1490
-    layer  20  self_attn.v_proj: ‖ΔW‖=5.2610  ‖W‖=34.6329  rel=0.1519
-  Writing weights:  88%|████████▊ | 21/24 [00:12<00:02,  1.36it/s]    layer  21  self_attn.k_proj: ‖ΔW‖=5.0784  ‖W‖=37.0322  rel=0.1371
-    layer  21  self_attn.o_proj: ‖ΔW‖=3.9693  ‖W‖=33.7938  rel=0.1175
-    layer  21  self_attn.q_proj: ‖ΔW‖=5.3340  ‖W‖=37.4039  rel=0.1426
-    layer  21  self_attn.v_proj: ‖ΔW‖=5.2123  ‖W‖=35.5936  rel=0.1464
-  Writing weights:  92%|█████████▏| 22/24 [00:13<00:01,  1.50it/s]    layer  22  self_attn.k_proj: ‖ΔW‖=4.8004  ‖W‖=36.3083  rel=0.1322
-    layer  22  self_attn.o_proj: ‖ΔW‖=4.1818  ‖W‖=34.8157  rel=0.1201
-    layer  22  self_attn.q_proj: ‖ΔW‖=4.9037  ‖W‖=36.0637  rel=0.1360
-    layer  22  self_attn.v_proj: ‖ΔW‖=5.1130  ‖W‖=36.6885  rel=0.1394
-  Writing weights:  96%|█████████▌| 23/24 [00:13<00:00,  1.52it/s]    layer  23  self_attn.k_proj: ‖ΔW‖=4.9305  ‖W‖=35.7509  rel=0.1379
-    layer  23  self_attn.o_proj: ‖ΔW‖=5.8456  ‖W‖=32.9731  rel=0.1773
-    layer  23  self_attn.q_proj: ‖ΔW‖=4.9588  ‖W‖=35.4646  rel=0.1398
-    layer  23  self_attn.v_proj: ‖ΔW‖=5.0263  ‖W‖=34.9012  rel=0.1440
-  Writing weights: 100%|██████████| 24/24 [00:14<00:00,  1.40it/s]  Writing weights: 100%|██████████| 24/24 [00:14<00:00,  1.64it/s]
-  [write-back] Actual writes: 96 / expected: 96 (W_approx = Q(W) + U@S@V.T)
-
-=========================================================
-  Model Bit-Width Summary (cross-layer sharing)
-=========================================================
-  Total quantized params:                  402,653,184
-  2-bit weights:                           2.0000 bits/param
-  Hybrid quant scale        (fp16):              0.1250 bits/param
-  Shared U            (int8, amortized):   0.2502 bits/param
-  Per-expert V        (int8):               0.2502 bits/param
-  Singular values S   (fp16, amortized):   0.0002 bits/param
-  -----------------------------------------------------
-  Total average:                           2.6257 bits/param
-  Original model (fp16):                  16.0000 bits/param
-  Compression ratio:                         6.09x
-=========================================================
-
-[save] Saving model (W_approx = Q(W) + U@S@V.T, fp16) → ./output/Qwen/Qwen1.5-MoE-A2.7B-glorcq-2bit-rank64-fakequant
-Writing model shards:   0%|          | 0/1 [00:00<?, ?it/s]Writing model shards: 100%|██████████| 1/1 [00:35<00:00, 35.16s/it]Writing model shards: 100%|██████████| 1/1 [00:35<00:00, 35.16s/it]
-
-[save] Cross-layer info → ./output/Qwen/Qwen1.5-MoE-A2.7B-glorcq-2bit-rank64-fakequant/cross_layer_info.pt
-
-✓ Done.
+==================================================
+  Peak GPU Memory: 27963 MB
+  Compile:  7.2 ± 0.0 tok/s (mode=default)
+  FP16:     6.8 ± 0.1 tok/s
+  Speedup (Compile vs FP16):   1.06x
+==================================================
