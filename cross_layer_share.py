@@ -345,28 +345,44 @@ def _grassmannian_dist_matrix(E_T_list, rank: int) -> np.ndarray:
     Pairwise Grassmannian geodesic distance on the residual U subspaces.
 
     d(i,j) = || arccos( σ(U_i^T U_j) ) ||_2  / (√r · π/2)  ∈ [0,1]
+
+    Computation is done on GPU with batched SVD for speed.
     """
     N = len(E_T_list)
     print(f"  [grassmannian] SVD for {N} modules, rank={rank} ...", flush=True)
-    U_all = np.stack([_compute_svd_u(E_T, rank) for E_T in E_T_list], axis=0)  # (N, in, r)
-    _, _, r = U_all.shape
-    max_d   = np.sqrt(r) * (np.pi / 2)
-    D       = np.zeros((N, N), dtype=np.float32)
+    U_np = np.stack([_compute_svd_u(E_T, rank) for E_T in E_T_list], axis=0)  # (N, in, r)
+    _, _, r = U_np.shape
+    max_d = np.sqrt(r) * (np.pi / 2)
 
-    print(f"  [grassmannian] {N*(N-1)//2} pairs ...", flush=True)
+    # Move to GPU for batched distance computation
+    U_all = torch.from_numpy(U_np).to(DEV)  # (N, in_d, r)
+    D = torch.zeros(N, N, device=DEV)
+
+    print(f"  [grassmannian] {N*(N-1)//2} pairs (GPU-batched) ...", flush=True)
+    # Process in chunks to limit GPU memory for svdvals
+    _chunk = 2048
     for i in range(N - 1):
-        U_i_T   = U_all[i].T                    # (r, in)
-        U_rest  = U_all[i + 1:]                 # (M, in, r)
-        M_batch = np.matmul(U_i_T, U_rest)      # (M, r, r)
-        sigma   = np.linalg.svd(M_batch, compute_uv=False)
-        sigma   = np.clip(sigma, 0.0, 1.0)
-        angles  = np.arccos(sigma)
-        dists   = np.sqrt((angles ** 2).sum(axis=1)) / (max_d + 1e-12)
+        U_i_T = U_all[i].T.unsqueeze(0)          # (1, r, in_d)
+        rest = U_all[i + 1:]                       # (M, in_d, r)
+        M = rest.shape[0]
+        dists_list = []
+        for c0 in range(0, M, _chunk):
+            c1 = min(c0 + _chunk, M)
+            M_batch = torch.bmm(
+                U_i_T.expand(c1 - c0, -1, -1),    # (chunk, r, in_d)
+                rest[c0:c1],                        # (chunk, in_d, r)
+            )                                       # (chunk, r, r)
+            sigma = torch.linalg.svdvals(M_batch)   # (chunk, r)
+            sigma = sigma.clamp(0.0, 1.0)
+            angles = torch.arccos(sigma)
+            d = angles.pow(2).sum(dim=1).sqrt() / (max_d + 1e-12)
+            dists_list.append(d)
+        dists = torch.cat(dists_list)
         D[i, i + 1:] = dists
         D[i + 1:, i] = dists
         if (i + 1) % 200 == 0 or i == N - 2:
             print(f"    row {i+1}/{N-1}", flush=True)
-    return D
+    return D.cpu().numpy()
 
 
 def cluster_residuals(all_residuals, rank: int, G_moe: int, G_attn: int,

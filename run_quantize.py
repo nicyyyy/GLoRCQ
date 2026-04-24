@@ -129,7 +129,8 @@ def run_joint_quant(args):
               f" (n_iter={args.n_iter})")
     print("=" * 60)
     all_records = quantize_joint(model, layers, dataloader, args,
-                                  use_turboquant=args.use_turboquant)
+                                  use_turboquant=args.use_turboquant,
+                                  model_type=config.model_type)
     gc.collect()
     torch.cuda.empty_cache()
 
@@ -288,6 +289,9 @@ def parse_args():
     p.add_argument("--use_turboquant", action="store_true", default=False,
                    help="Use TurboQuant vector quantizer instead of GPTQ "
                         "(random rotation + Lloyd-Max optimal codebook)")
+    p.add_argument("--turbo_batch_size", type=int, default=0,
+                   help="Batch size for TurboQuant MoE experts per wtype "
+                        "(0=all at once, reduce if OOM)")
     p.add_argument("--real_quant", action="store_true", default=False,
                    help="Save real quantized weights (packed int + LoRA params) "
                         "instead of fake-quant fp16 W_approx")

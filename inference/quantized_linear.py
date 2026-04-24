@@ -181,6 +181,7 @@ class GLoRCQLinear(nn.Module):
         self.U = None                # (in_d, rank) fp16
         self.S = None                # (rank,) fp16
         self.V = None                # (out_d, rank) fp16
+        self.cluster_id = None       # set by model_builder for cluster-parallel LoRA
 
         # Bias
         self.bias_param = None       # (out_d,) fp16
@@ -261,12 +262,15 @@ class GLoRCQLinear(nn.Module):
                 W[:, col0:col1] = (q_slice - self.zeros[:, gi:gi+1]) * self.scales[:, gi:gi+1]
         return W
 
-    def forward(self, x):
+    def forward(self, x, precomputed_xU=None):
         """
         Forward pass: dequantize weights, matmul, add LoRA compensation.
 
         Args:
             x: (..., in_features) input tensor
+            precomputed_xU: optional (..., rank) tensor — pre-computed ``x @ U``
+                from cluster-parallel MoE. Skips redundant ``x @ U`` when
+                multiple experts in the same cluster share the same U matrix.
         Returns:
             y: (..., out_features) output tensor
         """
@@ -275,14 +279,19 @@ class GLoRCQLinear(nn.Module):
             x = x.reshape(-1, self.in_features)
 
         # 1. Quantized weight matmul
+        # When precomputed_xU is provided, skip kernel-level LoRA fusion
+        # (the Python LoRA path below will use precomputed_xU instead).
+        _skip_lora_fusion = (precomputed_xU is not None)
         lora_fused = False
         if self.quant_type == "gptq":
             if _HAS_GPTQ_FUSED_KERNEL:
-                lora_USV = (self.U, self.S, self.V) if self.U is not None else None
+                lora_USV = None
+                if self.U is not None and not _skip_lora_fusion:
+                    lora_USV = (self.U, self.S, self.V)
                 y = gptq_dequant_matmul_fused(
                     x, self.qweight_int, self.scales, self.zeros,
                     self.gptq_groupsize, self.gptq_sym, lora_USV=lora_USV)
-                lora_fused = (self.U is not None)
+                lora_fused = (lora_USV is not None)
             else:
                 W = self._dequant_gptq()
                 y = x @ W.T
@@ -295,7 +304,7 @@ class GLoRCQLinear(nn.Module):
                 # Fused CUDA kernel path: dequant + matmul + optional LoRA in one kernel
                 if _HAS_FUSED_KERNEL and self.turbo_bits == 2:
                     lora_USV = None
-                    if self.U is not None:
+                    if self.U is not None and not _skip_lora_fusion:
                         lora_USV = (self.U, self.S, self.V)
                     y = turbo_dequant_matmul_fused(
                         x, self.packed_indices, self.norms,
@@ -316,9 +325,12 @@ class GLoRCQLinear(nn.Module):
 
         # 2. LoRA compensation: y += (x @ U) * S @ V^T (skip if already fused)
         if self.U is not None and not lora_fused:
-            a = x @ self.U          # (..., rank)
-            b = a * self.S          # (..., rank)
-            y = y + b @ self.V.T    # (..., out_d)
+            if precomputed_xU is not None:
+                a = precomputed_xU      # reuse cluster-parallel result
+            else:
+                a = x @ self.U          # (..., rank)
+            b = a * self.S              # (..., rank)
+            y = y + b @ self.V.T        # (..., out_d)
 
         # 3. Bias
         if self.bias_param is not None:

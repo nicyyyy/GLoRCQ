@@ -86,3 +86,27 @@ def find_layers(module, layers=[nn.Conv2d, nn.Linear], name=''):
         ))
     return res
 
+
+# ---------------------------------------------------------------------------
+# Per-architecture MoE config registry.  Add new models by adding an entry.
+# ---------------------------------------------------------------------------
+_MOE_ARCH_CONFIG = {
+    "qwen2_moe": {
+        "has_shared_expert": True,     # shared_expert exists, keep FP16
+        "expert_container": "mlp",     # module path containing .experts
+    },
+    "mixtral": {
+        "has_shared_expert": False,
+        "expert_container": "block_sparse_moe",
+    },
+}
+_DEFAULT_MOE_CONFIG = {
+    "has_shared_expert": False,
+    "expert_container": None,
+}
+
+
+def get_moe_config(model_type: str) -> dict:
+    """Return MoE arch config for *model_type* (from ``config.model_type``)."""
+    return _MOE_ARCH_CONFIG.get(model_type, _DEFAULT_MOE_CONFIG)
+

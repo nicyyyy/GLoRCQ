@@ -37,6 +37,7 @@ from cross_layer_share import (
     _expert_idx_from_name,
     _move_model_embeds,
 )
+from utils.moe_utils import is_regular_expert, is_shared_expert, get_moe_config
 from turbo_weight_quantizer import TurboWeightQuantizer
 
 
@@ -228,6 +229,7 @@ class GPTQJoint:
             # No calibration data — return unquantized W_r
             Q = W_r.half()
             self.layer.weight.data = Q
+            self.Q_gpu = Q.float()
             if real_quant:
                 return W_orig, Q.cpu(), None
             return W_orig, Q.cpu()
@@ -310,6 +312,7 @@ class GPTQJoint:
 
         Q = Q.reshape(self.layer.weight.shape).half()
         self.layer.weight.data = Q
+        self.Q_gpu = Q.float()  # cache on GPU for callers to avoid CPU↔GPU roundtrip
 
         if real_quant:
             gptq_packed = {
@@ -364,6 +367,7 @@ class GPTQJoint:
 
         Q = Q.half()
         self.layer.weight.data = Q.clone()
+        self.Q_gpu = Q.float()  # cache on GPU for callers to avoid CPU↔GPU roundtrip
         if real_quant:
             return W_orig, Q.cpu(), compressed
         return W_orig, Q.cpu()
@@ -429,6 +433,9 @@ class GPTQJoint:
         if hasattr(self, 'W_orig_gpu') and self.W_orig_gpu is not None:
             del self.W_orig_gpu
             self.W_orig_gpu = None
+        if hasattr(self, 'Q_gpu') and self.Q_gpu is not None:
+            del self.Q_gpu
+            self.Q_gpu = None
         torch.cuda.empty_cache()
 
 
@@ -531,7 +538,8 @@ def search_act_scale_pergroup(g, alpha_grid=None, groupsize=128):
 # Stage 1 — Alternating Joint Quantization + Hessian-weighted SVD
 # ---------------------------------------------------------------------------
 @torch.no_grad()
-def quantize_joint(model, layers, dataloader, args, use_turboquant: bool = False):
+def quantize_joint(model, layers, dataloader, args, use_turboquant: bool = False,
+                   model_type: str = ""):
     """
     Layer-by-layer alternating quantization + Hessian-weighted LoRA optimization.
 
@@ -549,6 +557,7 @@ def quantize_joint(model, layers, dataloader, args, use_turboquant: bool = False
     sym   = getattr(args, 'sym',    False)
     mse   = getattr(args, 'w_clip', True)
     real_quant = getattr(args, 'real_quant', False)
+    moe_cfg = get_moe_config(model_type)
 
     # Create TurboQuant quantizer if requested
     turbo_quantizer = None
@@ -654,8 +663,9 @@ def quantize_joint(model, layers, dataloader, args, use_turboquant: bool = False
 
         for name, g in gptq.items():
             eidx = _expert_idx_from_name(name)
-            if use_turboquant and eidx != -1:
-                # MoE expert or shared expert: TurboQuant, no act_scale
+            if use_turboquant and eidx >= 0:
+                # Regular MoE expert: TurboQuant, no act_scale
+                # (shared experts eidx==-2 fall through to attention path below)
                 g.prepare_hessian(percdamp=args.percdamp, act_alpha=default_alpha,
                                   use_turboquant=True)
                 continue
@@ -681,7 +691,7 @@ def quantize_joint(model, layers, dataloader, args, use_turboquant: bool = False
             # HYBRID: GPTQ(attn) + TurboQuant(MoE)
             # ==============================================================
             attn_names = [n for n in gptq if _expert_idx_from_name(n) == -1]
-            moe_names  = [n for n in gptq if _expert_idx_from_name(n) != -1]
+            moe_names  = [n for n in gptq if _expert_idx_from_name(n) >= 0]
 
             # Phase A: GPTQ alternating for attention
             lora_state_attn = {name: (None, None, None) for name in attn_names}
@@ -701,14 +711,14 @@ def quantize_joint(model, layers, dataloader, args, use_turboquant: bool = False
                         W_lora=W_lora, percdamp=args.percdamp,
                         groupsize=args.groupsize, reset_quant=(it == 0),
                     )
-                    E = (W_orig.float() - Q_W.float()).to(DEV)
+                    E = g.W_orig_gpu - g.Q_gpu
                     U_new, S_new, V_new = g.hessian_weighted_svd(E, args.rank)
                     lora_state_attn[name] = (U_new, S_new, V_new)
                     W_lora_new = U_new.float() @ (S_new.unsqueeze(1) * V_new.T.float())
-                    full[name].weight.data = (Q_W.to(DEV).float() + W_lora_new).half()
+                    full[name].weight.data = (g.Q_gpu + W_lora_new).half()
 
                     if early_stop_tol > 0:
-                        E_new = (W_orig.float().to(DEV) - Q_W.float().to(DEV) - W_lora_new)
+                        E_new = g.W_orig_gpu - g.Q_gpu - W_lora_new
                         curr_frob = E_new.norm().item()
                         rel_improve = (prev_frob[name] - curr_frob) / (prev_frob[name] + 1e-12)
                         if rel_improve < early_stop_tol:
@@ -727,10 +737,10 @@ def quantize_joint(model, layers, dataloader, args, use_turboquant: bool = False
                 _, Q_W_final = g.fasterquant(
                     W_lora=W_lora_final, percdamp=args.percdamp, groupsize=args.groupsize,
                 )
-                E_sym = (W_orig.float() - Q_W_final.float()).to(DEV)
+                E_sym = g.W_orig_gpu - g.Q_gpu
                 U_sym, S_sym, V_sym = g.hessian_weighted_svd(E_sym, args.rank)
                 W_lora_sym = U_sym.float() @ (S_sym.unsqueeze(1) * V_sym.T.float())
-                full[name].weight.data = (Q_W_final.to(DEV).float() + W_lora_sym).half()
+                full[name].weight.data = (g.Q_gpu + W_lora_sym).half()
 
                 if expert_idx >= 0 or expert_idx == -1:
                     record = {
@@ -753,47 +763,90 @@ def quantize_joint(model, layers, dataloader, args, use_turboquant: bool = False
                         )
                         record["gptq_packed"] = gptq_packed
                         # Restore the correct weight (fasterquant overwrites it)
-                        full[name].weight.data = (Q_W_final.to(DEV).float() + W_lora_sym).half()
+                        full[name].weight.data = (g.Q_gpu + W_lora_sym).half()
                     all_records.append(record)
                 g.free()
 
-            # Phase B: Sequential TurboQuant for MoE
+            # Phase B: Batched TurboQuant for MoE
+            # Group moe_names by in_d (same-dim experts can be batched)
+            from collections import defaultdict as _defaultdict
+            _dim_groups = _defaultdict(list)
             for name in moe_names:
-                g = gptq[name]
-                expert_idx = _expert_idx_from_name(name)
-                wtype      = _wtype_from_name(name)
+                _dim_groups[gptq[name].columns].append(name)
 
-                if real_quant:
-                    W_orig, Q_W, compressed = g.turbo_quantize(
-                        turbo_quantizer, W_lora=None,
-                        name=f"L{layer_idx}.{name}", real_quant=True)
-                else:
-                    W_orig, Q_W = g.turbo_quantize(
-                        turbo_quantizer, W_lora=None,
-                        name=f"L{layer_idx}.{name}")
-                    compressed = None
+            turbo_bs = getattr(args, 'turbo_batch_size', 0)
 
-                E = (W_orig.float() - Q_W.float()).to(DEV)
-                U, S, V = g.hessian_weighted_svd(E, args.rank)
-                W_lora = U.float() @ (S.unsqueeze(1) * V.T.float())
-                full[name].weight.data = (Q_W.to(DEV).float() + W_lora).half()
+            for _in_d, _group_names in _dim_groups.items():
+                bs = turbo_bs if turbo_bs > 0 else len(_group_names)
+                for _c0 in range(0, len(_group_names), bs):
+                    _chunk = _group_names[_c0:_c0 + bs]
 
-                if expert_idx >= 0 or expert_idx == -1:
-                    record = {
-                        "layer":        layer_idx,
-                        "expert":       expert_idx,
-                        "type":         wtype,
-                        "module_name":  name,
-                        "shape":        tuple(W_orig.shape),
-                        "weight_orig":  W_orig,
-                        "weight_quant": Q_W,
-                        "hessian_diag": g.H_eq_diag,
-                        "quant_method": "turboquant",
-                    }
-                    if real_quant and compressed is not None:
-                        record["turbo_compressed"] = compressed
-                    all_records.append(record)
-                g.free()
+                    if real_quant:
+                        # real_quant needs per-expert compressed data → sequential
+                        for name in _chunk:
+                            g = gptq[name]
+                            W_orig, Q_W, compressed = g.turbo_quantize(
+                                turbo_quantizer, W_lora=None,
+                                name=f"L{layer_idx}.{name}", real_quant=True)
+                            E = g.W_orig_gpu - g.Q_gpu
+                            U, S, V = g.hessian_weighted_svd(E, args.rank)
+                            W_lora = U.float() @ (S.unsqueeze(1) * V.T.float())
+                            full[name].weight.data = (g.Q_gpu + W_lora).half()
+                            expert_idx = _expert_idx_from_name(name)
+                            wtype = _wtype_from_name(name)
+                            if expert_idx >= 0 or expert_idx == -1:
+                                record = {
+                                    "layer": layer_idx, "expert": expert_idx,
+                                    "type": wtype, "module_name": name,
+                                    "shape": tuple(W_orig.shape),
+                                    "weight_orig": W_orig, "weight_quant": Q_W,
+                                    "hessian_diag": g.H_eq_diag,
+                                    "quant_method": "turboquant",
+                                }
+                                if compressed is not None:
+                                    record["turbo_compressed"] = compressed
+                                all_records.append(record)
+                            g.free()
+                        continue
+
+                    # Batch quantize: stack weights → one TurboQuant call → split
+                    W_list = [gptq[n].W_orig_gpu for n in _chunk]
+                    out_dims = [w.shape[0] for w in W_list]
+                    W_stacked = torch.cat(W_list, dim=0)  # (Σout_d, in_d)
+
+                    Q_stacked = turbo_quantizer.quantize_dequantize(W_stacked)
+
+                    # Split back and do per-expert SVD + record
+                    _off = 0
+                    for name, _od in zip(_chunk, out_dims):
+                        g = gptq[name]
+                        Q_exp = Q_stacked[_off:_off + _od]
+                        _off += _od
+
+                        # Cache quantized result (same as turbo_quantize would)
+                        g.Q_gpu = Q_exp.float()
+                        g.layer.weight.data = Q_exp.half().clone()
+                        Q_W = Q_exp.cpu().half()
+
+                        E = g.W_orig_gpu - g.Q_gpu
+                        U, S, V = g.hessian_weighted_svd(E, args.rank)
+                        W_lora = U.float() @ (S.unsqueeze(1) * V.T.float())
+                        full[name].weight.data = (g.Q_gpu + W_lora).half()
+
+                        expert_idx = _expert_idx_from_name(name)
+                        wtype = _wtype_from_name(name)
+                        if expert_idx >= 0 or expert_idx == -1:
+                            record = {
+                                "layer": layer_idx, "expert": expert_idx,
+                                "type": wtype, "module_name": name,
+                                "shape": tuple(g.W_orig_saved.shape),
+                                "weight_orig": g.W_orig_saved,
+                                "weight_quant": Q_W,
+                                "hessian_diag": g.H_eq_diag,
+                                "quant_method": "turboquant",
+                            }
+                            all_records.append(record)
+                        g.free()
         else:
             # ==============================================================
             # GPTQ: Alternating optimization (n_iter rounds) + symmetry fix
@@ -825,19 +878,17 @@ def quantize_joint(model, layers, dataloader, args, use_turboquant: bool = False
                     )
 
                     # Residual: E = W_orig - Q_W  (Hessian-weighted SVD target)
-                    E = (W_orig.float() - Q_W.float()).to(DEV)
+                    E = g.W_orig_gpu - g.Q_gpu
                     U_new, S_new, V_new = g.hessian_weighted_svd(E, args.rank)
                     lora_state[name] = (U_new, S_new, V_new)
 
                     # Update layer weight to W_approx = Q + LoRA
                     W_lora_new = U_new.float() @ (S_new.unsqueeze(1) * V_new.T.float())
-                    full[name].weight.data = (Q_W.to(DEV).float() + W_lora_new).half()
+                    full[name].weight.data = (g.Q_gpu + W_lora_new).half()
 
                     # Early stopping: check relative Frobenius improvement
                     if early_stop_tol > 0:
-                        E_new = (W_orig.float().to(DEV)
-                                 - Q_W.float().to(DEV)
-                                 - W_lora_new)
+                        E_new = g.W_orig_gpu - g.Q_gpu - W_lora_new
                         curr_frob   = E_new.norm().item()
                         rel_improve = ((prev_frob[name] - curr_frob)
                                        / (prev_frob[name] + 1e-12))
@@ -869,10 +920,10 @@ def quantize_joint(model, layers, dataloader, args, use_turboquant: bool = False
                 )
 
                 # Symmetry fix: recompute LoRA aligned with Q_final
-                E_sym = (W_orig.float() - Q_W_final.float()).to(DEV)
+                E_sym = g.W_orig_gpu - g.Q_gpu
                 U_sym, S_sym, V_sym = g.hessian_weighted_svd(E_sym, args.rank)
                 W_lora_sym = U_sym.float() @ (S_sym.unsqueeze(1) * V_sym.T.float())
-                full[name].weight.data = (Q_W_final.to(DEV).float() + W_lora_sym).half()
+                full[name].weight.data = (g.Q_gpu + W_lora_sym).half()
 
                 if expert_idx >= 0 or expert_idx == -1:
                     record = {
@@ -893,7 +944,7 @@ def quantize_joint(model, layers, dataloader, args, use_turboquant: bool = False
                             real_quant=True,
                         )
                         record["gptq_packed"] = gptq_packed
-                        full[name].weight.data = (Q_W_final.to(DEV).float() + W_lora_sym).half()
+                        full[name].weight.data = (g.Q_gpu + W_lora_sym).half()
                     all_records.append(record)
                 g.free()
 

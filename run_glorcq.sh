@@ -14,18 +14,18 @@ export HF_DATASETS_CACHE=/nvme1/yqy/huggingface/datasets
 export HF_HUB_ENABLE_HF_TRANSFER=0
 export HF_DATASETS_DISABLE_CACHING=0
 
-# model_path="Qwen/Qwen1.5-MoE-A2.7B"
-model_path="mistralai/Mixtral-8x7B-v0.1"
+model_path="Qwen/Qwen1.5-MoE-A2.7B"
+# model_path="mistralai/Mixtral-8x7B-v0.1"
 save_dir="./output"
 qbit=2
 rank=64
-n_iter=3
+n_iter=5
 G_moe=128
 G_attn=4
 
 mkdir -p ./log
 
-CUDA_VISIBLE_DEVICES=1 \
+CUDA_VISIBLE_DEVICES=3 \
 uv run python glorcq/run_quantize.py \
     --model_path "$model_path" \
     --output_path "$save_dir/${model_path}-glorcq-${qbit}bit-rank${rank}-hybrid" \

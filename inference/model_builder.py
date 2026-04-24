@@ -440,3 +440,5 @@ def _load_lora_for_module(ql, layer_idx, module_name, assignment_lookup,
         return
 
     ql.load_lora(U, S, V, device=device)
+    # Tag with cluster id for cluster-parallel LoRA in MoE block
+    ql.cluster_id = (wtype_key, group_id)
