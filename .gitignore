@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+
+# Compiled CUDA / C extensions
+*.so
+*.o
+build/
+dist/
+*.egg-info/
+
+# Logs and profiling outputs
+logs/
+*.json
+!pyproject.toml
+
+# Third-party with own git repo (add as submodule if needed)
+thirdpart/
+
+# Misc
+.env
+*.tmp

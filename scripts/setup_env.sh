@@ -35,15 +35,26 @@ uv pip install -e ".[turboquant]"
 # 3. Install TurboQuant if thirdpart/ exists
 TURBOQUANT_DIR="$GLORCQ_ROOT/thirdpart/turboquant"
 if [ -d "$TURBOQUANT_DIR" ]; then
-    echo "[3/4] Installing TurboQuant from thirdpart/ ..."
+    echo "[3/5] Installing TurboQuant from thirdpart/ ..."
     uv pip install -e "$TURBOQUANT_DIR"
 else
-    echo "[3/4] thirdpart/turboquant not found, skipping."
+    echo "[3/5] thirdpart/turboquant not found, skipping."
     echo "       (TurboQuant is optional; only needed for --use_turboquant mode)"
 fi
 
-# 4. Build CUDA kernels
-echo "[4/4] Building CUDA inference kernels ..."
+# 4. Install fast-hadamard-transform if thirdpart/ exists
+HADAMARD_DIR="$GLORCQ_ROOT/thirdpart/fast-hadamard-transform"
+if [ -d "$HADAMARD_DIR" ]; then
+    echo "[4/5] Installing fast-hadamard-transform from thirdpart/ ..."
+    uv pip install --no-build-isolation "$HADAMARD_DIR"
+else
+    echo "[4/5] thirdpart/fast-hadamard-transform not found, skipping."
+    echo "       (Optional; only needed for --rotation_type hadamard)"
+    echo "       Clone with: git clone https://github.com/Dao-AILab/fast-hadamard-transform.git thirdpart/fast-hadamard-transform"
+fi
+
+# 5. Build CUDA kernels
+echo "[5/5] Building CUDA inference kernels ..."
 bash "$SCRIPT_DIR/build_kernels.sh"
 
 echo ""

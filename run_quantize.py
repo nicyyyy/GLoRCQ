@@ -289,6 +289,10 @@ def parse_args():
     p.add_argument("--use_turboquant", action="store_true", default=False,
                    help="Use TurboQuant vector quantizer instead of GPTQ "
                         "(random rotation + Lloyd-Max optimal codebook)")
+    p.add_argument("--rotation_type", type=str, default="hadamard",
+                   choices=["qr", "hadamard"],
+                   help="Rotation type for TurboQuant (qr=full random orthogonal, "
+                        "hadamard=Randomized Hadamard Transform, zero storage)")
     p.add_argument("--turbo_batch_size", type=int, default=0,
                    help="Batch size for TurboQuant MoE experts per wtype "
                         "(0=all at once, reduce if OOM)")

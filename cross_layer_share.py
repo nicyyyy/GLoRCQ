@@ -862,6 +862,7 @@ def save_real_quant(output_path, model, all_records, shared_matrices,
         "use_turboquant": args.use_turboquant,
         "act_alpha":      args.act_alpha,
         "uv_bits":        args.uv_bits,
+        "rotation_type":  getattr(args, "rotation_type", "qr"),
     }
 
     # Collect per-layer per-module packed weights

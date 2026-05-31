@@ -12,6 +12,19 @@ import torch
 
 logger = logging.getLogger(__name__)
 
+# Cache for empty placeholder tensors (keyed by (device, dtype)).
+# Avoids ~240 aten::empty_strided CPU calls/step when lora_USV is always None.
+_empty_tensor_cache: dict = {}
+
+
+def _empty_lora(device):
+    """Return a cached empty float32 tensor for the no-LoRA case."""
+    key = (str(device), torch.float32)
+    if key not in _empty_tensor_cache:
+        _empty_tensor_cache[key] = torch.empty(0, dtype=torch.float32, device=device)
+    return _empty_tensor_cache[key]
+
+
 # ---------------------------------------------------------------------------
 # TurboQuant CUDA extension
 # ---------------------------------------------------------------------------
@@ -54,17 +67,16 @@ if _cuda_ext is not None:
         packed_indices: torch.Tensor,
         norms: torch.Tensor,
         centroids: torch.Tensor,
-        lora_out: torch.Tensor,
     ) -> torch.Tensor:
         return _cuda_ext.turbo_dequant_matmul(
-            x_rot, packed_indices, norms, centroids, lora_out,
+            x_rot, packed_indices, norms, centroids,
         )
 
     @_turbo_dequant_matmul_op.register_fake
-    def _turbo_fake(x_rot, packed_indices, norms, centroids, lora_out):
+    def _turbo_fake(x_rot, packed_indices, norms, centroids):
         return torch.empty(
             x_rot.shape[0], packed_indices.shape[0],
-            dtype=torch.float32, device=x_rot.device,
+            dtype=torch.float16, device=x_rot.device,
         )
 
 if _gptq_cuda_ext is not None:
@@ -165,37 +177,36 @@ def _gptq_pytorch_fallback(x, qweight_i8, scales, zeros, groupsize, sym):
 # Public API: TurboQuant
 # ---------------------------------------------------------------------------
 def turbo_dequant_matmul_fused(x, packed_indices, norms, Pi, centroids,
-                                bits, dim, lora_USV=None):
+                                bits, dim, lora_USV=None,
+                                precomputed_x_rot=None):
     """
     Fused TurboQuant dequant + matmul with optional LoRA fusion.
 
-    1. Rotate input:  x_rot = x.float() @ Pi.float().T
-    2. Pre-compute LoRA output (if provided)
+    1. Rotate input:  x_rot = x.float() @ Pi.float().T  (or reuse precomputed)
+    2. Pre-compute LoRA output (if provided via lora_USV)
     3. Call CUDA kernel (or PyTorch fallback)
 
     Args:
         x:              (B, K) fp16/fp32 input
         packed_indices: (N, K/4) uint8 packed 2-bit indices
         norms:          (N,) fp32 per-row norms
-        Pi:             (K, K) rotation matrix
+        Pi:             (K, K) rotation matrix (or None if precomputed_x_rot given)
         centroids:      (4,) fp32 codebook
         bits:           quantization bits (must be 2 for CUDA kernel)
         dim:            input dimension K
         lora_USV:       optional (U, S, V) tuple for LoRA fusion
+        precomputed_x_rot: optional (B, K) float32 — pre-rotated input
 
     Returns:
         y: (B, N) fp16
     """
-    # 1. Rotate input (cuBLAS)
-    x_rot = x.float() @ Pi.float().T  # (B, K)
+    # 1. Rotate input — or reuse precomputed rotation
+    if precomputed_x_rot is not None:
+        x_rot = precomputed_x_rot
+    else:
+        x_rot = (x.float() @ Pi.float().T).half()  # (B, K) fp16
 
-    # 2. Pre-compute LoRA
-    lora_out = torch.empty(0, device=x.device, dtype=torch.float32)
-    if lora_USV is not None:
-        U, S, V = lora_USV
-        lora_out = ((x @ U) * S @ V.T).float()  # (B, N)
-
-    # 3. CUDA kernel or fallback
+    # 2. CUDA kernel or fallback
     K = x_rot.shape[1]
     if _cuda_ext is not None and bits == 2:
         try:
@@ -204,7 +215,6 @@ def turbo_dequant_matmul_fused(x, packed_indices, norms, Pi, centroids,
                 packed_indices.contiguous(),
                 norms.contiguous(),
                 centroids.contiguous(),
-                lora_out.contiguous(),
             )
         except RuntimeError as e:
             B = x_rot.shape[0]
@@ -213,14 +223,15 @@ def turbo_dequant_matmul_fused(x, packed_indices, norms, Pi, centroids,
                 "TurboQuant CUDA kernel failed (B=%d, K=%d, N=%d): %s  "
                 "— falling back to PyTorch", B, K, N, e)
             y = _pytorch_fallback(x_rot, packed_indices, norms, centroids, K)
-            if lora_out.numel() > 0:
-                y += lora_out
     else:
         y = _pytorch_fallback(x_rot, packed_indices, norms, centroids, K)
-        if lora_out.numel() > 0:
-            y += lora_out
 
-    return y.half()
+    # Python-level LoRA (prefill path via quantized_linear)
+    if lora_USV is not None:
+        U, S, V = lora_USV
+        y = y + ((x @ U) * S @ V.T)
+
+    return y
 
 
 # ---------------------------------------------------------------------------
@@ -254,7 +265,7 @@ def gptq_dequant_matmul_fused(x, qweight_int, scales, zeros,
         qweight_i8 = qweight_int
 
     # 2. Pre-compute LoRA
-    lora_out = torch.empty(0, device=x.device, dtype=torch.float32)
+    lora_out = _empty_lora(x.device)
     if lora_USV is not None:
         U, S, V = lora_USV
         lora_out = ((x @ U) * S @ V.T).float()  # (B, N)

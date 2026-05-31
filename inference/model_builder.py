@@ -212,6 +212,17 @@ def load_glorcq_model(model_path, device="cuda:0"):
         u_cache, uv_bits, rotation_cache, device,
     )
 
+    # 6a. Load RHT signs for Hadamard rotation mode
+    rotation_type = model_config.get("rotation_type", "qr")
+    if rotation_type == "hadamard":
+        from hadamard_rotation import generate_rht_signs
+        from inference.quantized_linear import GLoRCQLinear
+        print("[GLoRCQ] Loading RHT signs for Hadamard rotation ...")
+        for _, m in model.named_modules():
+            if isinstance(m, GLoRCQLinear) and m.quant_type == "turbo":
+                signs = generate_rht_signs(m.turbo_dim, seed=m.turbo_seed, device=device)
+                m._rht_signs = signs
+
     # 6b. Replace MoE blocks for CUDA Graph compatibility
     _replace_moe_blocks(model)
 

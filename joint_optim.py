@@ -562,9 +562,12 @@ def quantize_joint(model, layers, dataloader, args, use_turboquant: bool = False
     # Create TurboQuant quantizer if requested
     turbo_quantizer = None
     if use_turboquant:
-        turbo_quantizer = TurboWeightQuantizer(nbits=nbits, device=DEV)
+        rotation_type = getattr(args, 'rotation_type', 'qr')
+        turbo_quantizer = TurboWeightQuantizer(
+            nbits=nbits, device=DEV, rotation_type=rotation_type)
+        rot_desc = "Hadamard RHT" if rotation_type == "hadamard" else "random rotation"
         print(f"  [TurboQuant] Enabled: {nbits}-bit row-wise vector quantization "
-              f"(random rotation + Lloyd-Max codebook)", flush=True)
+              f"({rot_desc} + Lloyd-Max codebook)", flush=True)
 
     use_cache = model.config.use_cache
     model.config.use_cache = False

@@ -13,7 +13,6 @@
  *
  * Computation:
  *   y[b, n] = norms[n] * Σ_k centroid[unpack(packed[n,k/4], k%4)] * x_rot[b, k]
- *   If lora_out is provided: y[b, n] += lora_out[b, n]
  */
 
 #include <torch/extension.h>
@@ -21,15 +20,16 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <cstdint>
+#include <cuda_fp16.h>
 
 // -------------------------------------------------------------------------
 // Device helpers
 // -------------------------------------------------------------------------
 
 __device__ __forceinline__ float centroid_lookup(
-    float c0, float c1, float c2, float c3, int idx)
+    const float* __restrict__ centroids, int idx)
 {
-    return (idx & 2) ? ((idx & 1) ? c3 : c2) : ((idx & 1) ? c1 : c0);
+    return centroids[idx & 3];
 }
 
 __device__ __forceinline__ float warp_reduce_sum(float val) {
@@ -44,14 +44,12 @@ __device__ __forceinline__ float warp_reduce_sum(float val) {
 static constexpr int WARPS_PER_BLOCK = 4;
 
 __global__ void turbo_dequant_gemv_2bit_kernel(
-    const float* __restrict__ x_rot,          // (B, K)
+    const __half* __restrict__ x_rot,          // (B, K) fp16
     const uint8_t* __restrict__ packed,        // (N, K/4) uint8
     const float* __restrict__ norms,           // (N,)
-    float c0, float c1, float c2, float c3,
-    const float* __restrict__ lora_out,        // (B, N) or nullptr
-    float* __restrict__ y,                     // (B, N)
-    int N, int K,
-    int lora_valid)
+    const float* __restrict__ centroids,       // (4,) fp32 codebook
+    __half* __restrict__ y,                    // (B, N) fp16
+    int N, int K)
 {
     const int warp_id_in_block = threadIdx.x / 32;
     const int lane = threadIdx.x % 32;
@@ -63,15 +61,19 @@ __global__ void turbo_dequant_gemv_2bit_kernel(
 
     const int packed_cols = K / 4;
     const uint8_t* packed_row = packed + (long long)n * packed_cols;
-    const float* x_row = x_rot + (long long)b * K;
+
+    // Cooperatively load x_rot[b, :] into shared memory so all 4 warps
+    // in this block share the same x data (4× reduction in global reads).
+    extern __shared__ float x_smem[];
+    const __half* x_row = x_rot + (long long)b * K;
+    for (int i = threadIdx.x; i < K; i += WARPS_PER_BLOCK * 32)
+        x_smem[i] = __half2float(x_row[i]);
+    __syncthreads();
 
     float acc = 0.0f;
 
     // Process in chunks of 32*4 = 128 bytes = 512 indices at a time.
     // Each lane reads 4 consecutive bytes (uint32) per iteration — coalesced.
-    // For K not divisible by 512, we use a smaller final iteration count to
-    // avoid reading beyond packed_cols, then fall through to the scalar
-    // remainder loop for any leftover elements.
     const int total_uint32s = packed_cols / 4;  // (K/4) / 4 = K/16
     const int full_iters = total_uint32s / 32;  // full iterations where all 32 lanes are valid
 
@@ -88,13 +90,12 @@ __global__ void turbo_dequant_gemv_2bit_kernel(
             for (int pi = 0; pi < 4; pi++) {
                 int idx = (byte_val >> (pi * 2)) & 3;
                 int k = elem_base + bi * 4 + pi;
-                acc += centroid_lookup(c0, c1, c2, c3, idx) * x_row[k];
+                acc += centroid_lookup(centroids, idx) * x_smem[k];
             }
         }
     }
 
     // Partial iteration: remaining uint32s that don't fill a full warp-width.
-    // Each lane checks bounds before the uint32 read to avoid OOB access.
     {
         int remaining_u32 = total_uint32s - full_iters * 32;
         if (remaining_u32 > 0 && lane < remaining_u32) {
@@ -111,32 +112,27 @@ __global__ void turbo_dequant_gemv_2bit_kernel(
                     int idx = (byte_val >> (pi * 2)) & 3;
                     int k = elem_base + bi * 4 + pi;
                     if (k < K) {
-                        acc += centroid_lookup(c0, c1, c2, c3, idx) * x_row[k];
+                        acc += centroid_lookup(centroids, idx) * x_smem[k];
                     }
                 }
             }
         }
     }
 
-    // Handle remaining elements not covered by uint32 reads.
-    // This covers any tail bytes where packed_cols is not divisible by 4.
-    int processed_by_u32 = total_uint32s * 16;  // elements covered by all uint32 reads
+    // Scalar tail for elements not covered by uint32 reads.
+    int processed_by_u32 = total_uint32s * 16;
     for (int k = processed_by_u32 + lane; k < K; k += 32) {
         int byte_idx = k / 4;
         int pos = k % 4;
         int idx = (packed_row[byte_idx] >> (pos * 2)) & 3;
-        acc += centroid_lookup(c0, c1, c2, c3, idx) * x_row[k];
+        acc += centroid_lookup(centroids, idx) * x_smem[k];
     }
 
     // Warp reduction
     acc = warp_reduce_sum(acc);
 
     if (lane == 0) {
-        acc *= norms[n];
-        if (lora_valid) {
-            acc += lora_out[(long long)b * N + n];
-        }
-        y[(long long)b * N + n] = acc;
+        y[(long long)b * N + n] = __float2half(acc * norms[n]);
     }
 }
 
@@ -152,14 +148,12 @@ static constexpr int TM = 4;
 static constexpr int TN = 4;
 
 __global__ void turbo_dequant_gemm_2bit_kernel(
-    const float* __restrict__ x_rot,
+    const __half* __restrict__ x_rot,
     const uint8_t* __restrict__ packed,
     const float* __restrict__ norms,
-    float c0, float c1, float c2, float c3,
-    const float* __restrict__ lora_out,
-    float* __restrict__ y,
-    int B, int N, int K,
-    int lora_valid)
+    const float* __restrict__ centroids,       // (4,) fp32 codebook
+    __half* __restrict__ y,
+    int B, int N, int K)
 {
     const int bm_start = blockIdx.x * BM;
     const int bn_start = blockIdx.y * BN;
@@ -191,7 +185,7 @@ __global__ void turbo_dequant_gemm_2bit_kernel(
             int b_idx = bm_start + row;
             int k_idx = k_start + col;
             if (b_idx < B && k_idx < K)
-                A_smem[row][col] = x_rot[(long long)b_idx * K + k_idx];
+                A_smem[row][col] = __half2float(x_rot[(long long)b_idx * K + k_idx]);
             else
                 A_smem[row][col] = 0.0f;
         }
@@ -207,7 +201,7 @@ __global__ void turbo_dequant_gemm_2bit_kernel(
                 int pos = k_idx % 4;
                 uint8_t byte_val = packed[(long long)n_idx * packed_cols + byte_idx];
                 int cidx = (byte_val >> (pos * 2)) & 3;
-                B_smem[n_local][k_local] = centroid_lookup(c0, c1, c2, c3, cidx) * norms[n_idx];
+                B_smem[n_local][k_local] = centroid_lookup(centroids, cidx) * norms[n_idx];
             } else {
                 B_smem[n_local][k_local] = 0.0f;
             }
@@ -245,11 +239,7 @@ __global__ void turbo_dequant_gemm_2bit_kernel(
         for (int j = 0; j < TN; j++) {
             int n_idx = bn_start + thread_col * TN + j;
             if (n_idx >= N) continue;
-            float val = C_reg[i][j];
-            if (lora_valid) {
-                val += lora_out[(long long)b_idx * N + n_idx];
-            }
-            y[(long long)b_idx * N + n_idx] = val;
+            y[(long long)b_idx * N + n_idx] = __float2half(C_reg[i][j]);
         }
     }
 }
@@ -263,11 +253,10 @@ __global__ void turbo_dequant_gemm_2bit_kernel(
 #define CHECK_CONTIGUOUS(x) TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
 
 torch::Tensor turbo_dequant_matmul_cuda(
-    torch::Tensor x_rot,            // (B, K) fp32
+    torch::Tensor x_rot,            // (B, K) fp16
     torch::Tensor packed_indices,    // (N, K/4) uint8
     torch::Tensor norms,             // (N,) fp32
-    torch::Tensor centroids,         // (4,) fp32
-    torch::Tensor lora_out)          // (B, N) fp32 or empty
+    torch::Tensor centroids)         // (4,) fp32
 {
     CHECK_CUDA(x_rot);
     CHECK_CUDA(packed_indices);
@@ -278,7 +267,7 @@ torch::Tensor turbo_dequant_matmul_cuda(
     CHECK_CONTIGUOUS(norms);
     CHECK_CONTIGUOUS(centroids);
 
-    TORCH_CHECK(x_rot.dtype() == torch::kFloat32, "x_rot must be fp32");
+    TORCH_CHECK(x_rot.dtype() == torch::kFloat16, "x_rot must be fp16");
     TORCH_CHECK(packed_indices.dtype() == torch::kUInt8, "packed_indices must be uint8");
     TORCH_CHECK(norms.dtype() == torch::kFloat32, "norms must be fp32");
     TORCH_CHECK(centroids.dtype() == torch::kFloat32, "centroids must be fp32");
@@ -293,58 +282,36 @@ torch::Tensor turbo_dequant_matmul_cuda(
     TORCH_CHECK(norms.size(0) == N, "norms shape mismatch");
     TORCH_CHECK(K % 4 == 0, "K must be divisible by 4 for 2-bit packing");
 
-    int lora_valid = 0;
-    const float* lora_ptr = nullptr;
-    if (lora_out.numel() > 0) {
-        CHECK_CUDA(lora_out);
-        CHECK_CONTIGUOUS(lora_out);
-        TORCH_CHECK(lora_out.dtype() == torch::kFloat32, "lora_out must be fp32");
-        TORCH_CHECK(lora_out.size(0) == B && lora_out.size(1) == N,
-                     "lora_out shape mismatch");
-        lora_valid = 1;
-        lora_ptr = lora_out.data_ptr<float>();
-    }
+    auto y = torch::empty({B, N}, torch::dtype(torch::kFloat16).device(x_rot.device()));
 
-    auto y = torch::zeros({B, N}, x_rot.options());
-
-    // Early return for empty batch (B=0) or empty output (N=0).
-    // Launching CUDA kernels with a zero grid dimension is illegal and
-    // corrupts the CUDA context, causing later operations to fail.
     if (B == 0 || N == 0) {
         return y;
     }
 
-    // Copy centroids to host (only 4 floats, negligible overhead)
-    float c0, c1, c2, c3;
-    cudaMemcpy(&c0, centroids.data_ptr<float>() + 0, sizeof(float), cudaMemcpyDeviceToHost);
-    cudaMemcpy(&c1, centroids.data_ptr<float>() + 1, sizeof(float), cudaMemcpyDeviceToHost);
-    cudaMemcpy(&c2, centroids.data_ptr<float>() + 2, sizeof(float), cudaMemcpyDeviceToHost);
-    cudaMemcpy(&c3, centroids.data_ptr<float>() + 3, sizeof(float), cudaMemcpyDeviceToHost);
-
     cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
+    const float* centroids_ptr = centroids.data_ptr<float>();
 
     if (B <= 4) {
         dim3 block(WARPS_PER_BLOCK * 32);
         dim3 grid((N + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK, B);
-        turbo_dequant_gemv_2bit_kernel<<<grid, block, 0, stream>>>(
-            x_rot.data_ptr<float>(),
+        size_t smem = K * sizeof(float);
+        turbo_dequant_gemv_2bit_kernel<<<grid, block, smem, stream>>>(
+            reinterpret_cast<const __half*>(x_rot.data_ptr<at::Half>()),
             packed_indices.data_ptr<uint8_t>(),
             norms.data_ptr<float>(),
-            c0, c1, c2, c3,
-            lora_ptr,
-            y.data_ptr<float>(),
-            N, K, lora_valid);
+            centroids_ptr,
+            reinterpret_cast<__half*>(y.data_ptr<at::Half>()),
+            N, K);
     } else {
         dim3 block(GEMM_THREADS);
         dim3 grid((B + BM - 1) / BM, (N + BN - 1) / BN);
         turbo_dequant_gemm_2bit_kernel<<<grid, block, 0, stream>>>(
-            x_rot.data_ptr<float>(),
+            reinterpret_cast<const __half*>(x_rot.data_ptr<at::Half>()),
             packed_indices.data_ptr<uint8_t>(),
             norms.data_ptr<float>(),
-            c0, c1, c2, c3,
-            lora_ptr,
-            y.data_ptr<float>(),
-            B, N, K, lora_valid);
+            centroids_ptr,
+            reinterpret_cast<__half*>(y.data_ptr<at::Half>()),
+            B, N, K);
     }
 
     return y;
@@ -356,6 +323,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("x_rot"),
           py::arg("packed_indices"),
           py::arg("norms"),
-          py::arg("centroids"),
-          py::arg("lora_out"));
+          py::arg("centroids"));
 }

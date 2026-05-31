@@ -8,6 +8,13 @@ Replaces nn.Linear with a quantized version that supports:
 """
 
 import torch
+
+
+# Compiled LoRA: fuse (a * S) @ V.T into one Triton kernel via Inductor
+@torch.compile(mode="default", fullgraph=True)
+def _compiled_lora_sv(a, S, V_T):
+    """Compute (a * S) @ V_T with operator fusion."""
+    return (a * S) @ V_T
 import torch.nn as nn
 
 # Try to import fused CUDA kernel for TurboQuant
@@ -178,9 +185,8 @@ class GLoRCQLinear(nn.Module):
         self._turbo_dequant_W = None  # legacy: cached dequantized weight (pre-decompressed)
 
         # LoRA compensation
-        self.U = None                # (in_d, rank) fp16
-        self.S = None                # (rank,) fp16
-        self.V = None                # (out_d, rank) fp16
+        self.U = None                # (in_d, rank) fp16 — shared across cluster
+        self.SV = None               # (out_d, rank) fp16 — S pre-fused into V: V * S[None,:]
         self.cluster_id = None       # set by model_builder for cluster-parallel LoRA
 
         # Bias
@@ -241,11 +247,16 @@ class GLoRCQLinear(nn.Module):
         self._turbo_dequant_W = turbo_quantizer.dequantize(q).half().to(device)
 
     def load_lora(self, U, S, V, device="cuda"):
-        """Load LoRA compensation matrices."""
+        """Load LoRA compensation matrices, pre-fusing S into V.
+
+        Precomputes SV = V * S[None, :] so that inference uses
+        ``a @ SV.T`` instead of ``(a * S) @ V.T``, eliminating the
+        elementwise multiply kernel at each forward pass.
+        """
         if U is not None:
             self.U = U.half().to(device)
-            self.S = S.half().to(device)
-            self.V = V.half().to(device)
+            # Pre-fuse: SV[i, j] = V[i, j] * S[j]  (out_d, rank)
+            self.SV = (V * S.unsqueeze(0)).half().to(device)
 
     def _dequant_gptq(self):
         """Dequantize GPTQ weights to fp16."""
@@ -262,7 +273,7 @@ class GLoRCQLinear(nn.Module):
                 W[:, col0:col1] = (q_slice - self.zeros[:, gi:gi+1]) * self.scales[:, gi:gi+1]
         return W
 
-    def forward(self, x, precomputed_xU=None):
+    def forward(self, x, precomputed_xU=None, precomputed_x_rot=None):
         """
         Forward pass: dequantize weights, matmul, add LoRA compensation.
 
@@ -271,6 +282,9 @@ class GLoRCQLinear(nn.Module):
             precomputed_xU: optional (..., rank) tensor — pre-computed ``x @ U``
                 from cluster-parallel MoE. Skips redundant ``x @ U`` when
                 multiple experts in the same cluster share the same U matrix.
+            precomputed_x_rot: optional (..., in_features) float32 tensor —
+                pre-rotated input ``x @ Pi.T`` for TurboQuant. Skips redundant
+                rotation when multiple experts share the same Pi matrix.
         Returns:
             y: (..., out_features) output tensor
         """
@@ -278,20 +292,13 @@ class GLoRCQLinear(nn.Module):
         if x.dim() > 2:
             x = x.reshape(-1, self.in_features)
 
-        # 1. Quantized weight matmul
-        # When precomputed_xU is provided, skip kernel-level LoRA fusion
-        # (the Python LoRA path below will use precomputed_xU instead).
-        _skip_lora_fusion = (precomputed_xU is not None)
-        lora_fused = False
+        # 1. Quantized weight matmul (S is pre-fused into SV, so no kernel-level
+        # LoRA fusion needed — LoRA is always computed in Python below).
         if self.quant_type == "gptq":
             if _HAS_GPTQ_FUSED_KERNEL:
-                lora_USV = None
-                if self.U is not None and not _skip_lora_fusion:
-                    lora_USV = (self.U, self.S, self.V)
                 y = gptq_dequant_matmul_fused(
                     x, self.qweight_int, self.scales, self.zeros,
-                    self.gptq_groupsize, self.gptq_sym, lora_USV=lora_USV)
-                lora_fused = (lora_USV is not None)
+                    self.gptq_groupsize, self.gptq_sym, lora_USV=None)
             else:
                 W = self._dequant_gptq()
                 y = x @ W.T
@@ -301,36 +308,31 @@ class GLoRCQLinear(nn.Module):
                     self.turbo_dim, self.turbo_bits, self.turbo_seed)
                 centroids = self._rotation_cache.get_centroids(
                     self.turbo_dim, self.turbo_bits, self.turbo_seed)
-                # Fused CUDA kernel path: dequant + matmul + optional LoRA in one kernel
                 if _HAS_FUSED_KERNEL and self.turbo_bits == 2:
-                    lora_USV = None
-                    if self.U is not None and not _skip_lora_fusion:
-                        lora_USV = (self.U, self.S, self.V)
                     y = turbo_dequant_matmul_fused(
                         x, self.packed_indices, self.norms,
                         Pi, centroids, self.turbo_bits, self.turbo_dim,
-                        lora_USV=lora_USV)
-                    lora_fused = (self.U is not None)
+                        lora_USV=None,
+                        precomputed_x_rot=precomputed_x_rot)
                 else:
                     y = turbo_dequant_matmul(
                         x, self.packed_indices, self.norms,
                         Pi, centroids, self.turbo_bits, self.turbo_dim)
             elif self._turbo_dequant_W is not None:
-                # Legacy pre-decompressed path
                 y = x @ self._turbo_dequant_W.T
             else:
                 raise RuntimeError("TurboQuant weights not loaded")
         else:
             raise RuntimeError(f"Unknown quant_type: {self.quant_type}")
 
-        # 2. LoRA compensation: y += (x @ U) * S @ V^T (skip if already fused)
-        if self.U is not None and not lora_fused:
+        # 2. LoRA compensation: y += a @ SV.T  where SV = V * S[None,:]
+        # SV is pre-fused at load time — no elementwise multiply needed here.
+        if self.SV is not None:
             if precomputed_xU is not None:
-                a = precomputed_xU      # reuse cluster-parallel result
+                a = precomputed_xU      # reuse cluster-parallel x @ U
             else:
                 a = x @ self.U          # (..., rank)
-            b = a * self.S              # (..., rank)
-            y = y + b @ self.V.T        # (..., out_d)
+            y = y + a @ self.SV.T
 
         # 3. Bias
         if self.bias_param is not None:

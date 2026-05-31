@@ -171,21 +171,21 @@ def main():
 
     results = {}
 
-    # # Phase 1: Standard generation
-    # if not args.skip_standard:
-    #     print(f"\n[1/2] Standard generation (warmup={args.num_warmup}, "
-    #           f"runs={args.num_runs}) ...")
-    #     durations_std = benchmark_standard(
-    #         model, input_ids, args.gen_len, args.num_warmup, args.num_runs,
-    #     )
-    #     tps_std = [args.gen_len / d for d in durations_std]
-    #     mean_std, std_std = np.mean(tps_std), np.std(tps_std)
-    #     print(f"  Standard: {mean_std:.1f} ± {std_std:.1f} tok/s")
-    #     results["standard"] = {
-    #         "mean_tps": float(mean_std),
-    #         "std_tps": float(std_std),
-    #         "durations": durations_std,
-    #     }
+    # Phase 1: Standard generation (real-quant model with custom CUDA kernels)
+    if not args.skip_standard:
+        print(f"\n[1/2] Standard generation (warmup={args.num_warmup}, "
+              f"runs={args.num_runs}) ...")
+        durations_std = benchmark_standard(
+            model, input_ids, args.gen_len, args.num_warmup, args.num_runs,
+        )
+        tps_std = [args.gen_len / d for d in durations_std]
+        mean_std, std_std = np.mean(tps_std), np.std(tps_std)
+        print(f"  Standard: {mean_std:.1f} ± {std_std:.1f} tok/s")
+        results["standard"] = {
+            "mean_tps": float(mean_std),
+            "std_tps": float(std_std),
+            "durations": durations_std,
+        }
 
     # Phase 2: CUDA Graph generation
     if not args.skip_graph:

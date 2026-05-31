@@ -20,6 +20,7 @@ dependencies = [
 
 [project.optional-dependencies]
 turboquant = ["scipy"]
+hadamard = ["fast-hadamard-transform"]
 
 [build-system]
 requires = ["setuptools", "wheel"]
