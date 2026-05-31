@@ -317,6 +317,152 @@ torch::Tensor turbo_dequant_matmul_cuda(
     return y;
 }
 
+// -------------------------------------------------------------------------
+// Kernel 3: Grouped-GEMV — one warp per output row, E experts with different inputs
+//
+// Each expert k has its own input vector x_grouped[k, :] and weight block
+// packed_cat[k*N_out : (k+1)*N_out, :].  Grid is structured so each block
+// handles WARPS_PER_BLOCK consecutive rows from the SAME expert → all 4 warps
+// share the same x in shared memory (same cooperation benefit as Kernel 1).
+// -------------------------------------------------------------------------
+
+__global__ void turbo_dequant_grouped_gemv_2bit_kernel(
+    const __half* __restrict__ x_grouped,    // (E, K) fp16 — one row per expert
+    const uint8_t* __restrict__ packed_cat,  // (E*N_out, K/4) uint8
+    const float* __restrict__ norms_cat,     // (E*N_out,) fp32
+    const float* __restrict__ centroids,     // (4,) fp32
+    __half* __restrict__ y_cat,              // (E*N_out,) fp16
+    int E, int N_out, int K, int blocks_per_expert)
+{
+    const int warp_id_in_block = threadIdx.x / 32;
+    const int lane = threadIdx.x % 32;
+
+    const int expert_idx  = blockIdx.x / blocks_per_expert;
+    const int local_block = blockIdx.x % blocks_per_expert;
+    const int row_in_expert = local_block * WARPS_PER_BLOCK + warp_id_in_block;
+
+    if (expert_idx >= E || row_in_expert >= N_out) return;
+
+    const int global_row = expert_idx * N_out + row_in_expert;
+
+    const int packed_cols = K / 4;
+    const uint8_t* packed_row = packed_cat + (long long)global_row * packed_cols;
+
+    // Cooperatively load x_grouped[expert_idx, :] into shared memory.
+    // All 4 warps in this block handle the same expert → same x vector.
+    extern __shared__ float x_smem[];
+    const __half* x_ptr = x_grouped + (long long)expert_idx * K;
+    for (int i = threadIdx.x; i < K; i += WARPS_PER_BLOCK * 32)
+        x_smem[i] = __half2float(x_ptr[i]);
+    __syncthreads();
+
+    float acc = 0.0f;
+
+    const int total_uint32s = packed_cols / 4;
+    const int full_iters = total_uint32s / 32;
+
+    for (int it = 0; it < full_iters; it++) {
+        int byte_offset = (it * 32 + lane) * 4;
+        uint32_t packed4 = *reinterpret_cast<const uint32_t*>(packed_row + byte_offset);
+        int elem_base = byte_offset * 4;
+
+        #pragma unroll
+        for (int bi = 0; bi < 4; bi++) {
+            uint8_t byte_val = (packed4 >> (bi * 8)) & 0xFF;
+            #pragma unroll
+            for (int pi = 0; pi < 4; pi++) {
+                int idx = (byte_val >> (pi * 2)) & 3;
+                int k = elem_base + bi * 4 + pi;
+                acc += centroid_lookup(centroids, idx) * x_smem[k];
+            }
+        }
+    }
+
+    {
+        int remaining_u32 = total_uint32s - full_iters * 32;
+        if (remaining_u32 > 0 && lane < remaining_u32) {
+            int byte_offset = (full_iters * 32 + lane) * 4;
+            uint32_t packed4 = *reinterpret_cast<const uint32_t*>(packed_row + byte_offset);
+            int elem_base = byte_offset * 4;
+
+            #pragma unroll
+            for (int bi = 0; bi < 4; bi++) {
+                uint8_t byte_val = (packed4 >> (bi * 8)) & 0xFF;
+                #pragma unroll
+                for (int pi = 0; pi < 4; pi++) {
+                    int idx = (byte_val >> (pi * 2)) & 3;
+                    int k = elem_base + bi * 4 + pi;
+                    if (k < K)
+                        acc += centroid_lookup(centroids, idx) * x_smem[k];
+                }
+            }
+        }
+    }
+
+    int processed_by_u32 = total_uint32s * 16;
+    for (int k = processed_by_u32 + lane; k < K; k += 32) {
+        int byte_idx = k / 4;
+        int pos = k % 4;
+        int idx = (packed_row[byte_idx] >> (pos * 2)) & 3;
+        acc += centroid_lookup(centroids, idx) * x_smem[k];
+    }
+
+    acc = warp_reduce_sum(acc);
+
+    if (lane == 0) {
+        y_cat[global_row] = __float2half(acc * norms_cat[global_row]);
+    }
+}
+
+torch::Tensor turbo_dequant_grouped_gemv_cuda(
+    torch::Tensor x_grouped,   // (E, K) fp16 — one input row per expert
+    torch::Tensor packed_cat,  // (E*N_out, K/4) uint8 — all experts concatenated
+    torch::Tensor norms_cat,   // (E*N_out,) fp32
+    torch::Tensor centroids,   // (4,) fp32
+    int N_out)                 // output dim per expert
+{
+    CHECK_CUDA(x_grouped); CHECK_CUDA(packed_cat);
+    CHECK_CUDA(norms_cat); CHECK_CUDA(centroids);
+    CHECK_CONTIGUOUS(x_grouped); CHECK_CONTIGUOUS(packed_cat);
+    CHECK_CONTIGUOUS(norms_cat); CHECK_CONTIGUOUS(centroids);
+
+    TORCH_CHECK(x_grouped.dtype() == torch::kFloat16, "x_grouped must be fp16");
+    TORCH_CHECK(packed_cat.dtype() == torch::kUInt8, "packed_cat must be uint8");
+    TORCH_CHECK(norms_cat.dtype() == torch::kFloat32, "norms_cat must be fp32");
+    TORCH_CHECK(centroids.dtype() == torch::kFloat32, "centroids must be fp32");
+    TORCH_CHECK(centroids.numel() == 4, "centroids must have 4 elements");
+
+    const int E = x_grouped.size(0);
+    const int K = x_grouped.size(1);
+    const int EN_out = packed_cat.size(0);
+
+    TORCH_CHECK(EN_out == (long long)E * N_out, "packed_cat first dim must be E * N_out");
+    TORCH_CHECK(packed_cat.size(1) == K / 4, "packed_cat col dim must be K/4");
+    TORCH_CHECK(norms_cat.size(0) == EN_out, "norms_cat size mismatch");
+    TORCH_CHECK(K % 4 == 0, "K must be divisible by 4");
+
+    auto y = torch::empty({EN_out},
+                          torch::dtype(torch::kFloat16).device(x_grouped.device()));
+
+    if (E == 0 || N_out == 0) return y;
+
+    const int blocks_per_expert = (N_out + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
+    dim3 grid(E * blocks_per_expert);
+    dim3 block(WARPS_PER_BLOCK * 32);
+    size_t smem = K * sizeof(float);
+
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
+    turbo_dequant_grouped_gemv_2bit_kernel<<<grid, block, smem, stream>>>(
+        reinterpret_cast<const __half*>(x_grouped.data_ptr<at::Half>()),
+        packed_cat.data_ptr<uint8_t>(),
+        norms_cat.data_ptr<float>(),
+        centroids.data_ptr<float>(),
+        reinterpret_cast<__half*>(y.data_ptr<at::Half>()),
+        E, N_out, K, blocks_per_expert);
+
+    return y;
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("turbo_dequant_matmul", &turbo_dequant_matmul_cuda,
           "TurboQuant 2-bit fused dequant + matmul (CUDA)",
@@ -324,4 +470,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("packed_indices"),
           py::arg("norms"),
           py::arg("centroids"));
+    m.def("turbo_dequant_grouped_gemv", &turbo_dequant_grouped_gemv_cuda,
+          "TurboQuant 2-bit grouped GEMV for E experts with different inputs (CUDA)",
+          py::arg("x_grouped"),
+          py::arg("packed_cat"),
+          py::arg("norms_cat"),
+          py::arg("centroids"),
+          py::arg("N_out"));
 }

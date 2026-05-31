@@ -133,7 +133,8 @@ class GraphCompatibleMoeBlock(nn.Module):
                 setattr(self, sv_attr, None)
                 setattr(self, u_attr, None)
 
-        # Down proj: one RHT call for all experts; batch LoRA via bmm
+        # Down proj: one RHT call for all experts; batch LoRA via bmm;
+        # grouped-GEMV via pre-concatenated weights
         down_projs = [self.experts[ei].down_proj for ei in range(E)]
         p0d = down_projs[0]
         rc_d = p0d._rotation_cache
@@ -141,6 +142,13 @@ class GraphCompatibleMoeBlock(nn.Module):
             p0d.turbo_dim, p0d.turbo_bits, p0d.turbo_seed)
         self._down_x_rot_key = (p0d.turbo_dim, p0d.turbo_bits, p0d.turbo_seed)
         self._rht_signs_down = getattr(p0d, '_rht_signs', None)
+
+        # Pre-concatenate packed_indices and norms for grouped-GEMV
+        self._packed_down_all = torch.cat(
+            [p.packed_indices for p in down_projs], dim=0)   # (E*out_d, K/4)
+        self._norms_down_all = torch.cat(
+            [p.norms for p in down_projs], dim=0)            # (E*out_d,)
+        self._down_out_d = p0d.out_features
 
         down_cids = [getattr(p, 'cluster_id', None) for p in down_projs]
         if (len(set(down_cids)) == 1 and down_cids[0] is not None
@@ -627,11 +635,11 @@ class GraphCompatibleMoeBlock(nn.Module):
 
     def _forward_graph(self, hidden_states, routing_weights,
                        selected_experts, hidden_dim, xU_cache, rot_cache):
-        """Batched graph-mode forward: ~8 turbo calls/layer vs 180.
+        """Batched graph-mode forward: 1 grouped-GEMV for down_proj vs E individual calls.
 
         Gate and up run as 1 batched turbo call each (all E experts share the
-        same input hidden_states).  Down still needs E individual calls
-        (different inputs h per expert), but rotation and LoRA are batched.
+        same input hidden_states).  Down now also uses a single grouped-GEMV
+        kernel call (E experts each with their own input row and weight block).
         """
         if not self._graph_cache_built:
             self._build_graph_cache()
@@ -686,22 +694,21 @@ class GraphCompatibleMoeBlock(nn.Module):
                 *self._down_x_rot_key)
             h_rot_all = (h_all.float() @ Pi_down.float().T).half()   # (N*E, inter_d)
 
-        # 6. Down turbo: E individual calls (different packed weights per expert)
-        p0_down = self.experts[0].down_proj
-        down_outs = []
-        for k in range(E):
-            proj_down = self.experts[k].down_proj
-            y_k = turbo_dequant_matmul_fused(
-                h_all[k * N: (k + 1) * N],
-                proj_down.packed_indices, proj_down.norms,
-                None, self._down_centroids,
-                p0_down.turbo_bits, p0_down.turbo_dim,
-                lora_USV=None,
-                precomputed_x_rot=h_rot_all[k * N: (k + 1) * N])
-            down_outs.append(y_k)
+        # 6. Down turbo: 1 grouped-GEMV call for all E experts
+        # h_rot_all: (N*E, inter_d) fp16 — expert k's inputs are rows [k*N : (k+1)*N]
+        # For graph-mode decode (N=1), this is exactly (E, K) → one row per expert.
+        from inference.kernels import turbo_dequant_grouped_gemv_fused
+        hidden_dim = hidden_states.shape[-1]
+        y_down_cat = turbo_dequant_grouped_gemv_fused(
+            h_rot_all,                 # (N*E, K) fp16, N=1 in decode
+            self._packed_down_all,     # (E*out_d, K/4) uint8
+            self._norms_down_all,      # (E*out_d,) fp32
+            self._down_centroids,      # (4,) fp32
+            self._down_out_d)          # out_features per expert
+        # y_down_cat: (E*out_d,) — reshape to (E, N, hidden_dim)
+        out_all = y_down_cat.view(E, N, hidden_dim)
 
         # 7. Down LoRA: 1 GEMM + 1 bmm when all experts share the same cluster
-        out_all = torch.stack(down_outs, dim=0)    # (E, N, hidden_dim)
         if self._U_down is not None:
             a_down = h_all @ self._U_down          # (N*E, rank)
             a_down_v = a_down.view(E, N, -1)       # (E, N, rank)

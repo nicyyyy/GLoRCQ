@@ -60,6 +60,11 @@ def is_gptq_cuda_available():
 # ---------------------------------------------------------------------------
 # torch.compile custom op wrappers (allows Dynamo to trace through CUDA calls)
 # ---------------------------------------------------------------------------
+_HAS_GROUPED_GEMV = (
+    _cuda_ext is not None
+    and hasattr(_cuda_ext, "turbo_dequant_grouped_gemv")
+)
+
 if _cuda_ext is not None:
     @torch.library.custom_op("glorcq::turbo_dequant_matmul", mutates_args=())
     def _turbo_dequant_matmul_op(
@@ -232,6 +237,45 @@ def turbo_dequant_matmul_fused(x, packed_indices, norms, Pi, centroids,
         y = y + ((x @ U) * S @ V.T)
 
     return y
+
+
+def turbo_dequant_grouped_gemv_fused(x_grouped, packed_cat, norms_cat, centroids, N_out):
+    """
+    Grouped GEMV: E experts with different inputs in a single kernel call.
+
+    Each expert k uses input x_grouped[k, :] and weight rows
+    packed_cat[k*N_out:(k+1)*N_out, :].  Replaces a Python loop of E separate
+    turbo_dequant_matmul_fused calls — reduces kernel launches from E to 1.
+
+    Args:
+        x_grouped:  (E, K) fp16 — one pre-rotated input row per expert
+        packed_cat: (E*N_out, K/4) uint8 — all experts' weights concatenated
+        norms_cat:  (E*N_out,) fp32 — all experts' per-row norms
+        centroids:  (4,) fp32 — shared 2-bit codebook
+        N_out:      int — output features per expert
+
+    Returns:
+        y: (E*N_out,) fp16
+    """
+    if _HAS_GROUPED_GEMV:
+        return _cuda_ext.turbo_dequant_grouped_gemv(
+            x_grouped.contiguous(),
+            packed_cat.contiguous(),
+            norms_cat.contiguous(),
+            centroids.contiguous(),
+            N_out,
+        )
+    # Fallback: loop over experts
+    E = x_grouped.shape[0]
+    K = x_grouped.shape[1]
+    outs = []
+    for k in range(E):
+        x_k = x_grouped[k:k+1]  # (1, K) fp16
+        p_k = packed_cat[k * N_out: (k + 1) * N_out]
+        n_k = norms_cat[k * N_out: (k + 1) * N_out]
+        y_k = _pytorch_fallback(x_k.float(), p_k, n_k, centroids, K)  # (1, N_out)
+        outs.append(y_k.half().squeeze(0))  # (N_out,)
+    return torch.cat(outs, dim=0)  # (E*N_out,)
 
 
 # ---------------------------------------------------------------------------
