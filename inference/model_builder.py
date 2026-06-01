@@ -124,6 +124,49 @@ class RotationCache:
 # ---------------------------------------------------------------------------
 # MoE block replacement (CUDA Graph compatibility)
 # ---------------------------------------------------------------------------
+def _build_global_u_pool(u_cache):
+    """Build cross-layer shared U matrix pools from SharedUCache.
+
+    Returns one contiguous tensor per projection type containing all unique
+    cluster U matrices.  All MoE layers reference the SAME tensor, so the GPU
+    L2 cache sees repeated accesses to identical HBM addresses → cross-layer
+    reuse without duplication.
+
+    Returns:
+        pools:   {'gate': (hidden_dim, K_total*rank), 'up': ..., 'down': ...}
+        id_maps: {'gate': {(wtype_key, group_id): col_index}, ...}
+    """
+    # Group u_cache entries by wtype
+    wtype_map = {'gate_proj': [], 'up_proj': [], 'down_proj': []}
+    for (wtype_key, gid), (U_fp16, _S) in u_cache._cache.items():
+        if wtype_key in wtype_map:
+            wtype_map[wtype_key].append((gid, U_fp16))
+
+    pools = {}
+    id_maps = {}
+    for wtype_key in ('gate_proj', 'up_proj', 'down_proj'):
+        items = wtype_map[wtype_key]
+        if not items:
+            continue
+        # Sort by group_id for deterministic ordering
+        items.sort(key=lambda x: x[0])
+        pool_key = wtype_key.split('_')[0]  # 'gate', 'up', 'down'
+        pools[pool_key]   = torch.cat([u for _, u in items], dim=1)  # (d_in, K*r)
+        id_maps[pool_key] = {(wtype_key, gid): i for i, (gid, _) in enumerate(items)}
+
+    return pools, id_maps
+
+
+def _install_global_u_pool(model, u_cache):
+    """Build global U pool and install on all MoE blocks."""
+    pools, id_maps = _build_global_u_pool(u_cache)
+    m = getattr(model, "model", model)
+    for layer in m.layers:
+        moe = getattr(layer, "mlp", None)
+        if moe is not None and hasattr(moe, "set_global_pool"):
+            moe.set_global_pool(pools, id_maps)
+
+
 def _replace_moe_blocks(model):
     """Replace Qwen2MoeSparseMoeBlock with GraphCompatibleMoeBlock."""
     try:
@@ -225,6 +268,10 @@ def load_glorcq_model(model_path, device="cuda:0"):
 
     # 6b. Replace MoE blocks for CUDA Graph compatibility
     _replace_moe_blocks(model)
+
+    # 6c. Install global U pool: all MoE layers share one copy per unique cluster
+    #     → GPU L2 cache reuse across layers during decode (Belady-OPT: all hot)
+    _install_global_u_pool(model, u_cache)
 
     # 7. Move non-linear components to device
     m = getattr(model, "model", model)

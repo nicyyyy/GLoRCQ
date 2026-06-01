@@ -67,6 +67,12 @@ class GraphCompatibleMoeBlock(nn.Module):
         # Batched graph cache (built lazily on first graph-mode forward)
         self._graph_cache_built = False
 
+        # Global U pool (shared across all layers, set by model_builder)
+        self._global_pool_gate = None  # (hidden_dim, K_total * rank)
+        self._global_pool_up   = None
+        self._gate_id_map = None       # {(wtype_key, group_id): global_col_idx}
+        self._up_id_map   = None
+
         # Persistent side stream for parallel LoRA execution
         self._side_stream = None
 
@@ -76,7 +82,23 @@ class GraphCompatibleMoeBlock(nn.Module):
             self._side_stream = torch.cuda.Stream()
         return self._side_stream
 
-    def _build_cluster_map(self):
+    def set_global_pool(self, pools, id_maps):
+        """Install cross-layer shared U matrix pool (called by model_builder).
+
+        Pools are shared across all 24 MoE layers so that the same cluster's
+        U matrix lives at one HBM address → GPU L2 cache reuse across layers.
+
+        Args:
+            pools: {'gate': (hidden_dim, K_total*rank) tensor,
+                    'up':   (hidden_dim, K_total*rank) tensor}
+            id_maps: {'gate': {(wtype_key, group_id): global_col_index}, ...}
+        """
+        self._global_pool_gate = pools.get('gate')
+        self._global_pool_up   = pools.get('up')
+        self._gate_id_map = id_maps.get('gate')
+        self._up_id_map   = id_maps.get('up')
+
+
         """Build mapping from cluster_id to expert indices for shared U."""
         self._cluster_groups = {}
         for proj_name in ("gate_proj", "up_proj"):
@@ -120,19 +142,6 @@ class GraphCompatibleMoeBlock(nn.Module):
                     (p0.turbo_dim, p0.turbo_bits, p0.turbo_seed))
             setattr(self, out_d_attr, p0.out_features)
 
-            # LoRA: batch SV across all experts if they share the same cluster
-            sv_attr = f"_SV_{proj_attr.split('_')[0]}_cat"  # _SV_gate_cat / _SV_up_cat
-            u_attr  = f"_U_{proj_attr.split('_')[0]}"        # _U_gate / _U_up
-            cids = [p.cluster_id for p in projs]
-            if (len(set(cids)) == 1 and cids[0] is not None
-                    and all(p.SV is not None for p in projs)):
-                setattr(self, sv_attr,
-                        torch.cat([p.SV for p in projs], dim=0))  # (E*out_d, rank)
-                setattr(self, u_attr, projs[0].U)
-            else:
-                setattr(self, sv_attr, None)
-                setattr(self, u_attr, None)
-
         # Down proj: one RHT call for all experts; batch LoRA via bmm;
         # grouped-GEMV via pre-concatenated weights
         down_projs = [self.experts[ei].down_proj for ei in range(E)]
@@ -150,16 +159,113 @@ class GraphCompatibleMoeBlock(nn.Module):
             [p.norms for p in down_projs], dim=0)            # (E*out_d,)
         self._down_out_d = p0d.out_features
 
-        down_cids = [getattr(p, 'cluster_id', None) for p in down_projs]
-        if (len(set(down_cids)) == 1 and down_cids[0] is not None
-                and all(p.SV is not None for p in down_projs)
-                and down_projs[0].U is not None):
-            self._U_down = down_projs[0].U                                         # (inter_d, rank)
-            self._SV_T_down_all = torch.stack(
-                [p.SV.T for p in down_projs], dim=0)                               # (E, rank, out_d)
-        else:
-            self._U_down = None
-            self._SV_T_down_all = None
+        self._prefetch_stream = self._get_side_stream()
+
+        # --- Batched LoRA for graph-mode parallel execution ---
+        # Instead of per-cluster loops (many small kernels), batch everything
+        # into 2 GPU ops per projection: 1 GEMV (U) + 1 BMM (SV).
+        #
+        # Gate/Up layout (input hidden_states is SHARED across all experts):
+        #   _U_cat_{gate,up}: (hidden_dim, K*rank)  — K cluster U mats concatenated
+        #   _SV_all_{gate,up}: (E, out_d, rank)     — per-expert SV matrices
+        #   _cluster_idx_{gate,up}: (E,) long       — which cluster each expert uses
+        #
+        # Down layout (each expert has its OWN input h_all[i]):
+        #   _U_per_expert_down: (E, inter_d, rank)  — U duplicated per expert
+        #   _SV_all_down: (E, hidden_dim, rank)      — per-expert SV matrices
+        #
+        # Experts without LoRA get zero SV (and zero U for down) so their
+        # contribution is automatically zero.
+
+        def _build_gate_up_lora(projs, out_d, device, pool, id_map):
+            """Build batched LoRA tensors for gate or up projection."""
+            from collections import defaultdict
+            cid_to_U = {}
+            cid_list = []        # ordered cluster id list
+            cid_to_idx = {}      # cid → index in cid_list
+            rank = None
+            for p in projs:
+                cid = getattr(p, 'cluster_id', None)
+                if cid is None or not hasattr(p, 'U') or p.U is None:
+                    continue
+                if not hasattr(p, 'SV') or p.SV is None:
+                    continue
+                if cid not in cid_to_idx:
+                    cid_to_idx[cid] = len(cid_list)
+                    cid_list.append(cid)
+                    cid_to_U[cid] = p.U
+                if rank is None:
+                    rank = p.U.shape[1]
+
+            if not cid_list:
+                return None, None, None, rank or 0
+
+            K = len(cid_list)
+            # U_cat: (hidden_dim, K*rank)
+            U_cat = torch.cat([cid_to_U[c] for c in cid_list], dim=1)
+
+            E = len(projs)
+            # SV_all: (E, out_d, rank) — zero for experts without LoRA
+            SV_all = torch.zeros(E, out_d, rank, dtype=torch.float16, device=device)
+            # cluster_idx: (E,) — default 0 (will be multiplied by zero SV anyway)
+            cluster_idx = torch.zeros(E, dtype=torch.long, device=device)
+            for ei, p in enumerate(projs):
+                cid = getattr(p, 'cluster_id', None)
+                if cid is not None and cid in cid_to_idx and hasattr(p, 'SV') and p.SV is not None:
+                    SV_all[ei] = p.SV    # p.SV shape: (out_d, rank)
+                    cluster_idx[ei] = cid_to_idx[cid]
+
+            return U_cat, SV_all, cluster_idx, rank
+
+        def _build_down_lora(projs, hidden_dim, device):
+            """Build batched LoRA tensors for down projection."""
+            rank = None
+            E = len(projs)
+            for p in projs:
+                if hasattr(p, 'U') and p.U is not None:
+                    rank = p.U.shape[1]
+                    inter_d = p.U.shape[0]
+                    break
+            if rank is None:
+                return None, None
+
+            # U_per_expert: (E, inter_d, rank) — duplicate U per expert
+            U_per = torch.zeros(E, inter_d, rank, dtype=torch.float16, device=device)
+            # SV_all: (E, hidden_dim, rank)
+            SV_all = torch.zeros(E, hidden_dim, rank, dtype=torch.float16, device=device)
+            any_lora = False
+            for ei, p in enumerate(projs):
+                if (hasattr(p, 'U') and p.U is not None
+                        and hasattr(p, 'SV') and p.SV is not None):
+                    U_per[ei] = p.U
+                    SV_all[ei] = p.SV    # p.SV shape: (hidden_dim, rank)
+                    any_lora = True
+            if not any_lora:
+                return None, None
+            return U_per, SV_all
+
+        _E = self.num_experts
+        _dev = self.experts[0].gate_proj.packed_indices.device
+        _gate_projs = [self.experts[ei].gate_proj for ei in range(_E)]
+        _up_projs   = [self.experts[ei].up_proj   for ei in range(_E)]
+        _down_projs = [self.experts[ei].down_proj for ei in range(_E)]
+
+        # Gate / Up batched LoRA
+        self._U_cat_gate, self._SV_all_gate, self._cluster_idx_gate, _ = \
+            _build_gate_up_lora(_gate_projs, self._gate_out_d, _dev,
+                                self._global_pool_gate, self._gate_id_map)
+        self._U_cat_up,   self._SV_all_up,   self._cluster_idx_up,   _ = \
+            _build_gate_up_lora(_up_projs,   self._up_out_d,   _dev,
+                                self._global_pool_up,   self._up_id_map)
+
+        # Down batched LoRA: down proj output = hidden_dim
+        self._U_per_expert_down, self._SV_all_down = \
+            _build_down_lora(_down_projs, self._down_out_d, _dev)
+
+        # Sync events: side stream records when each LoRA is done
+        self._ev_lora_gate = torch.cuda.Event()
+        self._ev_lora_up   = torch.cuda.Event()
+        self._ev_lora_down = torch.cuda.Event()
 
         self._graph_cache_built = True
 
@@ -654,29 +760,72 @@ class GraphCompatibleMoeBlock(nn.Module):
             N, E, dtype=routing_weights.dtype, device=hidden_states.device)
         full_weights.scatter_(1, selected_experts, routing_weights)
 
-        # 2. Gate proj: 1 turbo call for all E experts (same input)
+        # 2. Gate proj: side stream computes all per-cluster LoRA while main
+        # stream runs turbo GEMV — both captured in CUDA Graph → real GPU
+        # parallelism during replay (no Python overhead at runtime).
         x_rot_gate = rot_cache.get(self._gate_x_rot_key)
         p0_gate = self.experts[0].gate_proj
+
+        ps  = self._prefetch_stream   # side stream (always valid)
+        cur = torch.cuda.current_stream()
+
+        # 2. Gate proj: side stream computes batched LoRA (1 GEMV + 1 BMM) while
+        # main stream runs turbo GEMV — both captured in CUDA Graph.
+        # Gate LoRA: (1,hidden) @ (hidden,K*rank) → gather → BMM with SV_all
+        if self._U_cat_gate is not None:
+            _rank_g = self._SV_all_gate.shape[2]
+            _K_gate = self._U_cat_gate.shape[1] // _rank_g
+            ps.wait_stream(cur)   # ensure hidden_states is ready on side stream
+
+        # Submit turbo to main stream FIRST so both streams start simultaneously.
+        # ps.wait_stream(cur) above records the main-stream fence before turbo,
+        # so side stream only depends on routing (hidden_states), not on turbo.
         y_gate_all = turbo_dequant_matmul_fused(
             hidden_states, self._packed_gate_all, self._norms_gate_all,
             None, self._gate_centroids,
             p0_gate.turbo_bits, p0_gate.turbo_dim,
             lora_USV=None, precomputed_x_rot=x_rot_gate)            # (N, E*out_gate)
-        if self._U_gate is not None:
-            a_gate = hidden_states @ self._U_gate                    # (N, rank)
-            y_gate_all = y_gate_all + a_gate @ self._SV_gate_cat.T  # (N, E*out_gate)
 
-        # 3. Up proj: 1 turbo call for all E experts
+        if self._U_cat_gate is not None:
+            with torch.cuda.stream(ps):
+                _a_all_g = hidden_states @ self._U_cat_gate          # (N, K*rank)
+                # Squeeze N=1, reshape to (K, rank), gather per expert → (E, rank)
+                _a_exp_g = _a_all_g.squeeze(0).view(_K_gate, _rank_g)[
+                    self._cluster_idx_gate]
+                _lora_g = torch.bmm(
+                    _a_exp_g.unsqueeze(1),                           # (E, 1, rank)
+                    self._SV_all_gate.permute(0, 2, 1)               # (E, rank, out_d)
+                ).squeeze(1)                                          # (E, out_d)
+                self._ev_lora_gate.record()
+            cur.wait_event(self._ev_lora_gate)
+            y_gate_all = y_gate_all + _lora_g.view(N, -1)
+
+        # 3. Up proj: same pattern.
         x_rot_up = rot_cache.get(self._up_x_rot_key)
         p0_up = self.experts[0].up_proj
+
+        if self._U_cat_up is not None:
+            _rank_u = self._SV_all_up.shape[2]
+            _K_up = self._U_cat_up.shape[1] // _rank_u
+            with torch.cuda.stream(ps):
+                _a_all_u = hidden_states @ self._U_cat_up            # (N, K*rank)
+                _a_exp_u = _a_all_u.squeeze(0).view(_K_up, _rank_u)[
+                    self._cluster_idx_up]                            # (E, rank)
+                _lora_u = torch.bmm(
+                    _a_exp_u.unsqueeze(1),                           # (E, 1, rank)
+                    self._SV_all_up.permute(0, 2, 1)                 # (E, rank, out_d)
+                ).squeeze(1)                                          # (E, out_d)
+                self._ev_lora_up.record()
+
         y_up_all = turbo_dequant_matmul_fused(
             hidden_states, self._packed_up_all, self._norms_up_all,
             None, self._up_centroids,
             p0_up.turbo_bits, p0_up.turbo_dim,
             lora_USV=None, precomputed_x_rot=x_rot_up)               # (N, E*out_up)
-        if self._U_up is not None:
-            a_up = hidden_states @ self._U_up
-            y_up_all = y_up_all + a_up @ self._SV_up_cat.T
+
+        if self._U_cat_up is not None:
+            cur.wait_event(self._ev_lora_up)
+            y_up_all = y_up_all + _lora_u.view(N, -1)
 
         # 4. Activation on stacked (N*E, inter_d) tensor
         out_gate = self._gate_out_d
@@ -694,11 +843,18 @@ class GraphCompatibleMoeBlock(nn.Module):
                 *self._down_x_rot_key)
             h_rot_all = (h_all.float() @ Pi_down.float().T).half()   # (N*E, inter_d)
 
-        # 6. Down turbo: 1 grouped-GEMV call for all E experts
-        # h_rot_all: (N*E, inter_d) fp16 — expert k's inputs are rows [k*N : (k+1)*N]
-        # For graph-mode decode (N=1), this is exactly (E, K) → one row per expert.
+        # 6. Down turbo: 1 grouped-GEMV call for all E experts.
+        # Simultaneously, side stream computes per-cluster down LoRA using h_all
+        # (pre-rotation activations); h_all is ready on main stream at this point.
+        # N=1 assumed (CUDA Graph is captured for fixed decode batch size).
         from inference.kernels import turbo_dequant_grouped_gemv_fused
         hidden_dim = hidden_states.shape[-1]
+        _down_out_d = self._down_out_d
+
+        if self._U_per_expert_down is not None:
+            ps.wait_stream(cur)   # h_all ready on main stream
+
+        # Submit grouped GEMV to main stream FIRST (same parallelism trick as gate).
         y_down_cat = turbo_dequant_grouped_gemv_fused(
             h_rot_all,                 # (N*E, K) fp16, N=1 in decode
             self._packed_down_all,     # (E*out_d, K/4) uint8
@@ -708,12 +864,24 @@ class GraphCompatibleMoeBlock(nn.Module):
         # y_down_cat: (E*out_d,) — reshape to (E, N, hidden_dim)
         out_all = y_down_cat.view(E, N, hidden_dim)
 
-        # 7. Down LoRA: 1 GEMM + 1 bmm when all experts share the same cluster
-        if self._U_down is not None:
-            a_down = h_all @ self._U_down          # (N*E, rank)
-            a_down_v = a_down.view(E, N, -1)       # (E, N, rank)
-            lora_down = torch.bmm(a_down_v, self._SV_T_down_all)   # (E, N, hidden_dim)
-            out_all = out_all + lora_down
+        # 7. Down LoRA on side stream (parallel to grouped GEMV above),
+        # then sync and add.
+        # h_all: (E, inter_d) for N=1 decode.
+        # BMM1: (E, 1, inter_d) @ (E, inter_d, rank) → (E, 1, rank)
+        # BMM2: (E, 1, rank)   @ (E, rank, hidden_d) → (E, 1, hidden_d)
+        if self._U_per_expert_down is not None:
+            with torch.cuda.stream(ps):
+                _a_d = torch.bmm(
+                    h_all.unsqueeze(1),                              # (E, 1, inter_d)
+                    self._U_per_expert_down                          # (E, inter_d, rank)
+                )                                                    # (E, 1, rank)
+                _lora_d = torch.bmm(
+                    _a_d,
+                    self._SV_all_down.permute(0, 2, 1)               # (E, rank, hidden_d)
+                ).squeeze(1)                                          # (E, hidden_d)
+                self._ev_lora_down.record()
+            cur.wait_event(self._ev_lora_down)
+            out_all = out_all + _lora_d.unsqueeze(1)                 # (E, 1, hidden_dim)
 
         # 8. Routing accumulation: 1 bmm replaces E scatter-adds
         out_all_t = out_all.permute(1, 0, 2)                        # (N, E, hidden_dim)

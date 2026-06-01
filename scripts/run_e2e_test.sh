@@ -55,6 +55,6 @@ uv run python evaluate/eval_speed.py \
 # cat "${save_dir}/${tag}-fakequant/ppl.json"
 
 # 导出 Chrome trace 可视化（可选）
-uv run python evaluate/profile_speed.py \
-      --model_path ${save_dir}/${tag}-realquant \
-      --trace_path ./profile_realquant.json --gen_len 64
+# uv run python evaluate/profile_speed.py \
+#       --model_path ${save_dir}/${tag}-realquant \
+#       --trace_path ./profile_realquant.json --gen_len 64
