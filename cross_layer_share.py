@@ -492,7 +492,8 @@ def _dequant_intN(q: torch.Tensor, scale: torch.Tensor, nbits: int) -> torch.Ten
 
 def compute_shared_and_reconstruct(all_residuals, assignments, wtype_indices,
                                     layers, rank: int, analyze: bool = False,
-                                    uv_bits: int = 4, hessian_svd: bool = True):
+                                    uv_bits: int = 4, hessian_svd: bool = True,
+                                    u_bits: int = None, sv_bits: int = None):
     """
     For each (wtype, group_id):
       1. Stack residuals  →  E_cat = [E_1 | ... | E_K]  (in, out*K)
@@ -503,10 +504,12 @@ def compute_shared_and_reconstruct(all_residuals, assignments, wtype_indices,
       5. Store W_approx in each record
 
     Returns:
-      shared_matrices : {wtype: {group_id: {U_int8, U_scale, S}}}
-      per_expert_V    : {wtype: [{V_int8, V_scale}]}
+      shared_matrices : {wtype: {group_id: {U_int8, U_scale}}}
+      per_expert_V    : {wtype: [{SV_int8, SV_scale}]}
                         (same ordering as wtype_indices[wtype])
     """
+    u_bits  = u_bits  if u_bits  is not None else uv_bits
+    sv_bits = sv_bits if sv_bits is not None else uv_bits
     shared_matrices = {}
     per_expert_V    = {}
 
@@ -574,14 +577,14 @@ def compute_shared_and_reconstruct(all_residuals, assignments, wtype_indices,
             del E_cat, E_cat_w, E_list
             torch.cuda.empty_cache()
 
-            # Int{uv_bits}-quantize shared U
-            U_int8, U_scale = _quant_intN_absmax(U, uv_bits)    # CPU int8 / fp16
-            U_fp16          = _dequant_intN(U_int8.to(DEV), U_scale.to(DEV), uv_bits)
+            # Int{u_bits}-quantize shared U
+            U_int8, U_scale = _quant_intN_absmax(U, u_bits)    # CPU int8 / fp16
+            U_fp16          = _dequant_intN(U_int8.to(DEV), U_scale.to(DEV), u_bits)
 
             shared_matrices[wtype][group_id] = {
                 "U_int8":  U_int8.cpu(),    # (in_d, eff_rank) int8
                 "U_scale": U_scale.cpu(),   # (eff_rank,) fp16
-                "S":       S.half().cpu(),  # (eff_rank,) fp16
+                # S is pre-fused into per-expert SV; no longer stored here
             }
 
             # Per-expert V: Hessian-weighted least-squares or plain slice
@@ -605,26 +608,30 @@ def compute_shared_and_reconstruct(all_residuals, assignments, wtype_indices,
                     V_k_normed = V_all[s_off:e_off, :]             # (out_d, rank)
                     S_k = S                                        # use shared S
 
-                # Int{uv_bits}-quantize V_k
-                V_int8, V_scale = _quant_intN_absmax(V_k_normed, uv_bits)
-                V_fp16          = _dequant_intN(V_int8.to(DEV), V_scale.to(DEV), uv_bits)
+                # Pre-fuse: SV_k = V_k_normed * S_k  (the matrix used at inference)
+                SV_k = V_k_normed * S_k.unsqueeze(0)              # (out_d, rank)
+
+                # Int{sv_bits}-quantize SV_k (lower precision, per-expert private)
+                SV_int8, SV_scale = _quant_intN_absmax(SV_k, sv_bits)
+                SV_fp16           = _dequant_intN(SV_int8.to(DEV), SV_scale.to(DEV), sv_bits)
 
                 per_expert_V[wtype][li] = {
-                    "V_int8":  V_int8.cpu(),   # (out_d, eff_rank) int8
-                    "V_scale": V_scale.cpu(),  # (eff_rank,) fp16
+                    "SV_int8":  SV_int8.cpu(),   # (out_d, eff_rank) int8
+                    "SV_scale": SV_scale.cpu(),  # (eff_rank,) fp16
                 }
 
-                # W_approx = Q(W) + U @ diag(S_k) @ V_k^T
+                # W_approx = Q(W) + U @ SV_k.T  (SV_k already has S baked in)
                 Q_W_T       = r["weight_quant"].float().T.to(DEV)  # (in_d, out_d)
-                W_approx_T  = Q_W_T + (U_fp16 * S_k.unsqueeze(0)) @ V_fp16.T
+                W_approx_T  = Q_W_T + U_fp16 @ SV_fp16.T
                 r["weight_approx"] = W_approx_T.T.half().cpu()     # (out_d, in_d)
 
                 if analyze:
                     E_T_i        = (r["weight_orig"] - r["weight_quant"]).float().T.to(DEV)
                     # Ideal approximation (original U, no intN quantization)
-                    E_lora_fp    = (U.float() * S_k.float().unsqueeze(0)) @ V_k_normed.float().T
+                    SV_k_fp      = V_k_normed.float() * S_k.float().unsqueeze(0)
+                    E_lora_fp    = U.float() @ SV_k_fp.T
                     # Actual intN approximation
-                    E_lora_int8_ = (U_fp16.float() * S_k.float().unsqueeze(0)) @ V_fp16.float().T
+                    E_lora_int8_ = U_fp16.float() @ SV_fp16.float().T
 
                     E_norm_i    = E_T_i.norm().item()
                     err_trunc   = (E_T_i - E_lora_fp).norm().item()
@@ -638,13 +645,13 @@ def compute_shared_and_reconstruct(all_residuals, assignments, wtype_indices,
                     print(f"      [{r['layer']:2d}/{r['module_name']}] "
                           f"‖E‖={E_norm_i:.3f}  "
                           f"SVD_cap={E_lora_fp.norm().item()/E_norm_i*100:.1f}%  "
-                          f"int{uv_bits}_cap={E_lora_int8_.norm().item()/E_norm_i*100:.1f}%  "
+                          f"int{sv_bits}_cap={E_lora_int8_.norm().item()/E_norm_i*100:.1f}%  "
                           f"err_trunc={err_trunc/E_norm_i:.3f}  "
                           f"err_total={err_total/E_norm_i:.3f}  "
                           f"‖W-Q(W)‖={err_before:.3f}→‖W-W_approx‖={err_after:.3f}  "
                           f"{'[WORSE!]' if err_after > err_before else '[OK]'}",
                           flush=True)
-                    del E_T_i, E_lora_fp, E_lora_int8_, W_orig_T, Q_W_T_
+                    del E_T_i, E_lora_fp, E_lora_int8_, SV_k_fp, W_orig_T, Q_W_T_
                     torch.cuda.empty_cache()
 
             del U, S, V_all, U_fp16
@@ -699,7 +706,8 @@ def _write_back_weights(all_residuals, wtype_indices, layers):
 # ---------------------------------------------------------------------------
 def compute_avg_bits(all_residuals, assignments, wtype_indices,
                      shared_matrices, rank: int, groupsize: int, nbits: int = 4,
-                     uv_bits: int = 4, use_turboquant: bool = False):
+                     uv_bits: int = 4, use_turboquant: bool = False,
+                     u_bits: int = None, sv_bits: int = None):
     """
     Compute and print average bits/param for the full quantized model.
 
@@ -708,16 +716,16 @@ def compute_avg_bits(all_residuals, assignments, wtype_indices,
       2. Quantizer scale overhead:
          - GPTQ: per-group fp16 scale (one per 'groupsize' cols per row)
          - TurboQuant: per-row fp16 norm (one per row)
-      3. Shared U (int8, amortized over K experts in group) + U scale (fp16)
-      4. Per-expert V (int8)                                + V scale (fp16)
-      5. Shared singular values S (fp16, amortized)
+      3. Shared U (u_bits, amortized over K experts in group) + U scale (fp16)
+      4. Per-expert SV (sv_bits, pre-fused V*S)              + SV scale (fp16)
     """
+    _u_bits  = u_bits  if u_bits  is not None else uv_bits
+    _sv_bits = sv_bits if sv_bits is not None else uv_bits
     total_params      = 0
     bits_quant_weight = 0
     bits_gptq_scale   = 0
     bits_U            = 0
-    bits_V            = 0
-    bits_S            = 0
+    bits_SV           = 0
 
     for wtype, idxs in wtype_indices.items():
         labels     = assignments[wtype]
@@ -743,11 +751,9 @@ def compute_avg_bits(all_residuals, assignments, wtype_indices,
                 # GPTQ: one fp16 scale per row per group-of-columns
                 bits_gptq_scale   += out_d * math.ceil(in_d / groupsize) * 16
             # Shared U (intN) + U_scale (fp16, per column) — amortized
-            bits_U            += (in_d * eff_rank * uv_bits + eff_rank * 16) / K
-            # Per-expert V (intN) + V_scale (fp16, per column)
-            bits_V            += out_d * eff_rank * uv_bits + eff_rank * 16
-            # Shared S (fp16, per singular value) — amortized
-            bits_S            += eff_rank * 16 / K
+            bits_U            += (in_d * eff_rank * _u_bits + eff_rank * 16) / K
+            # Per-expert SV (intN, pre-fused) + SV_scale (fp16, per column)
+            bits_SV           += out_d * eff_rank * _sv_bits + eff_rank * 16
 
     if total_params == 0:
         print("[bit-width] No quantized parameters found.")
@@ -756,8 +762,7 @@ def compute_avg_bits(all_residuals, assignments, wtype_indices,
     def bpp(b):
         return b / total_params
 
-    total_bits = (bits_quant_weight + bits_gptq_scale
-                  + bits_U + bits_V + bits_S)
+    total_bits = (bits_quant_weight + bits_gptq_scale + bits_U + bits_SV)
 
     print("\n" + "=" * 57)
     print("  Model Bit-Width Summary (cross-layer sharing)")
@@ -766,9 +771,8 @@ def compute_avg_bits(all_residuals, assignments, wtype_indices,
     print(f"  {nbits}-bit weights:                        {bpp(bits_quant_weight):>9.4f} bits/param")
     scale_label = "Hybrid quant scale" if use_turboquant else "GPTQ scale factors"
     print(f"  {scale_label:25s} (fp16):           {bpp(bits_gptq_scale):>9.4f} bits/param")
-    print(f"  Shared U            (int{uv_bits}, amortized):{bpp(bits_U):>9.4f} bits/param")
-    print(f"  Per-expert V        (int{uv_bits}):            {bpp(bits_V):>9.4f} bits/param")
-    print(f"  Singular values S   (fp16, amortized):{bpp(bits_S):>9.4f} bits/param")
+    print(f"  Shared U            (int{_u_bits}, amortized):{bpp(bits_U):>9.4f} bits/param")
+    print(f"  Per-expert SV       (int{_sv_bits}):            {bpp(bits_SV):>9.4f} bits/param")
     print("  " + "-" * 53)
     print(f"  Total average:                        {bpp(total_bits):>9.4f} bits/param")
     print(f"  Original model (fp16):                {16.0:>9.4f} bits/param")

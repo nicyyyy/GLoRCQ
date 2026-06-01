@@ -258,6 +258,16 @@ class GLoRCQLinear(nn.Module):
             # Pre-fuse: SV[i, j] = V[i, j] * S[j]  (out_d, rank)
             self.SV = (V * S.unsqueeze(0)).half().to(device)
 
+    def load_sv(self, U, SV, device="cuda"):
+        """Load pre-fused SV matrix directly (new format).
+
+        Used when SV = V_normed * S is pre-computed at quantization time;
+        no fusion step needed here.
+        """
+        if U is not None:
+            self.U  = U.half().to(device)
+            self.SV = SV.half().to(device)  # (out_d, rank) fp16, already fused
+
     def _dequant_gptq(self):
         """Dequantize GPTQ weights to fp16."""
         out_d, in_d = self.qweight_int.shape

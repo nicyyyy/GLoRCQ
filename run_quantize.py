@@ -90,7 +90,9 @@ def run_joint_quant(args):
     if args.search_act_alpha:
         print(f"  search_act_alpha: ON  (per-module grid search, "
               f"default_alpha={args.act_alpha} as fallback)")
-    print(f"  uv_bits  : {args.uv_bits}  (U/V quantization bits)")
+    u_bits  = args.u_bits  if args.u_bits  is not None else args.uv_bits
+    sv_bits = args.sv_bits if args.sv_bits is not None else (args.uv_bits if args.uv_bits != 8 else 4)
+    print(f"  uv_bits  : {args.uv_bits}  (legacy; u_bits={u_bits}, sv_bits={sv_bits})")
     print(f"  early_stop_tol: {args.early_stop_tol}  (0=disabled)")
     print(f"  hessian_svd: {args.hessian_svd}")
     print(f"  use_turboquant: {args.use_turboquant}")
@@ -164,6 +166,7 @@ def run_joint_quant(args):
     shared_matrices, per_expert_V = compute_shared_and_reconstruct(
         all_records, assignments, wtype_indices, layers, args.rank,
         analyze=args.analyze, uv_bits=args.uv_bits,
+        u_bits=u_bits, sv_bits=sv_bits,
         hessian_svd=args.hessian_svd,
     )
     gc.collect()
@@ -176,6 +179,7 @@ def run_joint_quant(args):
         all_records, assignments, wtype_indices,
         shared_matrices, args.rank, args.groupsize, nbits=args.qbit,
         uv_bits=args.uv_bits, use_turboquant=args.use_turboquant,
+        u_bits=u_bits, sv_bits=sv_bits,
     )
 
     # -----------------------------------------------------------------------
@@ -195,6 +199,9 @@ def run_joint_quant(args):
         "use_turboquant": args.use_turboquant,
         "method":     "hybrid_gptq_attn_turboquant_moe" if args.use_turboquant
                       else "joint_gptq_hessian_svd",
+        "uv_bits":    args.uv_bits,
+        "u_bits":     u_bits,
+        "sv_bits":    sv_bits,
     }
 
     if args.real_quant:
@@ -278,7 +285,13 @@ def parse_args():
                    help="Per-module grid search for act_alpha (attention only)")
     p.add_argument("--uv_bits", type=int, default=8,
                    help="Quantization bits for shared U and per-expert V "
-                        "(default: 8; options: 2/4/8)")
+                        "(default: 8; options: 2/4/8). Legacy: sets both u_bits and sv_bits.")
+    p.add_argument("--u_bits", type=int, default=None,
+                   help="Quantization bits for shared U (default: uv_bits or 8). "
+                        "U is cross-layer shared, so higher precision is preferred.")
+    p.add_argument("--sv_bits", type=int, default=None,
+                   help="Quantization bits for per-expert SV (default: uv_bits or 4). "
+                        "SV is per-expert private; lower precision trades quality for storage.")
     p.add_argument("--early_stop_tol", type=float, default=0,
                    help="Relative Frobenius improvement threshold for early stopping "
                         "in alternating optimization (default: 0; 0=disabled)")

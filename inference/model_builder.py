@@ -32,17 +32,18 @@ class SharedUCache:
     Interface reserved for future optimization (LRU, on-demand dequant, etc.).
     """
 
-    def __init__(self, shared_matrices, uv_bits, device="cuda"):
+    def __init__(self, shared_matrices, uv_bits, device="cuda", u_bits=None):
         self._cache = {}
-        self._uv_bits = uv_bits
+        _u_bits = u_bits if u_bits is not None else uv_bits
         for wtype, groups in shared_matrices.items():
             for gid, data in groups.items():
                 U_fp16 = _dequant_intN(
                     data["U_int8"].to(device),
                     data["U_scale"].to(device),
-                    uv_bits,
+                    _u_bits,
                 ).half()
-                S = data["S"].half().to(device)
+                # S is stored in old format only; new format pre-fuses it into SV
+                S = data["S"].half().to(device) if "S" in data else None
                 self._cache[(wtype, gid)] = (U_fp16, S)
 
     def get(self, wtype, group_id):
@@ -237,10 +238,12 @@ def load_glorcq_model(model_path, device="cuda:0"):
     cl_config = cross_layer_info["config"]
 
     uv_bits = cl_config.get("uv_bits", model_config.get("uv_bits", 8))
+    u_bits  = cl_config.get("u_bits",  uv_bits)
+    sv_bits = cl_config.get("sv_bits", uv_bits)
 
     # 4. Build SharedUCache
     print("[GLoRCQ] Building SharedUCache ...")
-    u_cache = SharedUCache(shared_matrices, uv_bits, device=device)
+    u_cache = SharedUCache(shared_matrices, uv_bits, device=device, u_bits=u_bits)
 
     # 5. Build RotationCache for TurboQuant runtime dequant
     rotation_cache = None
@@ -253,6 +256,7 @@ def load_glorcq_model(model_path, device="cuda:0"):
     _replace_linear_layers(
         model, layers_data, assignments, per_expert_V,
         u_cache, uv_bits, rotation_cache, device,
+        sv_bits=sv_bits,
     )
 
     # 6a. Load RHT signs for Hadamard rotation mode
@@ -314,7 +318,8 @@ def _materialize_meta_module(module, device):
 
 
 def _replace_linear_layers(model, layers_data, assignments, per_expert_V,
-                            u_cache, uv_bits, rotation_cache, device):
+                            u_cache, uv_bits, rotation_cache, device,
+                            sv_bits=None):
     """
     Replace nn.Linear layers in the model with GLoRCQLinear.
 
@@ -399,6 +404,7 @@ def _replace_linear_layers(model, layers_data, assignments, per_expert_V,
                 ql, layer_idx, module_name,
                 assignment_lookup, u_cache, per_expert_V,
                 uv_bits, device,
+                sv_bits=sv_bits,
             )
 
             # Load bias if present
@@ -442,8 +448,13 @@ def _find_linear_modules(module, prefix=""):
 
 
 def _load_lora_for_module(ql, layer_idx, module_name, assignment_lookup,
-                           u_cache, per_expert_V, uv_bits, device):
-    """Load LoRA (U, S, V) compensation for a specific module."""
+                           u_cache, per_expert_V, uv_bits, device,
+                           sv_bits=None):
+    """Load LoRA (U, SV) compensation for a specific module.
+
+    Supports both new format (SV_int8 key, pre-fused SV) and old format
+    (V_int8 + S in shared_matrices) for backward compatibility.
+    """
     from utils.moe_utils import is_regular_expert, is_shared_expert, extract_expert_info
 
     # Determine expert_idx and wtype from module_name
@@ -480,23 +491,29 @@ def _load_lora_for_module(ql, layer_idx, module_name, assignment_lookup,
     if U is None:
         return
 
-    # Get per-expert V
+    # Get per-expert SV (new format) or V+S (old format)
     if wtype_key in per_expert_V and per_expert_V[wtype_key][local_idx] is not None:
         v_data = per_expert_V[wtype_key][local_idx]
-        V = _dequant_intN(
-            v_data["V_int8"].to(device),
-            v_data["V_scale"].to(device),
-            uv_bits,
-        ).half()
-
-        # Check if this expert has its own S (from Hessian-weighted per-expert V)
-        # The S is part of V's column norms in this case
-        V_col_norm = V.norm(dim=0).clamp(min=1e-6)
-        # Use shared S since the per-expert S is already baked into V
-        S = S_shared
+        if "SV_int8" in v_data:
+            # New format: SV is pre-fused (V_normed * S) and quantized with sv_bits
+            _sv_bits = sv_bits if sv_bits is not None else uv_bits
+            SV = _dequant_intN(
+                v_data["SV_int8"].to(device),
+                v_data["SV_scale"].to(device),
+                _sv_bits,
+            ).half()
+            ql.load_sv(U, SV, device=device)
+        else:
+            # Old format: V is stored separately; S is in u_cache
+            V = _dequant_intN(
+                v_data["V_int8"].to(device),
+                v_data["V_scale"].to(device),
+                uv_bits,
+            ).half()
+            S = S_shared
+            ql.load_lora(U, S, V, device=device)
     else:
         return
 
-    ql.load_lora(U, S, V, device=device)
     # Tag with cluster id for cluster-parallel LoRA in MoE block
     ql.cluster_id = (wtype_key, group_id)
