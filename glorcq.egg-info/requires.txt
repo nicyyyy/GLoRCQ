@@ -10,5 +10,8 @@ numpy
 tqdm
 SentencePiece
 
+[hadamard]
+fast-hadamard-transform
+
 [turboquant]
 scipy

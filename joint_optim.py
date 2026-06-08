@@ -535,6 +535,34 @@ def search_act_scale_pergroup(g, alpha_grid=None, groupsize=128):
 
 
 # ---------------------------------------------------------------------------
+# Batched randomized SVD helper
+# ---------------------------------------------------------------------------
+def _batched_rsvd(X: torch.Tensor, rank: int, niter: int = 4):
+    """
+    Batched randomized SVD: X (K, m, n) → U (K, m, rank), S (K, rank), Vp (K, n, rank).
+
+    Replaces K sequential torch.svd_lowrank calls with batched bmm operations,
+    giving much better GPU utilization when K is large (e.g., K=120 MoE experts).
+
+    Equivalent quality to svd_lowrank(X[k], q=rank, niter=niter) for each k.
+    """
+    K, m, n = X.shape
+    r = min(rank + 10, m, n)               # rank + oversampling, clamped to matrix dims
+    Omega = torch.randn(K, n, r, device=X.device, dtype=X.dtype)
+    Y = torch.bmm(X, Omega)                # (K, m, r)
+    for _ in range(niter):
+        Q, _ = torch.linalg.qr(Y)         # (K, m, r)
+        Z = torch.bmm(X.transpose(1, 2), Q)   # (K, n, r)
+        Q2, _ = torch.linalg.qr(Z)        # (K, n, r)
+        Y = torch.bmm(X, Q2)              # (K, m, r)
+    Q, _ = torch.linalg.qr(Y)             # (K, m, r)
+    B = torch.bmm(Q.transpose(1, 2), X)   # (K, r, n)
+    U_B, S, Vh = torch.linalg.svd(B, full_matrices=False)  # (K,r,r), (K,r), (K,r,n)
+    U = torch.bmm(Q, U_B[:, :, :rank])    # (K, m, rank)
+    return U, S[:, :rank], Vh[:, :rank, :].transpose(1, 2)  # (K,m,rank),(K,rank),(K,n,rank)
+
+
+# ---------------------------------------------------------------------------
 # Stage 1 — Alternating Joint Quantization + Hessian-weighted SVD
 # ---------------------------------------------------------------------------
 @torch.no_grad()
@@ -715,7 +743,8 @@ def quantize_joint(model, layers, dataloader, args, use_turboquant: bool = False
                         groupsize=args.groupsize, reset_quant=(it == 0),
                     )
                     E = g.W_orig_gpu - g.Q_gpu
-                    U_new, S_new, V_new = g.hessian_weighted_svd(E, args.rank)
+                    _rank_attn = getattr(args, 'rank_attn', None) or args.rank
+                    U_new, S_new, V_new = g.hessian_weighted_svd(E, _rank_attn)
                     lora_state_attn[name] = (U_new, S_new, V_new)
                     W_lora_new = U_new.float() @ (S_new.unsqueeze(1) * V_new.T.float())
                     full[name].weight.data = (g.Q_gpu + W_lora_new).half()
@@ -741,7 +770,8 @@ def quantize_joint(model, layers, dataloader, args, use_turboquant: bool = False
                     W_lora=W_lora_final, percdamp=args.percdamp, groupsize=args.groupsize,
                 )
                 E_sym = g.W_orig_gpu - g.Q_gpu
-                U_sym, S_sym, V_sym = g.hessian_weighted_svd(E_sym, args.rank)
+                _rank_attn = getattr(args, 'rank_attn', None) or args.rank
+                U_sym, S_sym, V_sym = g.hessian_weighted_svd(E_sym, _rank_attn)
                 W_lora_sym = U_sym.float() @ (S_sym.unsqueeze(1) * V_sym.T.float())
                 full[name].weight.data = (g.Q_gpu + W_lora_sym).half()
 
@@ -819,9 +849,34 @@ def quantize_joint(model, layers, dataloader, args, use_turboquant: bool = False
 
                     Q_stacked = turbo_quantizer.quantize_dequantize(W_stacked)
 
-                    # Split back and do per-expert SVD + record
+                    # Compute all residuals E = W_orig - Q in one shot
+                    E_stacked = W_stacked - Q_stacked      # (Σout_d, in_d) fp32
+                    del W_stacked                          # W_orig retained per-expert; free this
+
+                    # Batched randomized SVD: replace K sequential svd_lowrank with
+                    # one batched operation when all experts share the same out_d.
+                    # (Always true for same-type experts grouped by in_d.)
+                    _K = len(_chunk)
+                    _same_out = (len(set(out_dims)) == 1) and _K > 1
+                    if _same_out:
+                        _od0    = out_dims[0]
+                        eff_r   = min(args.rank, _od0, _in_d)
+                        E_batch = E_stacked.view(_K, _od0, _in_d)  # view, no copy
+                        try:
+                            U_batch, S_batch, Vp_batch = _batched_rsvd(
+                                E_batch, eff_r, niter=4
+                            )
+                            _batch_ok = True
+                        except Exception as _e:
+                            print(f"  [batched_rsvd] fallback to sequential: {_e}",
+                                  flush=True)
+                            _batch_ok = False
+                    else:
+                        _batch_ok = False
+
+                    # Split back and do per-expert update + record
                     _off = 0
-                    for name, _od in zip(_chunk, out_dims):
+                    for k, (name, _od) in enumerate(zip(_chunk, out_dims)):
                         g = gptq[name]
                         Q_exp = Q_stacked[_off:_off + _od]
                         _off += _od
@@ -831,8 +886,14 @@ def quantize_joint(model, layers, dataloader, args, use_turboquant: bool = False
                         g.layer.weight.data = Q_exp.half().clone()
                         Q_W = Q_exp.cpu().half()
 
-                        E = g.W_orig_gpu - g.Q_gpu
-                        U, S, V = g.hessian_weighted_svd(E, args.rank)
+                        if _batch_ok:
+                            U = U_batch[k].half()
+                            S = S_batch[k].half()
+                            V = Vp_batch[k].half()
+                        else:
+                            E = g.W_orig_gpu - g.Q_gpu
+                            U, S, V = g.hessian_weighted_svd(E, args.rank)
+
                         W_lora = U.float() @ (S.unsqueeze(1) * V.T.float())
                         full[name].weight.data = (g.Q_gpu + W_lora).half()
 

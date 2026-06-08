@@ -17,6 +17,8 @@ Requires-Dist: tqdm
 Requires-Dist: SentencePiece
 Provides-Extra: turboquant
 Requires-Dist: scipy; extra == "turboquant"
+Provides-Extra: hadamard
+Requires-Dist: fast-hadamard-transform; extra == "hadamard"
 
 # GLoRCQ
 

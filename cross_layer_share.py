@@ -330,69 +330,108 @@ def quantize_and_collect_residuals(model, layers, dataloader, args):
 # ---------------------------------------------------------------------------
 # Stage 2 — Grassmannian distance + SpectralClustering
 # ---------------------------------------------------------------------------
-def _compute_svd_u(E_T: torch.Tensor, rank: int) -> np.ndarray:
-    """Randomized truncated SVD; returns U (in, rank) as float32 numpy."""
+def _compute_svd_us(E_T: torch.Tensor, rank: int):
+    """Randomized truncated SVD; returns (U, S) as float32 numpy arrays."""
     r = min(rank, E_T.shape[0], E_T.shape[1])
     try:
-        U, _, _ = torch.svd_lowrank(E_T.float().to(DEV), q=r, niter=4)
-        return U.cpu().numpy().astype(np.float32)
+        U, S, _ = torch.svd_lowrank(E_T.float().to(DEV), q=r, niter=4)
+        return (U.cpu().numpy().astype(np.float32),
+                S.cpu().numpy().astype(np.float32))
     except Exception:
-        return np.zeros((E_T.shape[0], r), dtype=np.float32)
+        return (np.zeros((E_T.shape[0], r), dtype=np.float32),
+                np.zeros(r, dtype=np.float32))
 
 
-def _grassmannian_dist_matrix(E_T_list, rank: int) -> np.ndarray:
+def _grassmannian_dist_matrix(E_T_list, rank: int, compute_grass: bool = True):
     """
-    Pairwise Grassmannian geodesic distance on the residual U subspaces.
+    Pairwise Grassmannian + cross-reconstruction distances.
 
-    d(i,j) = || arccos( σ(U_i^T U_j) ) ||_2  / (√r · π/2)  ∈ [0,1]
+    D_grass(i,j) = || arccos( σ(U_i^T U_j) ) ||_2 / (√r · π/2)  ∈ [0,1]
+    D_recon(i,j) = 1 - 0.5*(||M_ij S_j||² / ||S_j||²
+                            + ||diag(S_i) M_ij||² / ||S_i||²)  ∈ [0,1]
 
-    Computation is done on GPU with batched SVD for speed.
+    where M_ij = U_i^T U_j  (r×r, computed in the same inner loop).
+
+    Args:
+      compute_grass : if False, skip svdvals and return D_grass=zeros.
+                      Use when recon_weight=1.0 (D_grass not needed).
+
+    Returns (D_grass, D_recon) as (N,N) numpy float32 arrays.
     """
     N = len(E_T_list)
     print(f"  [grassmannian] SVD for {N} modules, rank={rank} ...", flush=True)
-    U_np = np.stack([_compute_svd_u(E_T, rank) for E_T in E_T_list], axis=0)  # (N, in, r)
+    results = [_compute_svd_us(E_T, rank) for E_T in E_T_list]
+    U_np = np.stack([res[0] for res in results], axis=0)  # (N, in_d, r)
+    S_np = np.stack([res[1] for res in results], axis=0)  # (N, r)
     _, _, r = U_np.shape
     max_d = np.sqrt(r) * (np.pi / 2)
 
-    # Move to GPU for batched distance computation
-    U_all = torch.from_numpy(U_np).to(DEV)  # (N, in_d, r)
-    D = torch.zeros(N, N, device=DEV)
+    U_all  = torch.from_numpy(U_np).to(DEV)          # (N, in_d, r)
+    S_all  = torch.from_numpy(S_np).to(DEV)          # (N, r)
+    S_sq   = (S_all ** 2).sum(dim=1)                  # (N,)  ||S_i||²
+
+    D_grass = torch.zeros(N, N, device=DEV)
+    D_recon = torch.zeros(N, N, device=DEV)
 
     print(f"  [grassmannian] {N*(N-1)//2} pairs (GPU-batched) ...", flush=True)
-    # Process in chunks to limit GPU memory for svdvals
-    _chunk = 2048
+    _chunk = 8192
     for i in range(N - 1):
-        U_i_T = U_all[i].T.unsqueeze(0)          # (1, r, in_d)
-        rest = U_all[i + 1:]                       # (M, in_d, r)
-        M = rest.shape[0]
-        dists_list = []
+        U_i_T   = U_all[i].T.unsqueeze(0)            # (1, r, in_d)
+        rest    = U_all[i + 1:]                       # (M, in_d, r)
+        M       = rest.shape[0]
+        S_i_row = S_all[i].view(1, r, 1)             # (1, r, 1) — precompute for chunk loop
+        dg_list, dr_list = [], []
         for c0 in range(0, M, _chunk):
             c1 = min(c0 + _chunk, M)
             M_batch = torch.bmm(
-                U_i_T.expand(c1 - c0, -1, -1),    # (chunk, r, in_d)
-                rest[c0:c1],                        # (chunk, in_d, r)
-            )                                       # (chunk, r, r)
-            sigma = torch.linalg.svdvals(M_batch)   # (chunk, r)
-            sigma = sigma.clamp(0.0, 1.0)
-            angles = torch.arccos(sigma)
-            d = angles.pow(2).sum(dim=1).sqrt() / (max_d + 1e-12)
-            dists_list.append(d)
-        dists = torch.cat(dists_list)
-        D[i, i + 1:] = dists
-        D[i + 1:, i] = dists
+                U_i_T.expand(c1 - c0, -1, -1),       # (chunk, r, in_d)
+                rest[c0:c1],                           # (chunk, in_d, r)
+            )                                          # (chunk, r, r)
+
+            # Grassmannian (skipped when compute_grass=False)
+            if compute_grass:
+                sigma  = torch.linalg.svdvals(M_batch).clamp(0.0, 1.0)
+                angles = torch.arccos(sigma)
+                dg     = angles.pow(2).sum(dim=1).sqrt() / (max_d + 1e-12)
+                dg_list.append(dg)
+
+            # Cross-reconstruction:  D_recon(i,j) = 1 - 0.5*(R_ji + R_ij)
+            # R_ji = ||M_ij diag(S_j)||_F² / ||S_j||²  (scale columns by S_j)
+            S_j  = S_all[i + 1 + c0: i + 1 + c1]    # (chunk, r)
+            ms_j = (M_batch * S_j.unsqueeze(1)).pow(2).sum(dim=(1, 2))    # (chunk,)
+            # R_ij = ||diag(S_i) M_ij||_F² / ||S_i||²  (scale rows by S_i, no transpose)
+            ms_i = (M_batch * S_i_row).pow(2).sum(dim=(1, 2))             # (chunk,)
+            dr   = (1.0 - 0.5 * (ms_j / (S_sq[i + 1 + c0: i + 1 + c1] + 1e-12)
+                                  + ms_i / (S_sq[i] + 1e-12))).clamp(0.0, 1.0)
+            dr_list.append(dr)
+
+        if compute_grass:
+            dg = torch.cat(dg_list)
+            D_grass[i, i + 1:] = dg;  D_grass[i + 1:, i] = dg
+        dr = torch.cat(dr_list)
+        D_recon[i, i + 1:] = dr;  D_recon[i + 1:, i] = dr
         if (i + 1) % 200 == 0 or i == N - 2:
             print(f"    row {i+1}/{N-1}", flush=True)
-    return D.cpu().numpy()
+    return D_grass.cpu().numpy(), D_recon.cpu().numpy()
 
 
 def cluster_residuals(all_residuals, rank: int, G_moe: int, G_attn: int,
-                      seed: int = 42, share_attn: bool = False):
+                      seed: int = 42, share_attn: bool = False,
+                      hessian_svd: bool = True, recon_weight: float = 0.0):
     """
     Run Grassmannian SpectralClustering independently for each wtype.
 
     When share_attn=False (default), attention layers (q/k/v/o_proj) skip
     Grassmannian clustering and each record is assigned its own independent
     group (no cross-layer sharing for attention).
+
+    Args:
+      hessian_svd  : If True and records have 'hessian_diag', weight E_T by
+                     H^{1/2} before SVD — aligns Stage 2 with Stage 3 objective.
+      recon_weight : α ∈ [0,1]. Combined distance =
+                     (1-α)*D_grass + α*D_recon, where D_recon is the
+                     symmetric cross-reconstruction error proxy using S vectors.
+                     0 = pure Hessian-weighted Grassmannian (default).
 
     Returns:
       assignments   : {wtype: ndarray(N,)} — group_id per record
@@ -425,10 +464,30 @@ def cluster_residuals(all_residuals, rank: int, G_moe: int, G_attn: int,
 
         print(f"\n[Stage 2] {wtype}: N={N}, G={G}", flush=True)
         subset  = [all_residuals[i] for i in idxs]
-        E_T_list = [(r["weight_orig"] - r["weight_quant"]).float().T
-                    for r in subset]   # list of (in, out)
 
-        D = _grassmannian_dist_matrix(E_T_list, rank)
+        # Build E_T list with optional Hessian weighting
+        E_T_list = []
+        n_weighted = 0
+        for r in subset:
+            E_T = (r["weight_orig"] - r["weight_quant"]).float().T  # (in_d, out_d)
+            if hessian_svd and r.get("hessian_diag") is not None:
+                h_sqrt = r["hessian_diag"].float().sqrt().to(E_T.device)  # (in_d,)
+                E_T = E_T * h_sqrt.unsqueeze(1)
+                n_weighted += 1
+            E_T_list.append(E_T)
+        if n_weighted > 0:
+            print(f"  [hessian_svd] applied Hessian weighting to {n_weighted}/{N} modules",
+                  flush=True)
+
+        D_grass, D_recon = _grassmannian_dist_matrix(
+            E_T_list, rank, compute_grass=(recon_weight < 1.0)
+        )
+        if recon_weight > 0:
+            D = (1.0 - recon_weight) * D_grass + recon_weight * D_recon
+            print(f"  [recon_weight={recon_weight}] combined D_grass + D_recon",
+                  flush=True)
+        else:
+            D = D_grass
 
         if G <= 1 or N == 1:
             labels = np.zeros(N, dtype=np.int64)
@@ -490,10 +549,42 @@ def _dequant_intN(q: torch.Tensor, scale: torch.Tensor, nbits: int) -> torch.Ten
     return q.float() / maxval * scale.float()
 
 
+def _pack_int4(q_int8: torch.Tensor) -> torch.Tensor:
+    """
+    Pack (rows, cols) int8 tensor with values in [-7, 7] into 4-bit packed uint8.
+    Packs pairs of rows: packed[i, :] stores rows 2i and 2i+1.
+    Returns ((rows+1)//2, cols) uint8 tensor.
+    """
+    rows, cols = q_int8.shape
+    # Shift to unsigned [0, 14]; 4 bits can hold [0, 15]
+    u = (q_int8.to(torch.int16) + 7).to(torch.uint8)  # [0, 14]
+    # Pad to even number of rows
+    if rows % 2 == 1:
+        u = torch.cat([u, torch.zeros(1, cols, dtype=torch.uint8, device=u.device)], dim=0)
+    lo = u[0::2]   # even rows → low nibble
+    hi = u[1::2]   # odd rows  → high nibble
+    return (lo | (hi << 4)).to(torch.uint8)  # ((rows+1)//2, cols)
+
+
+def _unpack_int4(packed: torch.Tensor, orig_rows: int) -> torch.Tensor:
+    """
+    Unpack ((rows+1)//2, cols) uint8 tensor back to (orig_rows, cols) int8 in [-7, 7].
+    Inverse of _pack_int4.
+    """
+    lo = (packed & 0xF).to(torch.int8) - 7   # low nibble → even rows
+    hi = ((packed >> 4) & 0xF).to(torch.int8) - 7  # high nibble → odd rows
+    # Interleave: result[2i] = lo[i], result[2i+1] = hi[i]
+    interleaved = torch.stack([lo, hi], dim=1).reshape(-1, packed.shape[1])
+    return interleaved[:orig_rows]
+
+
 def compute_shared_and_reconstruct(all_residuals, assignments, wtype_indices,
                                     layers, rank: int, analyze: bool = False,
                                     uv_bits: int = 4, hessian_svd: bool = True,
-                                    u_bits: int = None, sv_bits: int = None):
+                                    u_bits: int = None, sv_bits: int = None,
+                                    sv_topk: int = None, u_fp16: bool = False,
+                                    rank_attn: int = None,
+                                    u_bits_attn: int = None, sv_bits_attn: int = None):
     """
     For each (wtype, group_id):
       1. Stack residuals  →  E_cat = [E_1 | ... | E_K]  (in, out*K)
@@ -518,8 +609,15 @@ def compute_shared_and_reconstruct(all_residuals, assignments, wtype_indices,
         idxs   = wtype_indices[wtype]
         subset = [all_residuals[i] for i in idxs]
         G      = int(labels.max()) + 1
+        # Use rank_attn / per-type bits for attention layers if specified
+        _is_attn = wtype in _ATTN_WTYPES
+        _rank    = (rank_attn if (rank_attn is not None and _is_attn) else rank)
+        _u_fp16  = u_fp16 and not _is_attn   # fp16 only for MoE U; attn always quantized
+        _u_bits  = (u_bits_attn  if (_is_attn and u_bits_attn  is not None) else u_bits)
+        _sv_bits = (sv_bits_attn if (_is_attn and sv_bits_attn is not None) else sv_bits)
 
-        print(f"\n[Stage 3+4] {wtype}: N={len(subset)}, G={G}", flush=True)
+        print(f"\n[Stage 3+4] {wtype}: N={len(subset)}, G={G}, rank={_rank}, "
+              f"u={'fp16' if _u_fp16 else f'int{_u_bits}'}, sv=int{_sv_bits}", flush=True)
         shared_matrices[wtype] = {}
         per_expert_V[wtype]    = [None] * len(subset)
 
@@ -542,7 +640,7 @@ def compute_shared_and_reconstruct(all_residuals, assignments, wtype_indices,
                 start += out_d
 
             E_cat     = torch.cat(E_list, dim=1)   # (in_d, Σout_d)
-            eff_rank  = min(rank, E_cat.shape[0], E_cat.shape[1])
+            eff_rank  = min(_rank, E_cat.shape[0], E_cat.shape[1])
             E_norm    = E_cat.norm().item()
 
             # ── Hessian-weighted SVD (Stage 3) ──────────────────────────
@@ -568,24 +666,46 @@ def compute_shared_and_reconstruct(all_residuals, assignments, wtype_indices,
                 U = U_w
 
             # U: (in_d, eff_rank), S: (eff_rank,), V_all: (Σout_d, eff_rank)
+            # S is in descending order from svd_lowrank — truncate to top-k if requested
+            if sv_topk is not None and sv_topk < eff_rank:
+                U      = U[:, :sv_topk]
+                S      = S[:sv_topk]
+                V_all  = V_all[:, :sv_topk]
+                eff_rank = sv_topk
             print(f"    group {group_id:3d}: ‖E_cat‖={E_norm:.4f}  "
                   f"S.max={S.max().item():.4f}  S.sum={S.sum().item():.4f}  "
                   f"S[0]/S[-1]={S[0].item()/S[-1].item():.1f}"
+                  f"  rank={eff_rank}"
                   f"{'  [H-weighted]' if use_hessian else ''}",
                   flush=True)
 
             del E_cat, E_cat_w, E_list
             torch.cuda.empty_cache()
 
-            # Int{u_bits}-quantize shared U
-            U_int8, U_scale = _quant_intN_absmax(U, u_bits)    # CPU int8 / fp16
-            U_fp16          = _dequant_intN(U_int8.to(DEV), U_scale.to(DEV), u_bits)
-
-            shared_matrices[wtype][group_id] = {
-                "U_int8":  U_int8.cpu(),    # (in_d, eff_rank) int8
-                "U_scale": U_scale.cpu(),   # (eff_rank,) fp16
-                # S is pre-fused into per-expert SV; no longer stored here
-            }
+            # Quantize or store shared U
+            if _u_fp16:
+                # Store U directly as fp16 — no quantization error
+                shared_matrices[wtype][group_id] = {
+                    "U_fp16": U.half().cpu(),  # (in_d, eff_rank) fp16
+                }
+                U_fp16 = U.float()  # keep float32 for reconstruction math below
+            elif _u_bits == 4:
+                # Real 4-bit packing: 2 values per byte → 50% storage vs int8
+                U_int8, U_scale = _quant_intN_absmax(U, 4)
+                U_packed = _pack_int4(U_int8.cpu())
+                shared_matrices[wtype][group_id] = {
+                    "U_int4_packed": U_packed,                    # ((in_d+1)//2, rank) uint8
+                    "U_scale":       U_scale.cpu(),               # (rank,) fp16
+                    "U_orig_rows":   torch.tensor(U.shape[0]),    # for unpack
+                }
+                U_fp16 = _dequant_intN(U_int8.to(DEV), U_scale.to(DEV), 4)
+            else:
+                U_int8, U_scale = _quant_intN_absmax(U, _u_bits)
+                U_fp16          = _dequant_intN(U_int8.to(DEV), U_scale.to(DEV), _u_bits)
+                shared_matrices[wtype][group_id] = {
+                    "U_int8":  U_int8.cpu(),   # (in_d, eff_rank) int8
+                    "U_scale": U_scale.cpu(),  # (eff_rank,) fp16
+                }
 
             # Per-expert V: Hessian-weighted least-squares or plain slice
             for k, li in enumerate(member_lis):
@@ -611,14 +731,25 @@ def compute_shared_and_reconstruct(all_residuals, assignments, wtype_indices,
                 # Pre-fuse: SV_k = V_k_normed * S_k  (the matrix used at inference)
                 SV_k = V_k_normed * S_k.unsqueeze(0)              # (out_d, rank)
 
-                # Int{sv_bits}-quantize SV_k (lower precision, per-expert private)
-                SV_int8, SV_scale = _quant_intN_absmax(SV_k, sv_bits)
-                SV_fp16           = _dequant_intN(SV_int8.to(DEV), SV_scale.to(DEV), sv_bits)
-
-                per_expert_V[wtype][li] = {
-                    "SV_int8":  SV_int8.cpu(),   # (out_d, eff_rank) int8
-                    "SV_scale": SV_scale.cpu(),  # (eff_rank,) fp16
-                }
+                if _sv_bits == 16:
+                    # fp16: no quantization, store directly (upper-bound test)
+                    SV_fp16 = SV_k.float()
+                    per_expert_V[wtype][li] = {"SV_fp16": SV_k.half().cpu()}
+                else:
+                    SV_int8, SV_scale = _quant_intN_absmax(SV_k, _sv_bits)
+                    SV_fp16           = _dequant_intN(SV_int8.to(DEV), SV_scale.to(DEV), _sv_bits)
+                    if _sv_bits == 4:
+                        SV_packed = _pack_int4(SV_int8.cpu())
+                        per_expert_V[wtype][li] = {
+                            "SV_int4_packed": SV_packed,
+                            "SV_scale":       SV_scale.cpu(),
+                            "SV_orig_rows":   torch.tensor(SV_int8.shape[0]),
+                        }
+                    else:
+                        per_expert_V[wtype][li] = {
+                            "SV_int8":  SV_int8.cpu(),
+                            "SV_scale": SV_scale.cpu(),
+                        }
 
                 # W_approx = Q(W) + U @ SV_k.T  (SV_k already has S baked in)
                 Q_W_T       = r["weight_quant"].float().T.to(DEV)  # (in_d, out_d)
@@ -707,7 +838,9 @@ def _write_back_weights(all_residuals, wtype_indices, layers):
 def compute_avg_bits(all_residuals, assignments, wtype_indices,
                      shared_matrices, rank: int, groupsize: int, nbits: int = 4,
                      uv_bits: int = 4, use_turboquant: bool = False,
-                     u_bits: int = None, sv_bits: int = None):
+                     u_bits: int = None, sv_bits: int = None, u_fp16: bool = False,
+                     rank_attn: int = None,
+                     u_bits_attn: int = None, sv_bits_attn: int = None):
     """
     Compute and print average bits/param for the full quantized model.
 
@@ -733,13 +866,19 @@ def compute_avg_bits(all_residuals, assignments, wtype_indices,
         for lbl in labels:
             group_K[int(lbl)] += 1
 
+        _is_attn   = wtype in _ATTN_WTYPES
+        _rank      = (rank_attn if (rank_attn is not None and _is_attn) else rank)
+        _u_bits_   = (u_bits_attn  if (_is_attn and u_bits_attn  is not None) else _u_bits)
+        _sv_bits_  = (sv_bits_attn if (_is_attn and sv_bits_attn is not None) else _sv_bits)
+        _u_fp16_   = u_fp16 and not _is_attn
+
         for li, global_i in enumerate(idxs):
             r        = all_residuals[global_i]
             out_d, in_d = r["shape"]
             n        = out_d * in_d
             g        = int(labels[li])
             K        = group_K[g]
-            eff_rank = min(rank, in_d, out_d)  # actual rank used
+            eff_rank = min(_rank, in_d, out_d)  # actual rank used
 
             total_params      += n
             bits_quant_weight += n * nbits
@@ -750,10 +889,15 @@ def compute_avg_bits(all_residuals, assignments, wtype_indices,
             else:
                 # GPTQ: one fp16 scale per row per group-of-columns
                 bits_gptq_scale   += out_d * math.ceil(in_d / groupsize) * 16
-            # Shared U (intN) + U_scale (fp16, per column) — amortized
-            bits_U            += (in_d * eff_rank * _u_bits + eff_rank * 16) / K
+            # Shared U — amortized over K experts in group
+            # fp16: in_d*rank*16 bits; intN: in_d*rank*_u_bits_ + rank*16 (scale)
+            if _u_fp16_:
+                u_storage_bits = in_d * eff_rank * 16
+            else:
+                u_storage_bits = in_d * eff_rank * _u_bits_ + eff_rank * 16
+            bits_U            += u_storage_bits / K
             # Per-expert SV (intN, pre-fused) + SV_scale (fp16, per column)
-            bits_SV           += out_d * eff_rank * _sv_bits + eff_rank * 16
+            bits_SV           += out_d * eff_rank * _sv_bits_ + eff_rank * 16
 
     if total_params == 0:
         print("[bit-width] No quantized parameters found.")
@@ -771,8 +915,18 @@ def compute_avg_bits(all_residuals, assignments, wtype_indices,
     print(f"  {nbits}-bit weights:                        {bpp(bits_quant_weight):>9.4f} bits/param")
     scale_label = "Hybrid quant scale" if use_turboquant else "GPTQ scale factors"
     print(f"  {scale_label:25s} (fp16):           {bpp(bits_gptq_scale):>9.4f} bits/param")
-    print(f"  Shared U            (int{_u_bits}, amortized):{bpp(bits_U):>9.4f} bits/param")
-    print(f"  Per-expert SV       (int{_sv_bits}):            {bpp(bits_SV):>9.4f} bits/param")
+    u_fmt_moe  = "fp16" if (u_fp16 and u_bits_attn is None) else f"int{_u_bits}"
+    sv_fmt_moe = f"int{_sv_bits}"
+    u_fmt_attn  = f"int{u_bits_attn}"  if u_bits_attn  is not None else u_fmt_moe
+    sv_fmt_attn = f"int{sv_bits_attn}" if sv_bits_attn is not None else sv_fmt_moe
+    if u_bits_attn is not None or sv_bits_attn is not None:
+        u_fmt  = f"MoE={u_fmt_moe}/Attn={u_fmt_attn}"
+        sv_fmt = f"MoE={sv_fmt_moe}/Attn={sv_fmt_attn}"
+    else:
+        u_fmt  = "fp16" if u_fp16 else u_fmt_moe
+        sv_fmt = sv_fmt_moe
+    print(f"  Shared U            ({u_fmt}, amortized): {bpp(bits_U):>9.4f} bits/param")
+    print(f"  Per-expert SV       ({sv_fmt}):  {bpp(bits_SV):>9.4f} bits/param")
     print("  " + "-" * 53)
     print(f"  Total average:                        {bpp(total_bits):>9.4f} bits/param")
     print(f"  Original model (fp16):                {16.0:>9.4f} bits/param")

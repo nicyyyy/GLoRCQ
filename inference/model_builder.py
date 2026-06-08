@@ -37,11 +37,18 @@ class SharedUCache:
         _u_bits = u_bits if u_bits is not None else uv_bits
         for wtype, groups in shared_matrices.items():
             for gid, data in groups.items():
-                U_fp16 = _dequant_intN(
-                    data["U_int8"].to(device),
-                    data["U_scale"].to(device),
-                    _u_bits,
-                ).half()
+                if "U_fp16" in data:
+                    U_fp16 = data["U_fp16"].half().to(device)
+                elif "U_int4_packed" in data:
+                    orig_rows = int(data["U_orig_rows"].item())
+                    U_int8 = _unpack_int4(data["U_int4_packed"].to(device), orig_rows)
+                    U_fp16 = _dequant_intN(U_int8, data["U_scale"].to(device), 4).half()
+                else:
+                    U_fp16 = _dequant_intN(
+                        data["U_int8"].to(device),
+                        data["U_scale"].to(device),
+                        _u_bits,
+                    ).half()
                 # S is stored in old format only; new format pre-fuses it into SV
                 S = data["S"].half().to(device) if "S" in data else None
                 self._cache[(wtype, gid)] = (U_fp16, S)
@@ -63,6 +70,14 @@ def _dequant_intN(q, scale, nbits):
     """Dequantize intN (stored as int8) → float32 using per-column scale."""
     maxval = 2 ** (nbits - 1) - 1
     return q.float() / maxval * scale.float()
+
+
+def _unpack_int4(packed, orig_rows):
+    """Unpack ((rows+1)//2, cols) uint8 → (orig_rows, cols) int8 in [-7, 7]."""
+    lo = (packed & 0xF).to(torch.int8) - 7
+    hi = ((packed >> 4) & 0xF).to(torch.int8) - 7
+    interleaved = torch.stack([lo, hi], dim=1).reshape(-1, packed.shape[1])
+    return interleaved[:orig_rows]
 
 
 # ---------------------------------------------------------------------------
@@ -494,8 +509,18 @@ def _load_lora_for_module(ql, layer_idx, module_name, assignment_lookup,
     # Get per-expert SV (new format) or V+S (old format)
     if wtype_key in per_expert_V and per_expert_V[wtype_key][local_idx] is not None:
         v_data = per_expert_V[wtype_key][local_idx]
-        if "SV_int8" in v_data:
-            # New format: SV is pre-fused (V_normed * S) and quantized with sv_bits
+        if "SV_int4_packed" in v_data:
+            # INT4 packed format: real 4-bit packing, 50% storage vs int8
+            orig_rows = int(v_data["SV_orig_rows"].item())
+            SV_int8 = _unpack_int4(v_data["SV_int4_packed"].to(device), orig_rows)
+            SV = _dequant_intN(SV_int8, v_data["SV_scale"].to(device), 4).half()
+            ql.load_sv(U, SV, device=device)
+        elif "SV_fp16" in v_data:
+            # fp16 format: directly stored without quantization
+            SV = v_data["SV_fp16"].to(device).half()
+            ql.load_sv(U, SV, device=device)
+        elif "SV_int8" in v_data:
+            # int8 (or other nbits stored in int8 container) format
             _sv_bits = sv_bits if sv_bits is not None else uv_bits
             SV = _dequant_intN(
                 v_data["SV_int8"].to(device),

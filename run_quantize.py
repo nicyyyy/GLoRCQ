@@ -92,9 +92,12 @@ def run_joint_quant(args):
               f"default_alpha={args.act_alpha} as fallback)")
     u_bits  = args.u_bits  if args.u_bits  is not None else args.uv_bits
     sv_bits = args.sv_bits if args.sv_bits is not None else (args.uv_bits if args.uv_bits != 8 else 4)
+    u_bits_attn  = args.u_bits_attn  if args.u_bits_attn  is not None else (u_bits  if u_bits  is not None else 8)
+    sv_bits_attn = args.sv_bits_attn if args.sv_bits_attn is not None else (sv_bits if sv_bits is not None else 8)
     print(f"  uv_bits  : {args.uv_bits}  (legacy; u_bits={u_bits}, sv_bits={sv_bits})")
+    print(f"  u_bits_attn={u_bits_attn}, sv_bits_attn={sv_bits_attn}")
     print(f"  early_stop_tol: {args.early_stop_tol}  (0=disabled)")
-    print(f"  hessian_svd: {args.hessian_svd}")
+    print(f"  hessian_svd: {args.hessian_svd}  recon_weight: {args.recon_weight}")
     print(f"  use_turboquant: {args.use_turboquant}")
     print(f"  real_quant: {args.real_quant}")
     print("=" * 60)
@@ -153,7 +156,8 @@ def run_joint_quant(args):
     print("=" * 60)
     assignments, wtype_indices = cluster_residuals(
         all_records, args.rank, args.G_moe, args.G_attn, seed=args.seed,
-        share_attn=args.share_attn,
+        share_attn=args.share_attn, hessian_svd=args.hessian_svd,
+        recon_weight=args.recon_weight,
     )
     gc.collect()
 
@@ -166,8 +170,11 @@ def run_joint_quant(args):
     shared_matrices, per_expert_V = compute_shared_and_reconstruct(
         all_records, assignments, wtype_indices, layers, args.rank,
         analyze=args.analyze, uv_bits=args.uv_bits,
-        u_bits=u_bits, sv_bits=sv_bits,
+        u_bits=u_bits, sv_bits=sv_bits, sv_topk=args.sv_topk,
+        u_fp16=args.u_fp16,
         hessian_svd=args.hessian_svd,
+        rank_attn=args.rank_attn,
+        u_bits_attn=u_bits_attn, sv_bits_attn=sv_bits_attn,
     )
     gc.collect()
     torch.cuda.empty_cache()
@@ -179,7 +186,9 @@ def run_joint_quant(args):
         all_records, assignments, wtype_indices,
         shared_matrices, args.rank, args.groupsize, nbits=args.qbit,
         uv_bits=args.uv_bits, use_turboquant=args.use_turboquant,
-        u_bits=u_bits, sv_bits=sv_bits,
+        u_bits=u_bits, sv_bits=sv_bits, u_fp16=args.u_fp16,
+        rank_attn=args.rank_attn,
+        u_bits_attn=u_bits_attn, sv_bits_attn=sv_bits_attn,
     )
 
     # -----------------------------------------------------------------------
@@ -188,6 +197,7 @@ def run_joint_quant(args):
     save_config = {
         "model_path": args.model_path,
         "rank":       args.rank,
+        "rank_attn":  args.rank_attn,
         "G_moe":      args.G_moe,
         "G_attn":     args.G_attn,
         "share_attn": args.share_attn,
@@ -199,9 +209,13 @@ def run_joint_quant(args):
         "use_turboquant": args.use_turboquant,
         "method":     "hybrid_gptq_attn_turboquant_moe" if args.use_turboquant
                       else "joint_gptq_hessian_svd",
-        "uv_bits":    args.uv_bits,
-        "u_bits":     u_bits,
-        "sv_bits":    sv_bits,
+        "uv_bits":      args.uv_bits,
+        "u_bits":       u_bits,
+        "sv_bits":      sv_bits,
+        "u_bits_attn":  u_bits_attn,
+        "sv_bits_attn":        sv_bits_attn,
+        "sv_topk":             args.sv_topk,
+        "u_fp16":       args.u_fp16,
     }
 
     if args.real_quant:
@@ -246,7 +260,11 @@ def parse_args():
     p.add_argument("--output_path", type=str, required=True,
                    help="Output directory for fake-quantized model + metadata")
     p.add_argument("--rank",      type=int,   default=64,
-                   help="LoRA / SVD rank (default: 64)")
+                   help="LoRA / SVD rank for MoE expert layers (default: 64)")
+    p.add_argument("--rank_attn", type=int,   default=None,
+                   help="LoRA / SVD rank for attention layers (q/k/v/o_proj). "
+                        "If None, falls back to --rank. Increase for better "
+                        "attention quality (e.g. 256 or 512).")
     p.add_argument("--G_moe",     type=int,   default=128,
                    help="Cluster count for MoE experts (gate/up/down_proj, "
                         "default: 128)")
@@ -292,6 +310,18 @@ def parse_args():
     p.add_argument("--sv_bits", type=int, default=None,
                    help="Quantization bits for per-expert SV (default: uv_bits or 4). "
                         "SV is per-expert private; lower precision trades quality for storage.")
+    p.add_argument("--u_bits_attn", type=int, default=None,
+                   help="U bits for attention layers (default: u_bits or 8). "
+                        "Attention U is per-layer; higher precision recommended.")
+    p.add_argument("--sv_bits_attn", type=int, default=None,
+                   help="SV bits for attention layers (default: sv_bits or 8). "
+                        "Attention SV is per-layer; higher precision recommended.")
+    p.add_argument("--sv_topk", type=int, default=None,
+                   help="Keep only top-k singular value columns (e.g. 32 out of rank=64). "
+                        "Reduces LoRA storage and GEMV cost by rank/topk ratio.")
+    p.add_argument("--u_fp16", action="store_true", default=False,
+                   help="Store shared U in fp16 instead of int8 (no quantization error; "
+                        "doubles U storage but U is amortized so overhead is small).")
     p.add_argument("--early_stop_tol", type=float, default=0,
                    help="Relative Frobenius improvement threshold for early stopping "
                         "in alternating optimization (default: 0; 0=disabled)")
@@ -299,6 +329,9 @@ def parse_args():
                    help="Use Hessian-weighted SVD in Stage 3 (default: True)")
     p.add_argument("--no_hessian_svd", dest="hessian_svd", action="store_false",
                    help="Disable Hessian-weighted SVD in Stage 3")
+    p.add_argument("--recon_weight", type=float, default=0.0,
+                   help="Cross-reconstruction error weight in clustering "
+                        "(0=pure Grassmannian, 0.3 recommended to test)")
     p.add_argument("--use_turboquant", action="store_true", default=False,
                    help="Use TurboQuant vector quantizer instead of GPTQ "
                         "(random rotation + Lloyd-Max optimal codebook)")
