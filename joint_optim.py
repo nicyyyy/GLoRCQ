@@ -172,7 +172,9 @@ class GPTQJoint:
                 self.Hinv = torch.linalg.cholesky(Hinv_raw, upper=True)
 
         # ── Cache L_lower for hessian_weighted_svd (based on H_eq) ────────────
-        # Skip when using TurboQuant (no Hessian-weighted SVD needed)
+        # Only for GPTQ (attention) path. TurboQuant (MoE) skips L_lower to
+        # avoid storing 64 × in_d² matrices simultaneously (OOM). Instead,
+        # hessian_weighted_svd will use diagonal H_eq weighting as a fallback.
         if not use_turboquant:
             damp_eq_svd = percdamp * torch.mean(torch.diag(H_eq))
             H_eq_svd = H_eq.clone()
@@ -410,17 +412,29 @@ class GPTQJoint:
                 print(f"  [hessian_weighted_svd] SVD on EL failed ({e}), "
                       f"falling back to plain SVD on E.", flush=True)
                 # fall through to plain SVD below
-        # Fallback: plain SVD on E (no Hessian weighting)
+        # Fallback: diagonal Hessian-weighted SVD using cached H_eq_diag.
+        # When L_lower is unavailable (TurboQuant MoE path), scale columns of E
+        # by sqrt(H_eq_diag) before SVD — approximates Hessian weighting with
+        # O(in_d) memory instead of O(in_d²), then un-scales V afterwards.
         try:
-            U, S, Vp = torch.svd_lowrank(E, q=eff_rank, niter=4)
-            return U.half(), S.half(), Vp.half()
+            if self.H_eq_diag is not None:
+                w = self.H_eq_diag.to(E.device).float().sqrt().clamp(min=1e-6)
+                E_scaled = E * w.unsqueeze(0)                    # (out_d, in_d)
+                U, S_sc, Vw = torch.svd_lowrank(E_scaled, q=eff_rank, niter=4)
+                V_unscaled = Vw / w.unsqueeze(1)                 # (in_d, eff_rank)
+                col_norms = V_unscaled.norm(dim=0).clamp(min=1e-10)
+                V = V_unscaled / col_norms.unsqueeze(0)          # unit columns
+                S = S_sc * col_norms
+            else:
+                U, S, V = torch.svd_lowrank(E, q=eff_rank, niter=4)
+            return U.half(), S.half(), V.half()
         except (torch._C._LinAlgError, RuntimeError) as e:
-            print(f"  [hessian_weighted_svd] plain SVD also failed ({e}), "
+            print(f"  [hessian_weighted_svd] diagonal-H SVD failed ({e}), "
                   f"returning zero LoRA.", flush=True)
             U  = torch.zeros(E.shape[0], eff_rank, dtype=torch.float16, device=E.device)
             S  = torch.zeros(eff_rank,              dtype=torch.float16, device=E.device)
-            Vp = torch.zeros(E.shape[1], eff_rank,  dtype=torch.float16, device=E.device)
-            return U, S, Vp
+            V  = torch.zeros(E.shape[1], eff_rank,  dtype=torch.float16, device=E.device)
+            return U, S, V
 
     def free(self):
         del self.H
@@ -687,35 +701,41 @@ def quantize_joint(model, layers, dataloader, args, use_turboquant: bool = False
                 outs[j + k] = _out_batch[k]
         for h in handles:
             h.remove()
+        del _batch, _out_batch
+        gc.collect()
+        torch.cuda.empty_cache()
 
         # Compute and cache Cholesky decompositions + activation scales once
         default_alpha = getattr(args, 'act_alpha', 0.6)
         do_search = getattr(args, 'search_act_alpha', False)
 
         for name, g in gptq.items():
-            eidx = _expert_idx_from_name(name)
-            if use_turboquant and eidx >= 0:
-                # Regular MoE expert: TurboQuant, no act_scale
-                # (shared experts eidx==-2 fall through to attention path below)
-                g.prepare_hessian(percdamp=args.percdamp, act_alpha=default_alpha,
-                                  use_turboquant=True)
-                continue
+            try:
+                eidx = _expert_idx_from_name(name)
+                if use_turboquant and eidx >= 0:
+                    # Regular MoE expert: TurboQuant, no act_scale
+                    # (shared experts eidx==-2 fall through to attention path below)
+                    g.prepare_hessian(percdamp=args.percdamp, act_alpha=default_alpha,
+                                      use_turboquant=True)
+                    continue
 
-            # Attention module (or all modules when use_turboquant=False)
-            if do_search:
-                act_scale, alpha_map = search_act_scale_pergroup(
-                    g, groupsize=args.groupsize)
-                # Log per-group alpha distribution
-                from collections import Counter
-                dist = Counter(alpha_map)
-                dist_str = " ".join(f"{a}:{c}" for a, c in sorted(dist.items()))
-                print(f"    {name}: per-group AWQ [{dist_str}]", flush=True)
-                g.prepare_hessian(percdamp=args.percdamp, act_alpha=0.0,
-                                  use_turboquant=False,
-                                  act_scale_override=act_scale)
-            else:
-                g.prepare_hessian(percdamp=args.percdamp, act_alpha=default_alpha,
-                                  use_turboquant=False)
+                # Attention module (or all modules when use_turboquant=False)
+                if do_search:
+                    act_scale, alpha_map = search_act_scale_pergroup(
+                        g, groupsize=args.groupsize)
+                    # Log per-group alpha distribution
+                    from collections import Counter
+                    dist = Counter(alpha_map)
+                    dist_str = " ".join(f"{a}:{c}" for a, c in sorted(dist.items()))
+                    print(f"    {name}: per-group AWQ [{dist_str}]", flush=True)
+                    g.prepare_hessian(percdamp=args.percdamp, act_alpha=0.0,
+                                      use_turboquant=False,
+                                      act_scale_override=act_scale)
+                else:
+                    g.prepare_hessian(percdamp=args.percdamp, act_alpha=default_alpha,
+                                      use_turboquant=False)
+            except Exception:
+                raise
 
         if use_turboquant:
             # ==============================================================
