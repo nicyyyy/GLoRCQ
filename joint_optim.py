@@ -818,6 +818,12 @@ def quantize_joint(model, layers, dataloader, args, use_turboquant: bool = False
                         # Restore the correct weight (fasterquant overwrites it)
                         full[name].weight.data = (g.Q_gpu + W_lora_sym).half()
                     all_records.append(record)
+                # Save Hinv + state for LoftQ iterative re-quantization (attention only)
+                if expert_idx == -1 and g.Hinv is not None:
+                    record["_hinv_cpu"]      = g.Hinv.cpu()
+                    record["_dead_cpu"]      = g.dead.cpu()
+                    record["_act_scale_cpu"] = g.act_scale.cpu() if g.act_scale is not None else None
+                    record["_gptq_ref"]      = g   # keep alive: quantizer, layer, dev, rows, columns
                 g.free()
 
             # Phase B: Batched TurboQuant for MoE
@@ -1058,3 +1064,61 @@ def quantize_joint(model, layers, dataloader, args, use_turboquant: bool = False
         print(f"\n[Stage 1] Collected {len(all_records)} records "
               f"(joint GPTQ+LoRA, n_iter={args.n_iter}).")
     return all_records
+
+
+# ---------------------------------------------------------------------------
+# LoftQ-style iterative re-quantization (Plan 1)
+# ---------------------------------------------------------------------------
+@torch.no_grad()
+def requantize_attention_records(all_records, device, args):
+    """
+    LoftQ Round 2+: given Stage 3 LoRA write-back, re-quantize attention layers.
+
+    For each attention record (quant_method == "gptq", has saved Hinv):
+      LoRA_prev = layer.weight - weight_quant   (≈ U@SV^T written by Stage 3)
+      W'        = weight_orig - LoRA_prev       (residual after removing LoRA)
+      Q(W')     = GPTQ(W', saved_Hinv)          (re-quantize without re-sampling)
+      record["weight_quant"] ← Q(W')            (Stage 2-3 will use new residuals)
+
+    Modifies all_records in-place.
+    """
+    n = 0
+    for record in all_records:
+        if record.get("quant_method") != "gptq" or "_gptq_ref" not in record:
+            continue
+        g = record["_gptq_ref"]
+
+        # LoRA contribution written by Stage 3: W_approx = Q(W) + U@SV^T
+        W_approx  = g.layer.weight.data.cpu().float()
+        lora_prev = W_approx - record["weight_quant"].float()   # U@SV^T (fp16 approx)
+        W_prime   = record["weight_orig"].float() - lora_prev   # W - LoRA_prev
+
+        # Restore saved state to GPU
+        g.Hinv      = record["_hinv_cpu"].to(device)
+        g.dead      = record["_dead_cpu"].to(device)
+        g.act_scale = record["_act_scale_cpu"].to(device) if record["_act_scale_cpu"] is not None else None
+        g.H         = torch.ones(1, device=device)   # dummy: bypass "no calibration data" check
+        g.W_orig_gpu = W_prime.to(device)
+        g.Q_gpu     = None
+
+        # Re-quantize W' using the same Hinv (no Hessian re-computation needed)
+        _, Q_W_new = g.fasterquant(
+            W_lora=None,
+            percdamp=args.percdamp,
+            groupsize=args.groupsize,
+            reset_quant=True,
+        )
+        record["weight_quant"] = Q_W_new
+
+        # Re-offload to CPU to free GPU memory
+        g.Hinv      = g.Hinv.cpu()
+        g.dead      = g.dead.cpu()
+        if g.act_scale is not None:
+            g.act_scale = g.act_scale.cpu()
+        g.H         = None
+        g.W_orig_gpu = None
+        g.Q_gpu     = None
+        torch.cuda.empty_cache()
+        n += 1
+
+    print(f"  [LoftQ] Re-quantized {n} attention layers.")

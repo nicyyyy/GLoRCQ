@@ -49,7 +49,7 @@ from cross_layer_share import (
 )
 
 # New Stage 1 implementation
-from joint_optim import quantize_joint
+from joint_optim import quantize_joint, requantize_attention_records
 
 DEV   = torch.device("cuda")
 qtype = torch.float16
@@ -99,6 +99,7 @@ def run_joint_quant(args):
     print(f"  early_stop_tol: {args.early_stop_tol}  (0=disabled)")
     print(f"  hessian_svd: {args.hessian_svd}  recon_weight: {args.recon_weight}")
     print(f"  use_turboquant: {args.use_turboquant}")
+    print(f"  n_lora_iter: {getattr(args, 'n_lora_iter', 1)}  (LoftQ-style E2E iterations)")
     print(f"  real_quant: {args.real_quant}")
     print("=" * 60)
 
@@ -148,39 +149,55 @@ def run_joint_quant(args):
         print("\n✓ Done.")
         return
 
-    # -----------------------------------------------------------------------
-    # Stage 2: Grassmannian clustering per weight type
-    # -----------------------------------------------------------------------
-    print("\n" + "=" * 60)
-    print("  Stage 2: Grassmannian clustering")
-    print("=" * 60)
-    assignments, wtype_indices = cluster_residuals(
-        all_records, args.rank, args.G_moe, args.G_attn, seed=args.seed,
-        share_attn=args.share_attn, hessian_svd=args.hessian_svd,
-        recon_weight=args.recon_weight,
-        rank_cluster=args.rank_cluster if args.rank_cluster > 0 else None,
-    )
-    gc.collect()
+    n_lora_iter = getattr(args, 'n_lora_iter', 1)
 
-    # -----------------------------------------------------------------------
-    # Stage 3+4: Shared U (int8) + fake-quant reconstruction
-    # -----------------------------------------------------------------------
-    print("\n" + "=" * 60)
-    print("  Stage 3+4: Shared U + fake-quant reconstruction")
-    print("=" * 60)
-    shared_matrices, per_expert_V = compute_shared_and_reconstruct(
-        all_records, assignments, wtype_indices, layers, args.rank,
-        analyze=args.analyze, uv_bits=args.uv_bits,
-        u_bits=u_bits, sv_bits=sv_bits, sv_topk=args.sv_topk,
-        u_fp16=args.u_fp16,
-        hessian_svd=args.hessian_svd,
-        rank_attn=args.rank_attn, rank_down=args.rank_down,
-        u_bits_attn=u_bits_attn, sv_bits_attn=sv_bits_attn,
-        sv_bits_down=args.sv_bits_down,
-        u_fp16_attn=args.u_fp16_attn,
-    )
-    gc.collect()
-    torch.cuda.empty_cache()
+    for _lora_round in range(n_lora_iter):
+        if _lora_round > 0:
+            # -----------------------------------------------------------------------
+            # LoftQ Round 2+: re-quantize attention layers with updated LoRA
+            # -----------------------------------------------------------------------
+            print("\n" + "=" * 60)
+            print(f"  LoftQ Round {_lora_round + 1}: re-quantize attention with updated LoRA")
+            print("=" * 60)
+            requantize_attention_records(all_records, DEV, args)
+            gc.collect()
+            torch.cuda.empty_cache()
+
+        # -----------------------------------------------------------------------
+        # Stage 2: Grassmannian clustering per weight type
+        # -----------------------------------------------------------------------
+        print("\n" + "=" * 60)
+        print(f"  Stage 2: Grassmannian clustering"
+              + (f" (LoftQ round {_lora_round + 1}/{n_lora_iter})" if n_lora_iter > 1 else ""))
+        print("=" * 60)
+        assignments, wtype_indices = cluster_residuals(
+            all_records, args.rank, args.G_moe, args.G_attn, seed=args.seed,
+            share_attn=args.share_attn, hessian_svd=args.hessian_svd,
+            recon_weight=args.recon_weight,
+            rank_cluster=args.rank_cluster if args.rank_cluster > 0 else None,
+        )
+        gc.collect()
+
+        # -----------------------------------------------------------------------
+        # Stage 3+4: Shared U (int8) + fake-quant reconstruction
+        # -----------------------------------------------------------------------
+        print("\n" + "=" * 60)
+        print(f"  Stage 3+4: Shared U + fake-quant reconstruction"
+              + (f" (LoftQ round {_lora_round + 1}/{n_lora_iter})" if n_lora_iter > 1 else ""))
+        print("=" * 60)
+        shared_matrices, per_expert_V = compute_shared_and_reconstruct(
+            all_records, assignments, wtype_indices, layers, args.rank,
+            analyze=args.analyze, uv_bits=args.uv_bits,
+            u_bits=u_bits, sv_bits=sv_bits, sv_topk=args.sv_topk,
+            u_fp16=args.u_fp16,
+            hessian_svd=args.hessian_svd,
+            rank_attn=args.rank_attn, rank_down=args.rank_down,
+            u_bits_attn=u_bits_attn, sv_bits_attn=sv_bits_attn,
+            sv_bits_down=args.sv_bits_down,
+            u_fp16_attn=args.u_fp16_attn,
+        )
+        gc.collect()
+        torch.cuda.empty_cache()
 
     # -----------------------------------------------------------------------
     # Stage 5: Average bit-width statistics for the whole model
@@ -362,6 +379,10 @@ def parse_args():
     p.add_argument("--real_quant", action="store_true", default=False,
                    help="Save real quantized weights (packed int + LoRA params) "
                         "instead of fake-quant fp16 W_approx")
+    p.add_argument("--n_lora_iter", type=int, default=1,
+                   help="LoftQ-style E2E iterations (default: 1 = current behavior; "
+                        "2 = one extra re-quantize attention round after Stage 3). "
+                        "Only affects attention layers (MoE TurboQuant has no Hessian).")
     attn_share_group = p.add_mutually_exclusive_group()
     attn_share_group.add_argument(
         "--share_attn", dest="share_attn", action="store_true",
