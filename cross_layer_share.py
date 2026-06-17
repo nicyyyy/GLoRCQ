@@ -417,7 +417,8 @@ def _grassmannian_dist_matrix(E_T_list, rank: int, compute_grass: bool = True):
 
 def cluster_residuals(all_residuals, rank: int, G_moe: int, G_attn: int,
                       seed: int = 42, share_attn: bool = False,
-                      hessian_svd: bool = True, recon_weight: float = 0.0):
+                      hessian_svd: bool = True, recon_weight: float = 0.0,
+                      rank_cluster: int = None):
     """
     Run Grassmannian SpectralClustering independently for each wtype.
 
@@ -437,6 +438,7 @@ def cluster_residuals(all_residuals, rank: int, G_moe: int, G_attn: int,
       assignments   : {wtype: ndarray(N,)} — group_id per record
       wtype_indices : {wtype: list[int]}   — indices into all_residuals
     """
+    _rank_c = rank_cluster if rank_cluster is not None else min(rank, 32)
     assignments   = {}
     wtype_indices = {}
 
@@ -480,7 +482,7 @@ def cluster_residuals(all_residuals, rank: int, G_moe: int, G_attn: int,
                   flush=True)
 
         D_grass, D_recon = _grassmannian_dist_matrix(
-            E_T_list, rank, compute_grass=(recon_weight < 1.0)
+            E_T_list, _rank_c, compute_grass=(recon_weight < 1.0)
         )
         if recon_weight > 0:
             D = (1.0 - recon_weight) * D_grass + recon_weight * D_recon
@@ -549,6 +551,24 @@ def _dequant_intN(q: torch.Tensor, scale: torch.Tensor, nbits: int) -> torch.Ten
     return q.float() / maxval * scale.float()
 
 
+def _quant_intN_absmax_rowwise(tensor: torch.Tensor, nbits: int):
+    """
+    Per-row absmax symmetric quantization to nbits integers.
+    Each row gets its own scale = max(|row|).
+    Returns (q_int8: int8, scale: fp16) where scale has shape (rows, 1).
+    """
+    maxval = 2 ** (nbits - 1) - 1
+    scale  = tensor.float().abs().max(dim=1, keepdim=True).values.clamp(min=1e-8)
+    q      = (tensor.float() / scale * maxval).round().clamp(-maxval, maxval).to(torch.int8)
+    return q, scale.half()
+
+
+def _dequant_intN_rowwise(q: torch.Tensor, scale: torch.Tensor, nbits: int) -> torch.Tensor:
+    """Dequantize intN (stored as int8) → float32 using per-row scale."""
+    maxval = 2 ** (nbits - 1) - 1
+    return q.float() / maxval * scale.float()
+
+
 def _pack_int4(q_int8: torch.Tensor) -> torch.Tensor:
     """
     Pack (rows, cols) int8 tensor with values in [-7, 7] into 4-bit packed uint8.
@@ -583,8 +603,10 @@ def compute_shared_and_reconstruct(all_residuals, assignments, wtype_indices,
                                     uv_bits: int = 4, hessian_svd: bool = True,
                                     u_bits: int = None, sv_bits: int = None,
                                     sv_topk: int = None, u_fp16: bool = False,
-                                    rank_attn: int = None,
-                                    u_bits_attn: int = None, sv_bits_attn: int = None):
+                                    rank_attn: int = None, rank_down: int = None,
+                                    u_bits_attn: int = None, sv_bits_attn: int = None,
+                                    sv_bits_down: int = None,
+                                    u_fp16_attn: bool = False):
     """
     For each (wtype, group_id):
       1. Stack residuals  →  E_cat = [E_1 | ... | E_K]  (in, out*K)
@@ -611,10 +633,12 @@ def compute_shared_and_reconstruct(all_residuals, assignments, wtype_indices,
         G      = int(labels.max()) + 1
         # Use rank_attn / per-type bits for attention layers if specified
         _is_attn = wtype in _ATTN_WTYPES
-        _rank    = (rank_attn if (rank_attn is not None and _is_attn) else rank)
-        _u_fp16  = u_fp16 and not _is_attn   # fp16 only for MoE U; attn always quantized
+        _rank    = (rank_attn if (rank_attn is not None and _is_attn) else
+                    (rank_down if (rank_down is not None and wtype == 'down_proj') else rank))
+        _u_fp16  = (u_fp16 and not _is_attn) or (u_fp16_attn and _is_attn)
         _u_bits  = (u_bits_attn  if (_is_attn and u_bits_attn  is not None) else u_bits)
-        _sv_bits = (sv_bits_attn if (_is_attn and sv_bits_attn is not None) else sv_bits)
+        _sv_bits = (sv_bits_attn if (_is_attn and sv_bits_attn is not None) else
+                    (sv_bits_down if (sv_bits_down is not None and wtype == 'down_proj') else sv_bits))
 
         print(f"\n[Stage 3+4] {wtype}: N={len(subset)}, G={G}, rank={_rank}, "
               f"u={'fp16' if _u_fp16 else f'int{_u_bits}'}, sv=int{_sv_bits}", flush=True)
@@ -839,8 +863,10 @@ def compute_avg_bits(all_residuals, assignments, wtype_indices,
                      shared_matrices, rank: int, groupsize: int, nbits: int = 4,
                      uv_bits: int = 4, use_turboquant: bool = False,
                      u_bits: int = None, sv_bits: int = None, u_fp16: bool = False,
-                     rank_attn: int = None,
-                     u_bits_attn: int = None, sv_bits_attn: int = None):
+                     rank_attn: int = None, rank_down: int = None,
+                     u_bits_attn: int = None, sv_bits_attn: int = None,
+                     sv_bits_down: int = None,
+                     u_fp16_attn: bool = False):
     """
     Compute and print average bits/param for the full quantized model.
 
@@ -867,10 +893,12 @@ def compute_avg_bits(all_residuals, assignments, wtype_indices,
             group_K[int(lbl)] += 1
 
         _is_attn   = wtype in _ATTN_WTYPES
-        _rank      = (rank_attn if (rank_attn is not None and _is_attn) else rank)
+        _rank      = (rank_attn if (rank_attn is not None and _is_attn) else
+                      (rank_down if (rank_down is not None and wtype == 'down_proj') else rank))
         _u_bits_   = (u_bits_attn  if (_is_attn and u_bits_attn  is not None) else _u_bits)
-        _sv_bits_  = (sv_bits_attn if (_is_attn and sv_bits_attn is not None) else _sv_bits)
-        _u_fp16_   = u_fp16 and not _is_attn
+        _sv_bits_  = (sv_bits_attn if (_is_attn and sv_bits_attn is not None) else
+                      (sv_bits_down if (sv_bits_down is not None and wtype == 'down_proj') else _sv_bits))
+        _u_fp16_   = (u_fp16 and not _is_attn) or (u_fp16_attn and _is_attn)
 
         for li, global_i in enumerate(idxs):
             r        = all_residuals[global_i]
@@ -917,8 +945,8 @@ def compute_avg_bits(all_residuals, assignments, wtype_indices,
     print(f"  {scale_label:25s} (fp16):           {bpp(bits_gptq_scale):>9.4f} bits/param")
     u_fmt_moe  = "fp16" if (u_fp16 and u_bits_attn is None) else f"int{_u_bits}"
     sv_fmt_moe = f"int{_sv_bits}"
-    u_fmt_attn  = f"int{u_bits_attn}"  if u_bits_attn  is not None else u_fmt_moe
-    sv_fmt_attn = f"int{sv_bits_attn}" if sv_bits_attn is not None else sv_fmt_moe
+    u_fmt_attn  = "fp16" if u_fp16_attn else (f"int{u_bits_attn}" if u_bits_attn is not None else u_fmt_moe)
+    sv_fmt_attn = ("fp16" if sv_bits_attn == 16 else f"int{sv_bits_attn}") if sv_bits_attn is not None else sv_fmt_moe
     if u_bits_attn is not None or sv_bits_attn is not None:
         u_fmt  = f"MoE={u_fmt_moe}/Attn={u_fmt_attn}"
         sv_fmt = f"MoE={sv_fmt_moe}/Attn={sv_fmt_attn}"

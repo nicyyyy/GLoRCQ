@@ -158,6 +158,7 @@ def run_joint_quant(args):
         all_records, args.rank, args.G_moe, args.G_attn, seed=args.seed,
         share_attn=args.share_attn, hessian_svd=args.hessian_svd,
         recon_weight=args.recon_weight,
+        rank_cluster=args.rank_cluster if args.rank_cluster > 0 else None,
     )
     gc.collect()
 
@@ -173,8 +174,10 @@ def run_joint_quant(args):
         u_bits=u_bits, sv_bits=sv_bits, sv_topk=args.sv_topk,
         u_fp16=args.u_fp16,
         hessian_svd=args.hessian_svd,
-        rank_attn=args.rank_attn,
+        rank_attn=args.rank_attn, rank_down=args.rank_down,
         u_bits_attn=u_bits_attn, sv_bits_attn=sv_bits_attn,
+        sv_bits_down=args.sv_bits_down,
+        u_fp16_attn=args.u_fp16_attn,
     )
     gc.collect()
     torch.cuda.empty_cache()
@@ -187,8 +190,10 @@ def run_joint_quant(args):
         shared_matrices, args.rank, args.groupsize, nbits=args.qbit,
         uv_bits=args.uv_bits, use_turboquant=args.use_turboquant,
         u_bits=u_bits, sv_bits=sv_bits, u_fp16=args.u_fp16,
-        rank_attn=args.rank_attn,
+        rank_attn=args.rank_attn, rank_down=args.rank_down,
         u_bits_attn=u_bits_attn, sv_bits_attn=sv_bits_attn,
+        sv_bits_down=args.sv_bits_down,
+        u_fp16_attn=args.u_fp16_attn,
     )
 
     # -----------------------------------------------------------------------
@@ -265,6 +270,13 @@ def parse_args():
                    help="LoRA / SVD rank for attention layers (q/k/v/o_proj). "
                         "If None, falls back to --rank. Increase for better "
                         "attention quality (e.g. 256 or 512).")
+    p.add_argument("--rank_down", type=int,   default=None,
+                   help="LoRA / SVD rank for MoE down_proj layers. "
+                        "If None, falls back to --rank. Can be set higher than "
+                        "gate/up rank since down_proj is harder to compress.")
+    p.add_argument("--rank_cluster", type=int, default=0,
+                   help="Rank used for Stage 2 Grassmannian clustering only "
+                        "(0=auto: min(rank,32)). Stage 3 reconstruction uses --rank.")
     p.add_argument("--G_moe",     type=int,   default=128,
                    help="Cluster count for MoE experts (gate/up/down_proj, "
                         "default: 128)")
@@ -316,12 +328,17 @@ def parse_args():
     p.add_argument("--sv_bits_attn", type=int, default=None,
                    help="SV bits for attention layers (default: sv_bits or 8). "
                         "Attention SV is per-layer; higher precision recommended.")
+    p.add_argument("--sv_bits_down", type=int, default=None,
+                   help="SV bits for down_proj layers (default: sv_bits). "
+                        "down_proj is harder to compress; can use lower bits with higher rank.")
     p.add_argument("--sv_topk", type=int, default=None,
                    help="Keep only top-k singular value columns (e.g. 32 out of rank=64). "
                         "Reduces LoRA storage and GEMV cost by rank/topk ratio.")
     p.add_argument("--u_fp16", action="store_true", default=False,
                    help="Store shared U in fp16 instead of int8 (no quantization error; "
                         "doubles U storage but U is amortized so overhead is small).")
+    p.add_argument("--u_fp16_attn", action="store_true", default=False,
+                   help="Store attention U in fp16 instead of quantized int (no quant error).")
     p.add_argument("--early_stop_tol", type=float, default=0,
                    help="Relative Frobenius improvement threshold for early stopping "
                         "in alternating optimization (default: 0; 0=disabled)")
