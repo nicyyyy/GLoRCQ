@@ -418,7 +418,8 @@ def _grassmannian_dist_matrix(E_T_list, rank: int, compute_grass: bool = True):
 def cluster_residuals(all_residuals, rank: int, G_moe: int, G_attn: int,
                       seed: int = 42, share_attn: bool = False,
                       hessian_svd: bool = True, recon_weight: float = 0.0,
-                      rank_cluster: int = None):
+                      rank_cluster: int = None,
+                      rank_attn: int = None, rank_down: int = None):
     """
     Run Grassmannian SpectralClustering independently for each wtype.
 
@@ -438,7 +439,10 @@ def cluster_residuals(all_residuals, rank: int, G_moe: int, G_attn: int,
       assignments   : {wtype: ndarray(N,)} — group_id per record
       wtype_indices : {wtype: list[int]}   — indices into all_residuals
     """
-    _rank_c = rank_cluster if rank_cluster is not None else min(rank, 32)
+    # Per-wtype rank for clustering (default: match reconstruction rank, capped at 32 if not set)
+    _rank_c_moe  = rank_cluster if rank_cluster is not None else rank
+    _rank_c_down = rank_cluster if rank_cluster is not None else (rank_down if rank_down is not None else rank)
+    _rank_c_attn = rank_cluster if rank_cluster is not None else (rank_attn if rank_attn is not None else rank)
     assignments   = {}
     wtype_indices = {}
 
@@ -481,6 +485,13 @@ def cluster_residuals(all_residuals, rank: int, G_moe: int, G_attn: int,
             print(f"  [hessian_svd] applied Hessian weighting to {n_weighted}/{N} modules",
                   flush=True)
 
+        # Select clustering rank for this wtype
+        if wtype in _ATTN_WTYPES:
+            _rank_c = _rank_c_attn
+        elif wtype == "down_proj":
+            _rank_c = _rank_c_down
+        else:
+            _rank_c = _rank_c_moe
         D_grass, D_recon = _grassmannian_dist_matrix(
             E_T_list, _rank_c, compute_grass=(recon_weight < 1.0)
         )

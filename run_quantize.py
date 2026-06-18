@@ -175,6 +175,7 @@ def run_joint_quant(args):
             share_attn=args.share_attn, hessian_svd=args.hessian_svd,
             recon_weight=args.recon_weight,
             rank_cluster=args.rank_cluster if args.rank_cluster > 0 else None,
+            rank_attn=args.rank_attn, rank_down=args.rank_down,
         )
         gc.collect()
 
