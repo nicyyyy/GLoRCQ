@@ -46,6 +46,7 @@ from cross_layer_share import (
     compute_avg_bits,
     save_cross_layer_info,
     save_real_quant,
+    assign_down_importance_ranks,
 )
 
 # New Stage 1 implementation
@@ -164,6 +165,21 @@ def run_joint_quant(args):
             torch.cuda.empty_cache()
 
         # -----------------------------------------------------------------------
+        # Per-expert adaptive rank for down_proj (assign _rank_override per record)
+        # -----------------------------------------------------------------------
+        _rank_down_eff = args.rank_down
+        if getattr(args, 'rank_down_high', None) and getattr(args, 'rank_down_low', None):
+            assign_down_importance_ranks(
+                all_records,
+                rank_down_high=args.rank_down_high,
+                rank_down_low=args.rank_down_low,
+                topk_frac=getattr(args, 'rank_down_topk', 0.1),
+            )
+            # For clustering stage, keep the original rank_down (or base rank) — do NOT use
+            # rank_down_high here, as rank=1024 SVD on 1440 experts is prohibitively slow.
+            # Reconstruction rank (high/low) is applied per-expert in Stage 3 via _rank_override.
+
+        # -----------------------------------------------------------------------
         # Stage 2: Grassmannian clustering per weight type
         # -----------------------------------------------------------------------
         print("\n" + "=" * 60)
@@ -175,7 +191,7 @@ def run_joint_quant(args):
             share_attn=args.share_attn, hessian_svd=args.hessian_svd,
             recon_weight=args.recon_weight,
             rank_cluster=args.rank_cluster if args.rank_cluster > 0 else None,
-            rank_attn=args.rank_attn, rank_down=args.rank_down,
+            rank_attn=args.rank_attn, rank_down=_rank_down_eff,
         )
         gc.collect()
 
@@ -292,6 +308,14 @@ def parse_args():
                    help="LoRA / SVD rank for MoE down_proj layers. "
                         "If None, falls back to --rank. Can be set higher than "
                         "gate/up rank since down_proj is harder to compress.")
+    p.add_argument("--rank_down_high", type=int, default=None,
+                   help="High LoRA rank for important down_proj experts (Hessian-weighted "
+                        "error top-k%%). Overrides --rank_down when both --rank_down_high "
+                        "and --rank_down_low are set.")
+    p.add_argument("--rank_down_low", type=int, default=None,
+                   help="Low LoRA rank for less-important down_proj experts.")
+    p.add_argument("--rank_down_topk", type=float, default=0.1,
+                   help="Fraction of down_proj experts assigned high rank (default 0.1=top-10%%).")
     p.add_argument("--rank_cluster", type=int, default=0,
                    help="Rank used for Stage 2 Grassmannian clustering only "
                         "(0=auto: min(rank,32)). Stage 3 reconstruction uses --rank.")

@@ -415,6 +415,43 @@ def _grassmannian_dist_matrix(E_T_list, rank: int, compute_grass: bool = True):
     return D_grass.cpu().numpy(), D_recon.cpu().numpy()
 
 
+def assign_down_importance_ranks(all_records, rank_down_high: int, rank_down_low: int,
+                                 topk_frac: float = 0.1):
+    """
+    Assign per-expert rank overrides for down_proj based on Hessian-weighted
+    quantization error norm. Top-k% experts (largest error) get rank_down_high,
+    the rest get rank_down_low. Modifies records in-place via '_rank_override'.
+    """
+    down_idxs = [i for i, r in enumerate(all_records) if r.get("type") == "down_proj"]
+    if not down_idxs:
+        print("  [importance rank] No down_proj records found.")
+        return
+    scores = []
+    for i in down_idxs:
+        r = all_records[i]
+        E = (r["weight_orig"] - r["weight_quant"]).float()
+        h = r.get("hessian_diag")
+        if h is not None:
+            score = (E * h.float().sqrt().unsqueeze(0)).norm().item()
+        else:
+            score = E.norm().item()
+        scores.append(score)
+    n_high = max(1, int(len(scores) * topk_frac))
+    threshold_idx = n_high - 1
+    threshold = sorted(scores, reverse=True)[threshold_idx]
+    n_assigned_high = 0
+    for i, idx in enumerate(down_idxs):
+        if scores[i] >= threshold:
+            all_records[idx]["_rank_override"] = rank_down_high
+            n_assigned_high += 1
+        else:
+            all_records[idx]["_rank_override"] = rank_down_low
+    print(f"  [importance rank] down_proj: {n_assigned_high}/{len(down_idxs)} "
+          f"high(rank={rank_down_high}), "
+          f"{len(down_idxs)-n_assigned_high} low(rank={rank_down_low}), "
+          f"topk_frac={topk_frac}")
+
+
 def cluster_residuals(all_residuals, rank: int, G_moe: int, G_attn: int,
                       seed: int = 42, share_attn: bool = False,
                       hessian_svd: bool = True, recon_weight: float = 0.0,
@@ -504,6 +541,8 @@ def cluster_residuals(all_residuals, rank: int, G_moe: int, G_attn: int,
 
         if G <= 1 or N == 1:
             labels = np.zeros(N, dtype=np.int64)
+        elif G >= N:
+            labels = np.arange(N, dtype=np.int64)
         else:
             pos_vals = D[D > 0]
             sigma2   = float(pos_vals.mean() ** 2) if len(pos_vals) else 1.0
@@ -675,7 +714,10 @@ def compute_shared_and_reconstruct(all_residuals, assignments, wtype_indices,
                 start += out_d
 
             E_cat     = torch.cat(E_list, dim=1)   # (in_d, Σout_d)
-            eff_rank  = min(_rank, E_cat.shape[0], E_cat.shape[1])
+            # Per-member rank: use _rank_override if set (per-expert adaptive rank)
+            member_ranks  = [r.get("_rank_override", _rank) for r in members]
+            group_max_rank = max(member_ranks)
+            eff_rank  = min(group_max_rank, E_cat.shape[0], E_cat.shape[1])
             E_norm    = E_cat.norm().item()
 
             # ── Hessian-weighted SVD (Stage 3) ──────────────────────────
@@ -745,26 +787,29 @@ def compute_shared_and_reconstruct(all_residuals, assignments, wtype_indices,
             # Per-expert V: Hessian-weighted least-squares or plain slice
             for k, li in enumerate(member_lis):
                 r = subset[li]
+                member_rank = r.get("_rank_override", _rank)       # per-expert adaptive rank
+                member_rank = min(member_rank, eff_rank)           # clamp to actual SVD rank
+                U_k = U[:, :member_rank]                           # truncate U to this expert's rank
                 h_k = r.get("hessian_diag")
 
                 if use_hessian and h_k is not None:
-                    # Hessian-weighted optimal V: min ||(E_k - U @ M_k) @ diag(sqrt(h_k))||_F
+                    # Hessian-weighted optimal V: min ||(E_k - U_k @ M_k) @ diag(sqrt(h_k))||_F
                     h_k_dev = h_k.to(DEV)                          # (in_d,)
                     E_T_k = (r["weight_orig"] - r["weight_quant"]).float().T.to(DEV)  # (in_d, out_d)
-                    UH = U * h_k_dev.unsqueeze(1)                  # (in_d, rank)
-                    G_mat = UH.T @ U                               # (rank, rank)
-                    V_k = torch.linalg.solve(G_mat, UH.T @ E_T_k) # (rank, out_d)
-                    V_k = V_k.T                                    # (out_d, rank)
+                    UH = U_k * h_k_dev.unsqueeze(1)                # (in_d, member_rank)
+                    G_mat = UH.T @ U_k                             # (member_rank, member_rank)
+                    V_k = torch.linalg.solve(G_mat, UH.T @ E_T_k) # (member_rank, out_d)
+                    V_k = V_k.T                                    # (out_d, member_rank)
                     # Extract S_k (V_k column norms), normalize
                     S_k = V_k.norm(dim=0).clamp(min=1e-6)
                     V_k_normed = V_k / S_k
                 else:
                     s_off, e_off = offsets[k]
-                    V_k_normed = V_all[s_off:e_off, :]             # (out_d, rank)
-                    S_k = S                                        # use shared S
+                    V_k_normed = V_all[s_off:e_off, :member_rank]  # (out_d, member_rank)
+                    S_k = S[:member_rank]                          # (member_rank,)
 
                 # Pre-fuse: SV_k = V_k_normed * S_k  (the matrix used at inference)
-                SV_k = V_k_normed * S_k.unsqueeze(0)              # (out_d, rank)
+                SV_k = V_k_normed * S_k.unsqueeze(0)              # (out_d, member_rank)
 
                 if _sv_bits == 16:
                     # fp16: no quantization, store directly (upper-bound test)
@@ -786,9 +831,9 @@ def compute_shared_and_reconstruct(all_residuals, assignments, wtype_indices,
                             "SV_scale": SV_scale.cpu(),
                         }
 
-                # W_approx = Q(W) + U @ SV_k.T  (SV_k already has S baked in)
+                # W_approx = Q(W) + U_k @ SV_k.T  (SV_k already has S baked in)
                 Q_W_T       = r["weight_quant"].float().T.to(DEV)  # (in_d, out_d)
-                W_approx_T  = Q_W_T + U_fp16 @ SV_fp16.T
+                W_approx_T  = Q_W_T + U_fp16[:, :member_rank] @ SV_fp16.T
                 r["weight_approx"] = W_approx_T.T.half().cpu()     # (out_d, in_d)
 
                 if analyze:
@@ -917,7 +962,7 @@ def compute_avg_bits(all_residuals, assignments, wtype_indices,
             n        = out_d * in_d
             g        = int(labels[li])
             K        = group_K[g]
-            eff_rank = min(_rank, in_d, out_d)  # actual rank used
+            eff_rank = min(r.get("_rank_override", _rank), in_d, out_d)  # actual rank used; use override if set
 
             total_params      += n
             bits_quant_weight += n * nbits
