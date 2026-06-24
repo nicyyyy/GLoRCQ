@@ -41,16 +41,31 @@ def _load_real_quant(model_path, device):
 
 
 def _load_fake_quant(model_path, device):
-    """Load standard HF model (fake-quant fp16 checkpoint)."""
+    """Load standard HF model (fake-quant fp16 checkpoint).
+
+    When device == "auto", distributes the model across all visible GPUs using
+    device_map="auto" (needed for large models like Mixtral-8x7B that exceed
+    single-GPU memory).
+    """
     config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
     config.use_cache = True
-    model = AutoModelForCausalLM.from_pretrained(
-        model_path,
-        config=config,
-        trust_remote_code=True,
-        torch_dtype=torch.float16,
-        low_cpu_mem_usage=True,
-    ).to(device)
+    if device == "auto":
+        model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            config=config,
+            trust_remote_code=True,
+            torch_dtype=torch.float16,
+            low_cpu_mem_usage=True,
+            device_map="auto",
+        )
+    else:
+        model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            config=config,
+            trust_remote_code=True,
+            torch_dtype=torch.float16,
+            low_cpu_mem_usage=True,
+        ).to(device)
     model.eval()
     if not hasattr(model, "seqlen"):
         model.seqlen = getattr(config, "max_position_embeddings", 4096)

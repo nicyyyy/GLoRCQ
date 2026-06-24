@@ -37,7 +37,10 @@ def eval_ppl_sliding_window(model, tokenizer, max_length=2048, stride=512,
     testdata = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
     text = "\n\n".join(testdata["text"])
     encodings = tokenizer(text, return_tensors="pt")
-    input_ids = encodings.input_ids.to(device)
+    # When device_map="auto" is used, send input to whichever device holds
+    # the first parameter (typically the first visible GPU).
+    _input_device = device if device != "auto" else next(model.parameters()).device
+    input_ids = encodings.input_ids.to(_input_device)
 
     seq_len = input_ids.size(1)
     print(f"Dataset tokens: {seq_len}, max_length: {max_length}, stride: {stride}")
