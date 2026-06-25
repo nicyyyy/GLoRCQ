@@ -719,7 +719,13 @@ def quantize_joint(model, layers, dataloader, args, use_turboquant: bool = False
                                       use_turboquant=True)
                     continue
 
-                # Attention module (or all modules when use_turboquant=False)
+                # MoE expert in GPTQ mode: skip AWQ search, use full Hinv
+                if not use_turboquant and eidx >= 0:
+                    g.prepare_hessian(percdamp=args.percdamp, act_alpha=default_alpha,
+                                      use_turboquant=False)
+                    continue
+
+                # Attention module only (use_turboquant=False, eidx < 0)
                 if do_search:
                     act_scale, alpha_map = search_act_scale_pergroup(
                         g, groupsize=args.groupsize)
