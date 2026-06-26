@@ -456,7 +456,8 @@ def cluster_residuals(all_residuals, rank: int, G_moe: int, G_attn: int,
                       seed: int = 42, share_attn: bool = False,
                       hessian_svd: bool = True, recon_weight: float = 0.0,
                       rank_cluster: int = None,
-                      rank_attn: int = None, rank_down: int = None):
+                      rank_attn: int = None, rank_down: int = None,
+                      cluster_on_original: bool = False):
     """
     Run Grassmannian SpectralClustering independently for each wtype.
 
@@ -471,6 +472,14 @@ def cluster_residuals(all_residuals, rank: int, G_moe: int, G_attn: int,
                      (1-α)*D_grass + α*D_recon, where D_recon is the
                      symmetric cross-reconstruction error proxy using S vectors.
                      0 = pure Hessian-weighted Grassmannian (default).
+      cluster_on_original : If True, cluster on original FP16 weights (TileQ-
+                     style) instead of quantization residuals.  Scaling applied
+                     in priority order:
+                       1. act_scale (from _act_scale_cpu, GPTQ/attention path)
+                       2. sqrt(hessian_diag) (TurboQuant path fallback)
+                       3. no scaling (if neither is available)
+                     Stage 3 shared-U computation is NOT affected (still uses
+                     Hessian-weighted residuals). Only cluster assignments change.
 
     Returns:
       assignments   : {wtype: ndarray(N,)} — group_id per record
@@ -508,18 +517,36 @@ def cluster_residuals(all_residuals, rank: int, G_moe: int, G_attn: int,
         print(f"\n[Stage 2] {wtype}: N={N}, G={G}", flush=True)
         subset  = [all_residuals[i] for i in idxs]
 
-        # Build E_T list with optional Hessian weighting
+        # Build E_T list — two modes:
+        #   cluster_on_original=False (default): Hessian-weighted residuals
+        #   cluster_on_original=True  (TileQ):   activation/Hessian-scaled FP16 weights
         E_T_list = []
         n_weighted = 0
         for r in subset:
-            E_T = (r["weight_orig"] - r["weight_quant"]).float().T  # (in_d, out_d)
-            if hessian_svd and r.get("hessian_diag") is not None:
-                h_sqrt = r["hessian_diag"].float().sqrt().to(E_T.device)  # (in_d,)
-                E_T = E_T * h_sqrt.unsqueeze(1)
-                n_weighted += 1
+            if cluster_on_original:
+                # TileQ-style: cluster on original weights, not quantization residuals.
+                E_T = r["weight_orig"].float().T  # (in_d, out_d)
+                act_s = r.get("_act_scale_cpu")   # GPTQ/attention path: (in_d,) or None
+                if act_s is not None:
+                    # activation-scaled (AWQ-style, directly comparable to TileQ s_k)
+                    E_T = E_T * act_s.float().to(E_T.device).unsqueeze(1)
+                    n_weighted += 1
+                elif hessian_svd and r.get("hessian_diag") is not None:
+                    # TurboQuant path: no act_scale, fall back to Hessian row-scaling
+                    h_sqrt = r["hessian_diag"].float().sqrt().to(E_T.device)
+                    E_T = E_T * h_sqrt.unsqueeze(1)
+                    n_weighted += 1
+            else:
+                # Default: Hessian-weighted quantization residuals
+                E_T = (r["weight_orig"] - r["weight_quant"]).float().T  # (in_d, out_d)
+                if hessian_svd and r.get("hessian_diag") is not None:
+                    h_sqrt = r["hessian_diag"].float().sqrt().to(E_T.device)  # (in_d,)
+                    E_T = E_T * h_sqrt.unsqueeze(1)
+                    n_weighted += 1
             E_T_list.append(E_T)
         if n_weighted > 0:
-            print(f"  [hessian_svd] applied Hessian weighting to {n_weighted}/{N} modules",
+            mode_str = "act_scale/hessian on orig-weight" if cluster_on_original else "hessian on residuals"
+            print(f"  [cluster] {mode_str}: {n_weighted}/{N} modules weighted",
                   flush=True)
 
         # Select clustering rank for this wtype

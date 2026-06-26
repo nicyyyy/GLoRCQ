@@ -99,6 +99,8 @@ def run_joint_quant(args):
     print(f"  u_bits_attn={u_bits_attn}, sv_bits_attn={sv_bits_attn}")
     print(f"  early_stop_tol: {args.early_stop_tol}  (0=disabled)")
     print(f"  hessian_svd: {args.hessian_svd}  recon_weight: {args.recon_weight}")
+    print(f"  cluster_on_original: {getattr(args, 'tileq_cluster', False)}"
+          f"  (TileQ-style: cluster on orig weights, not residuals)")
     print(f"  use_turboquant: {args.use_turboquant}")
     print(f"  n_lora_iter: {getattr(args, 'n_lora_iter', 1)}  (LoftQ-style E2E iterations)")
     print(f"  real_quant: {args.real_quant}")
@@ -192,6 +194,7 @@ def run_joint_quant(args):
             recon_weight=args.recon_weight,
             rank_cluster=args.rank_cluster if args.rank_cluster > 0 else None,
             rank_attn=args.rank_attn, rank_down=_rank_down_eff,
+            cluster_on_original=getattr(args, 'tileq_cluster', False),
         )
         gc.collect()
 
@@ -391,6 +394,10 @@ def parse_args():
     p.add_argument("--recon_weight", type=float, default=0.0,
                    help="Cross-reconstruction error weight in clustering "
                         "(0=pure Grassmannian, 0.3 recommended to test)")
+    p.add_argument("--tileq_cluster", action="store_true", default=False,
+                   help="TileQ-style clustering: cluster on activation/Hessian-scaled "
+                        "original FP16 weights instead of quantization residuals. "
+                        "Stage 3 shared-U computation is unaffected.")
     p.add_argument("--use_turboquant", action="store_true", default=False,
                    help="Use TurboQuant vector quantizer instead of GPTQ "
                         "(random rotation + Lloyd-Max optimal codebook)")
