@@ -25,12 +25,17 @@
 #   Step 5 (vLLM FP16): Qwen3-30B FP16 ≈ 60 GB + KV cache
 #                        → needs H200 141G or B200 192G (A100 80G OOM)
 #
-# SOTA config (Qwen3-30B-A3B, derived — 48L × 128 experts = 6144 total):
+# SOTA config (Qwen3-30B-A3B, derived from Qwen1.5-MoE E5 pattern):
 #   rank=32, rank_down=512, rank_attn=512, rank_cluster=32
 #   n_iter=5, n_lora_iter=2, G_moe=512 (~12 experts/cluster), G_attn=4
 #   u_bits=8, u_bits_attn=8, sv_bits=8
 #   w_clip, hessian_svd, recon_weight=0.7
 #   use_turboquant, search_act_alpha
+#
+# G_moe=512: Qwen3-30B has 6144 total experts (48L×128), 512 clusters → ~12/cluster
+#            matches Qwen1.5-MoE ratio (1440/128=11.25 experts/cluster)
+# G_attn=4:  same as Qwen1.5-MoE (48 layers / 4 groups = 12 layers/group)
+# NOTE: config not yet validated on Qwen3-30B; results pending H200/B200 run
 #
 # Usage:
 #   bash exp/paper_eval_qwen3_30b.sh <output_dir> [gpu_id]

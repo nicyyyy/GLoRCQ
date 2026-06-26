@@ -67,6 +67,7 @@ GPU_ID="${1:-0}"
 QWEN15_OUT="/path/to/glorcq_out/qwen15moe"
 
 # Mixtral-8x7B-v0.1 (FP16 ≈ 94 GB; requires H200/B200 for quantization)
+# Config: E5-pattern with rank_down=512, rank_attn=512, G_moe=32 (32L×8exp=256, 8/cluster)
 MIXTRAL_OUT="/path/to/glorcq_out/mixtral"
 
 # Qwen3-30B-A3B (FP16 ≈ 60 GB; requires H200/B200 for quantization)

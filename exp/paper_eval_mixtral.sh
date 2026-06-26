@@ -24,11 +24,17 @@
 #   Step 5 (vLLM FP16): Mixtral FP16 ≈ 94 GB → needs H200/B200 or 2×A100
 #     NOTE: modify bench_vllm.sh to add --tensor-parallel-size 2 for 2-GPU setup
 #
-# SOTA config (Mixtral, PPL=?):
-#   rank=32, n_iter=5, G_moe=32, G_attn=32
-#   uv_bits=8, sv_bits=8, n_lora_iter=2
-#   use_turboquant, hessian_svd, search_act_alpha
-#   (no rank_down/rank_attn, no w_clip, no recon_weight)
+# SOTA config (Mixtral, adapted from Qwen1.5-MoE E5 pattern):
+#   rank=32, rank_down=512, rank_attn=512, rank_cluster=32
+#   n_iter=5, n_lora_iter=2, G_moe=32, G_attn=32
+#   u_bits=8, u_bits_attn=8, sv_bits=8
+#   w_clip, hessian_svd, recon_weight=0.7
+#   use_turboquant, search_act_alpha
+#
+# G_moe=32: Mixtral has 256 total experts (32L×8), 32 clusters → 8/cluster
+# G_attn=32: one group per attention layer (no cross-layer attn sharing)
+# n_lora_iter=2: Mixtral is 4× larger than Qwen1.5 → keep compute reasonable
+# NOTE: config not yet validated on Mixtral; results pending H200/B200 run
 #
 # Usage:
 #   bash exp/paper_eval_mixtral.sh <output_dir> [gpu_id]
@@ -82,11 +88,12 @@ else
         --model_path "$HF_MODEL" \
         --output_path "$FAKE_QUANT" \
         --qbit 2 --groupsize 128 --nsamples 128 \
-        --rank 32 \
+        --rank 32 --rank_down 512 --rank_attn 512 --rank_cluster 32 \
         --n_iter 5 --n_lora_iter 2 \
         --G_moe 32 --G_attn 32 \
-        --uv_bits 8 --sv_bits 8 \
-        --use_turboquant --hessian_svd --search_act_alpha \
+        --u_bits 8 --u_bits_attn 8 --sv_bits 8 \
+        --w_clip --hessian_svd --recon_weight 0.7 \
+        --use_turboquant --search_act_alpha \
         2>&1 | tee "${EVAL_OUT}/quant_fake.log"
     echo "[$(date '+%H:%M:%S')] Step 0a done"
 fi
@@ -101,11 +108,12 @@ else
         --model_path "$HF_MODEL" \
         --output_path "$REAL_QUANT" \
         --qbit 2 --groupsize 128 --nsamples 128 \
-        --rank 32 \
+        --rank 32 --rank_down 512 --rank_attn 512 --rank_cluster 32 \
         --n_iter 5 --n_lora_iter 2 \
         --G_moe 32 --G_attn 32 \
-        --uv_bits 8 --sv_bits 8 \
-        --use_turboquant --hessian_svd --search_act_alpha \
+        --u_bits 8 --u_bits_attn 8 --sv_bits 8 \
+        --w_clip --hessian_svd --recon_weight 0.7 \
+        --use_turboquant --search_act_alpha \
         --real_quant \
         2>&1 | tee "${EVAL_OUT}/quant_real.log"
     echo "[$(date '+%H:%M:%S')] Step 0b done"
