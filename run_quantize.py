@@ -138,8 +138,8 @@ def run_joint_quant(args):
               f" (n_iter={args.n_iter})")
     print("=" * 60)
     all_records = quantize_joint(model, layers, dataloader, args,
-                                  use_turboquant=args.use_turboquant,
-                                  model_type=config.model_type)
+                                 use_turboquant=args.use_turboquant,
+                                 model_type=config.model_type)
     gc.collect()
     torch.cuda.empty_cache()
 

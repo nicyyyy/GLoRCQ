@@ -581,12 +581,17 @@ def _batched_rsvd(X: torch.Tensor, rank: int, niter: int = 4):
 # ---------------------------------------------------------------------------
 @torch.no_grad()
 def quantize_joint(model, layers, dataloader, args, use_turboquant: bool = False,
-                   model_type: str = ""):
+                   model_type: str = "", calibration_only: bool = False):
     """
     Layer-by-layer alternating quantization + Hessian-weighted LoRA optimization.
 
     When use_turboquant=True, replaces GPTQ with TurboQuant row-wise vector
     quantization (random rotation + Lloyd-Max optimal codebook).
+
+    When calibration_only=True (new pipeline only): MoE experts skip quantization
+    and store weight_quant = weight_orig as a placeholder. Hessian and act_scale
+    are still collected. Attention layers still run GPTQ normally. Use this with
+    compute_shared_and_reconstruct(fit_on_original=True) + quantize_lora_residuals().
 
     Returns all_records: list of dicts in the same format as
     cross_layer_share.quantize_and_collect_residuals(), i.e.:
@@ -879,7 +884,8 @@ def quantize_joint(model, layers, dataloader, args, use_turboquant: bool = False
                     out_dims = [w.shape[0] for w in W_list]
                     W_stacked = torch.cat(W_list, dim=0)  # (Σout_d, in_d)
 
-                    Q_stacked = turbo_quantizer.quantize_dequantize(W_stacked)
+                    Q_stacked = (W_stacked.clone() if calibration_only
+                                 else turbo_quantizer.quantize_dequantize(W_stacked))
 
                     # Compute all residuals E = W_orig - Q in one shot
                     E_stacked = W_stacked - Q_stacked      # (Σout_d, in_d) fp32
@@ -1128,3 +1134,4 @@ def requantize_attention_records(all_records, device, args):
         n += 1
 
     print(f"  [LoftQ] Re-quantized {n} attention layers.")
+

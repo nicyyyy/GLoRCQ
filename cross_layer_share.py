@@ -683,7 +683,8 @@ def compute_shared_and_reconstruct(all_residuals, assignments, wtype_indices,
                                     rank_attn: int = None, rank_down: int = None,
                                     u_bits_attn: int = None, sv_bits_attn: int = None,
                                     sv_bits_down: int = None,
-                                    u_fp16_attn: bool = False):
+                                    u_fp16_attn: bool = False,
+                                    fit_on_original: bool = False):
     """
     For each (wtype, group_id):
       1. Stack residuals  →  E_cat = [E_1 | ... | E_K]  (in, out*K)
@@ -735,7 +736,9 @@ def compute_shared_and_reconstruct(all_residuals, assignments, wtype_indices,
             E_list  = []
             for r in members:
                 out_d, in_d = r["shape"]
-                E_T = (r["weight_orig"] - r["weight_quant"]).float().T.to(DEV)
+                E_T = (r["weight_orig"].float().T.to(DEV)
+                       if (fit_on_original and r.get("quant_method") == "turboquant")
+                       else (r["weight_orig"] - r["weight_quant"]).float().T.to(DEV))
                 E_list.append(E_T)
                 offsets.append((start, start + out_d))
                 start += out_d
@@ -822,7 +825,9 @@ def compute_shared_and_reconstruct(all_residuals, assignments, wtype_indices,
                 if use_hessian and h_k is not None:
                     # Hessian-weighted optimal V: min ||(E_k - U_k @ M_k) @ diag(sqrt(h_k))||_F
                     h_k_dev = h_k.to(DEV)                          # (in_d,)
-                    E_T_k = (r["weight_orig"] - r["weight_quant"]).float().T.to(DEV)  # (in_d, out_d)
+                    E_T_k = (r["weight_orig"].float().T.to(DEV)
+                             if (fit_on_original and r.get("quant_method") == "turboquant")
+                             else (r["weight_orig"] - r["weight_quant"]).float().T.to(DEV))  # (in_d, out_d)
                     UH = U_k * h_k_dev.unsqueeze(1)                # (in_d, member_rank)
                     G_mat = UH.T @ U_k                             # (member_rank, member_rank)
                     V_k = torch.linalg.solve(G_mat, UH.T @ E_T_k) # (member_rank, out_d)
@@ -937,6 +942,76 @@ def _write_back_weights(all_residuals, wtype_indices, layers):
 
     print(f"  [write-back] Actual writes: {n_actual} / expected: {n_expected} "
           f"(W_approx = Q(W) + U@S@V.T)")
+
+
+@torch.no_grad()
+def quantize_lora_residuals(all_records, turbo_quantizer, layers, device):
+    """
+    Stage 5 (TileQ 1D pipeline): after Stage 3-4 write-back with fit_on_original=True,
+    each model weight = weight_orig + lora  (lora = U@S@V.T ≈ W_orig).
+
+    For each TurboQuant MoE record:
+      lora   = model_weight - weight_orig        (= U@S@V.T from Stage 3-4)
+      R_k    = weight_orig  - lora               (genuine low-rank residual)
+      Q(R_k) = TurboQuant(R_k)                  (2-bit of a cleaner signal)
+      new_w  = Q(R_k) + lora                     (final reconstructed weight)
+
+    Modifies model weights and record["weight_quant"] in-place.
+    """
+    from collections import defaultdict
+    # Group records by layer for efficient layer loading
+    layer_records = defaultdict(list)
+    for r in all_records:
+        if r.get("quant_method") == "turboquant":
+            layer_records[r["layer"]].append(r)
+
+    n_quant = 0
+    for layer_idx in tqdm.tqdm(sorted(layer_records.keys()), desc="  [Stage 5] Quantize residuals"):
+        layer = layers[layer_idx].to(device)
+        full  = quant_module.find_qlayers(layer, [nn.Linear])
+
+        # Collect all MoE expert weights from this layer for batch quantization
+        layer_recs = layer_records[layer_idx]
+        # Group by in_d for batch processing
+        by_in_d = defaultdict(list)
+        for r in layer_recs:
+            if r["module_name"] in full:
+                by_in_d[r["shape"][1]].append(r)
+
+        for in_d, recs in by_in_d.items():
+            names   = [r["module_name"] for r in recs]
+            # Retrieve current model weights (= weight_orig + lora after Stage 3-4 write-back)
+            cur_Ws  = [full[n].weight.data.float() for n in names]
+            W_origs = [r["weight_orig"].float().to(device) for r in recs]
+            loras   = [cw - wo for cw, wo in zip(cur_Ws, W_origs)]
+            R_ks    = [wo - lo for wo, lo in zip(W_origs, loras)]
+
+            # Batch TurboQuant on residuals
+            R_stacked = torch.cat(R_ks, dim=0)  # (Σout_d, in_d)
+            Q_stacked = turbo_quantizer.quantize_dequantize(R_stacked)
+
+            out_dims = [r["shape"][0] for r in recs]
+            off = 0
+            for r, name, lo in zip(recs, names, loras):
+                od = r["shape"][0]
+                Q_R = Q_stacked[off:off + od]
+                off += od
+                new_w = (Q_R + lo).half()
+                full[name].weight.data = new_w
+                # NOTE: intentionally do NOT update r["weight_quant"] here.
+                # weight_quant = weight_orig (calibration_only placeholder) must remain
+                # so that Stage 3+4 write-back in the next LoftQ round correctly computes
+                # W_approx = weight_orig + lora_new (not Q(R_k) + lora_new).
+                n_quant += 1
+
+            del R_stacked, Q_stacked, cur_Ws, W_origs, loras, R_ks
+            torch.cuda.empty_cache()
+
+        layers[layer_idx] = layer.cpu()
+        del layer
+        torch.cuda.empty_cache()
+
+    print(f"  [Stage 5] Re-quantized {n_quant} MoE expert weights with TurboQuant.")
 
 
 # ---------------------------------------------------------------------------
