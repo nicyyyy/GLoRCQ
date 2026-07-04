@@ -6,7 +6,7 @@ import torch.nn as nn
 import utils.utils
 import quantizer
 import logging
-# from utils.hadamard_utils import *
+from utils.hadamard_utils import *
 from utils.qlayer_name_utils import *
 from utils.moe_utils import *
 import torch
@@ -182,14 +182,18 @@ class GPTVQ_lora:
 
 
         # Begin: construct partial permute rotate matrix.
+        # Auto-fallback ha_bsize to largest power-of-2 that divides W.shape[1].
+        # E.g. W.shape[1]=1408 with ha_bsize=256 → 1408%256=128 ≠ 0, fall back to 128.
         partial_size = id_bsize
         rotate_size = ha_bsize
+        while rotate_size > 1 and W.shape[1] % rotate_size != 0:
+            rotate_size //= 2
         rot = block_diagonal_walsh_matrix(W.shape[1], rotate_size, W.device)
         abs_tensor = res.abs()
         mean_abs_per_col = abs_tensor.mean(dim=0) 
         #top_values, top_indices = torch.topk(-mean_abs_per_col, W.shape[1])
 
-        perm = torch.log2(torch.diag(H))
+        perm = torch.log2(torch.diag(H).clamp(min=1e-30))
         perm = mean_abs_per_col/(perm - torch.min(perm) + 1)
         top_values, top_indices = torch.topk(-perm, W.shape[1])
 
@@ -347,9 +351,67 @@ class GPTVQ_lora:
 
         Q = Q.reshape(self.layer.weight.shape)
 
+        # ---- Retain VQ state for real-quant export ----
+        # We MUST save Q (still in ROTATED space) and derive codes here — after
+        # `Q @ PD_rot.T` below, Q is in un-rotated (raw) space and cannot be
+        # matched against centroids (which live in the rotated+quantization
+        # space). Also save FULL per-group centroids (not just cb[0]) so future
+        # non-pool-kmeans configs work too.
+        if use_vq and self.assignments is not None:
+            try:
+                Q_rot = Q.detach().to(torch.float16)  # still in rotated space here
+                self.layer.gptvq_Q_rotated = Q_rot.cpu()
+
+                if len(self.quantizer.all_centroids) > 0:
+                    # Full centroids per find_params call: (groups_per_column, K, vdim).
+                    # With pool_kmeans the codebook was broadcast — cb[0] is fine.
+                    # With per-group codebooks (non-pool), cb[i] differs per row-group.
+                    cbs = [cb[0].detach().to(torch.float16).cpu()
+                           for cb in self.quantizer.all_centroids]
+                    self.layer.gptvq_centroids = torch.stack(cbs, dim=0)  # (n_codebooks, K, vdim)
+
+                    # Derive codes NOW from Q_rot + centroids so inference doesn't
+                    # need to re-solve nearest-centroid at load time. Uses the same
+                    # semantics as the inference dequant path: for each column block
+                    # (of codes_per_cb vec-4 vectors), find nearest centroid.
+                    _cent_stack = self.layer.gptvq_centroids.to(Q_rot.device).float()
+                    n_cb = _cent_stack.shape[0]
+                    out_d, in_d = Q_rot.shape
+                    n_vecs = in_d // int(vq_dim)
+                    assert n_vecs % n_cb == 0, f"n_vecs={n_vecs} not divisible by n_cb={n_cb}"
+                    codes_per_cb = n_vecs // n_cb
+                    _codes = torch.empty(out_d, n_vecs, dtype=torch.uint8, device=Q_rot.device)
+                    Q_f = Q_rot.float()
+                    _chunk = 1024 if codes_per_cb <= 128 else 32
+                    for _cb_id in range(n_cb):
+                        _v_lo = _cb_id * codes_per_cb
+                        _v_hi = _v_lo + codes_per_cb
+                        _cb = _cent_stack[_cb_id]  # (K, vdim)
+                        for _r0 in range(0, out_d, _chunk):
+                            _r1 = min(_r0 + _chunk, out_d)
+                            _Q_block = Q_f[_r0:_r1, _v_lo * int(vq_dim):_v_hi * int(vq_dim)].reshape(
+                                _r1 - _r0, codes_per_cb, int(vq_dim))
+                            _d = (_Q_block.unsqueeze(2) - _cb.unsqueeze(0).unsqueeze(0)).pow(2).sum(-1)
+                            _codes[_r0:_r1, _v_lo:_v_hi] = _d.argmin(-1).to(torch.uint8)
+                    self.layer.gptvq_codes = _codes.cpu()
+                self.layer.gptvq_perm       = top_indices.detach().cpu().to(torch.int32)
+                # diagI_rot is a (in_d, in_d) diag-style matrix; pull its diagonal
+                # to get the (in_d,) sign vector used by Hadamard rotation.
+                if diagI_rot.dim() == 2:
+                    diag_vec = torch.diagonal(diagI_rot).detach().to(torch.float16).cpu()
+                else:
+                    diag_vec = diagI_rot.detach().to(torch.float16).cpu()
+                self.layer.gptvq_diag_signs = diag_vec
+                self.layer.gptvq_vdim       = int(vq_dim) if vq_dim is not None else None
+                self.layer.gptvq_groupsize  = int(groupsize)
+                self.layer.gptvq_rotate_size = int(rotate_size)
+                self.layer.gptvq_partial_size = int(partial_size)
+            except Exception as _e:
+                print(f"[fasterquant] warning: failed to attach gptvq state: {_e}")
+
+        # Un-rotate Q and add LoRA compensation → set as fake-quant weight
         Q = (Q @ PD_rot.T)
         QR = Q.to(self.layer.weight.data.dtype) + lora.to(self.layer.weight.data.dtype)
-        
         self.layer.weight.data = QR
 
         W = W.detach().cpu()
@@ -438,13 +500,11 @@ def gptvq_fwrd_lora(model, loras, dataloader, dev, args):
 
     for i in tqdm.tqdm(range(len(layers)), desc="LoPRo quantization process (vector)..."):
 
-        if isinstance(layers[0], MixtralDecoderLayer):
-            regular_qlist = MixtralQuantLayerA[1]
-            sequential = [regular_qlist]
-        else:
-            subset = find_layers(layers[i])
-            normal_qlist, shared_qlist, regular_qlist = get_moe_qlayers_name(subset)
-            sequential = [regular_qlist]
+        # Name-based dispatch works for both Qwen (`.experts.` + gate/up/down)
+        # and Mixtral (`.experts.` + w1/w2/w3). No isinstance branching needed.
+        subset = find_layers(layers[i])
+        normal_qlist, shared_qlist, regular_qlist = get_moe_qlayers_name(subset)
+        sequential = [regular_qlist]
 
         lora_layer = loras[i]
         layer = layers[i].to(dev)
@@ -459,7 +519,8 @@ def gptvq_fwrd_lora(model, loras, dataloader, dev, args):
                 if 'lm_head' in name:
                     layer_weight_bits = 16
                     continue
-                if args.int8_down_proj and 'down_proj' in name:
+                # Mixtral names down_proj as w2; keep both patterns
+                if args.int8_down_proj and ('down_proj' in name or '.w2' in name):
                     layer_weight_bits = 8
                 gptq[name] = GPTVQ_lora(subset[name], lora_layer[name])
                 
@@ -470,6 +531,7 @@ def gptvq_fwrd_lora(model, loras, dataloader, dev, args):
                 else: 
                     vdim = 4
                     gp = 65536
+                _pool_km = getattr(args, 'pool_kmeans', False)
                 QClass = lambda: VQQuantizer(
                     vq_dim=vdim,
                     columns_per_group=256,
@@ -479,9 +541,10 @@ def gptvq_fwrd_lora(model, loras, dataloader, dev, args):
                     vq_scaling_domain="log",
                     kmeans_init_method="mahalanobis",
                     assignment_chunk_size=None,
-                    kmeans_iters=10,
-                    codebook_bitwidth=8,
+                    kmeans_iters=30 if _pool_km else 10,
+                    codebook_bitwidth=None if _pool_km else 8,
                     quantize_per_codebook=".",
+                    pool_kmeans=_pool_km,
                 )
 
                 gptq[name].quantizer = QClass()
@@ -508,7 +571,7 @@ def gptvq_fwrd_lora(model, loras, dataloader, dev, args):
                 include_m_step = False
                 use_vq = True
                 svd_rank = 0
-                hessian_weighted_lookups = False
+                hessian_weighted_lookups = True
                 only_init_kmeans = False
                 gptq[name].fasterquant(
                     percdamp=args.percdamp,

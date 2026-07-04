@@ -38,6 +38,17 @@ class GLoRCQGraphWrapper:
         self.device = next(model.parameters()).device
         self.dtype = next(model.parameters()).dtype
 
+        # Mixtral defaults `output_router_logits=True`, which returns a list of
+        # per-layer tensors during forward — this both inflates memory during
+        # graph capture and produces variable-shape outputs that break replay.
+        # Force it off before capture. Qwen2Moe defaults False so no-op there.
+        model.config.output_router_logits = False
+        if hasattr(model, 'generation_config') and model.generation_config is not None:
+            try:
+                model.generation_config.output_router_logits = False
+            except Exception:
+                pass
+
         # Static KV Cache
         self.static_cache = StaticCache(
             config=model.config,
@@ -47,12 +58,31 @@ class GLoRCQGraphWrapper:
             dtype=self.dtype,
         )
 
+        # Mixtral's stock attention calls past_key_value.get_usable_length(),
+        # whose implementation does `if previous_seq_length + new_seq_length > max_length`
+        # where previous_seq_length is a CUDA 0-dim tensor from StaticCache.get_seq_length
+        # (default: `(key_cache[layer_idx][0,0].any(dim=-1)).sum()`). The Python `>`
+        # forces a `.item()` sync — forbidden during CUDA-Graph capture.
+        # Patch get_seq_length to a Python int equal to max_cache_len; this makes
+        # the > check take the "clamp" branch and returns max_length - new_seq_length,
+        # so kv_seq_len = max_cache_len — sufficient for RoPE size and safe under capture.
+        _mcl = max_seq_len
+        self.static_cache.get_seq_length = lambda layer_idx=0: _mcl
+
         # Static input buffers (fixed shape for graph)
         self.static_input_ids = torch.zeros(
             (max_batch_size, 1), dtype=torch.long, device=self.device
         )
         self.static_cache_position = torch.zeros(
             (1,), dtype=torch.long, device=self.device
+        )
+        # Mixtral's stock forward derives position_ids from cache_position in a
+        # way that misfires under CUDA-Graph capture (indexing cos with a stale
+        # tensor → device-side assert at apply_rotary_pos_emb). Passing
+        # position_ids explicitly avoids that path. Qwen2Moe accepts and honors
+        # position_ids too — safe to pass unconditionally.
+        self.static_position_ids = torch.zeros(
+            (max_batch_size, 1), dtype=torch.long, device=self.device
         )
 
         self.static_logits = None
@@ -84,8 +114,10 @@ class GLoRCQGraphWrapper:
         with torch.no_grad():
             self.static_input_ids.fill_(1)
             self.static_cache_position.fill_(0)
+            self.static_position_ids.fill_(0)
             self.model(
                 input_ids=self.static_input_ids,
+                position_ids=self.static_position_ids,
                 cache_position=self.static_cache_position,
                 past_key_values=self.static_cache,
                 use_cache=True,
@@ -102,8 +134,10 @@ class GLoRCQGraphWrapper:
             for _ in range(3):
                 self.static_input_ids.fill_(1)
                 self.static_cache_position.fill_(10)
+                self.static_position_ids.fill_(10)
                 self.model(
                     input_ids=self.static_input_ids,
+                    position_ids=self.static_position_ids,
                     cache_position=self.static_cache_position,
                     past_key_values=self.static_cache,
                     use_cache=True,
@@ -117,10 +151,12 @@ class GLoRCQGraphWrapper:
         self.graph = torch.cuda.CUDAGraph()
         self.static_input_ids.fill_(1)
         self.static_cache_position.fill_(0)
+        self.static_position_ids.fill_(0)
 
         with torch.cuda.graph(self.graph, stream=self.graph_stream):
             logits = self.model(
                 input_ids=self.static_input_ids,
+                position_ids=self.static_position_ids,
                 cache_position=self.static_cache_position,
                 past_key_values=self.static_cache,
                 use_cache=True,
@@ -145,6 +181,7 @@ class GLoRCQGraphWrapper:
 
         self.static_input_ids.copy_(input_ids)
         self.static_cache_position.fill_(cache_position_val)
+        self.static_position_ids.fill_(cache_position_val)
         self.graph.replay()
         return self.static_logits
 

@@ -95,6 +95,11 @@ _MOE_ARCH_CONFIG = {
         "has_shared_expert": True,     # shared_expert exists, keep FP16
         "expert_container": "mlp",     # module path containing .experts
     },
+    "qwen3_moe": {
+        # Qwen3-MoE (e.g., Qwen3-30B-A3B): no shared expert, container=`mlp`.
+        "has_shared_expert": False,
+        "expert_container": "mlp",
+    },
     "mixtral": {
         "has_shared_expert": False,
         "expert_container": "block_sparse_moe",

@@ -58,6 +58,131 @@ def is_gptq_cuda_available():
 
 
 # ---------------------------------------------------------------------------
+# VQ4 CUDA extension
+# ---------------------------------------------------------------------------
+_vq4_cuda_ext = None
+try:
+    from . import _vq4_matmul_cuda
+    _vq4_cuda_ext = _vq4_matmul_cuda
+except ImportError:
+    pass
+
+
+def is_vq4_cuda_available():
+    """Check whether the compiled VQ4 CUDA kernel is available."""
+    return _vq4_cuda_ext is not None
+
+
+_HAS_VQ4_GROUPED_GEMV = (
+    _vq4_cuda_ext is not None
+    and hasattr(_vq4_cuda_ext, "vq4_dequant_grouped_gemv")
+)
+
+_HAS_LORA_GROUPED_GEMV = (
+    _vq4_cuda_ext is not None
+    and hasattr(_vq4_cuda_ext, "lora_grouped_gemv")
+)
+
+
+def lora_grouped_gemv(A, B):
+    """Batched GEMV replacing torch.bmm((E,1,K),(E,K,M)) → (E,M).
+    Good for small-K, large-M (rank@out_d, SV pattern).
+
+    Args:
+        A: (E, K) or (E, 1, K) fp16
+        B: (E, K, M) fp16
+    Returns:
+        Y: (E, M) fp16
+    """
+    if not _HAS_LORA_GROUPED_GEMV:
+        if A.dim() == 2:
+            A = A.unsqueeze(1)
+        return torch.bmm(A, B).squeeze(1)
+    return _vq4_cuda_ext.lora_grouped_gemv(A, B)
+
+
+_HAS_LORA_U_GROUPED_GEMV = (
+    _vq4_cuda_ext is not None
+    and hasattr(_vq4_cuda_ext, "lora_u_grouped_gemv")
+)
+
+_HAS_SILU_AND_MUL = (
+    _vq4_cuda_ext is not None
+    and hasattr(_vq4_cuda_ext, "silu_and_mul")
+)
+
+
+def silu_and_mul(gate, up):
+    """Fused SiLU(gate) * up in one CUDA kernel.
+
+    Args:
+        gate: fp16 tensor
+        up:   fp16 tensor (same shape)
+    Returns:
+        fp16 tensor of same shape
+    """
+    if not _HAS_SILU_AND_MUL:
+        return torch.nn.functional.silu(gate) * up
+    return _vq4_cuda_ext.silu_and_mul(gate, up)
+
+
+def lora_u_grouped_gemv(A, BT):
+    """Batched K-parallel GEMV for large-K, small-M pattern.
+
+    Equivalent to torch.bmm((E,1,K), (E,K,M)) → (E,M) but BT is pre-transposed
+    to (E, M, K) so K is contiguous inner dim for coalesced K-parallel reduction.
+
+    Args:
+        A: (E, K) or (E, 1, K) fp16
+        BT: (E, M, K) fp16 — pre-transposed weight
+    Returns:
+        Y: (E, M) fp16
+    """
+    if not _HAS_LORA_U_GROUPED_GEMV:
+        # Fallback: transpose BT back to (E, K, M) and use bmm
+        if A.dim() == 2:
+            A = A.unsqueeze(1)
+        return torch.bmm(A, BT.transpose(-1, -2)).squeeze(1)
+    return _vq4_cuda_ext.lora_u_grouped_gemv(A, BT)
+
+
+def vq4_dequant_matmul(x_rot, codes, centroids, n_cb, codes_per_cb):
+    """Fused VQ4 dequant + matmul.
+    Args:
+        x_rot:         (B, K) fp16 — pre-rotated input (x @ PD_rot)
+        codes:         (N, K/vdim) uint8
+        centroids:     (n_cb, K_CB=256, vdim=4) fp16
+        n_cb:          int — number of codebooks per row
+        codes_per_cb:  int — code positions per codebook
+    Returns:
+        y:             (B, N) fp16
+    """
+    if _vq4_cuda_ext is None:
+        raise RuntimeError("VQ4 CUDA kernel not available")
+    return _vq4_cuda_ext.vq4_dequant_matmul(
+        x_rot, codes, centroids, int(n_cb), int(codes_per_cb),
+    )
+
+
+def vq4_dequant_grouped_gemv(x_grouped, codes_cat, centroids_cat,
+                              E, N, n_cb, codes_per_cb):
+    """Grouped VQ4 GEMV for MoE (E experts with different inputs).
+    Args:
+        x_grouped:     (E, K) fp16
+        codes_cat:     (E*N, K/vdim) uint8
+        centroids_cat: (E*n_cb, K_CB=256, vdim=4) fp16
+    Returns:
+        y_cat:         (E*N,) fp16
+    """
+    if not _HAS_VQ4_GROUPED_GEMV:
+        raise RuntimeError("VQ4 grouped GEMV not available")
+    return _vq4_cuda_ext.vq4_dequant_grouped_gemv(
+        x_grouped, codes_cat, centroids_cat,
+        int(E), int(N), int(n_cb), int(codes_per_cb),
+    )
+
+
+# ---------------------------------------------------------------------------
 # torch.compile custom op wrappers (allows Dynamo to trace through CUDA calls)
 # ---------------------------------------------------------------------------
 _HAS_GROUPED_GEMV = (

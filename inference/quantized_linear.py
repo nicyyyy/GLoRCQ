@@ -31,6 +31,13 @@ try:
 except ImportError:
     _HAS_GPTQ_FUSED_KERNEL = False
 
+# Try to import fused CUDA kernel for VQ4
+try:
+    from inference.kernels import vq4_dequant_matmul, is_vq4_cuda_available
+    _HAS_VQ4_FUSED_KERNEL = is_vq4_cuda_available()
+except ImportError:
+    _HAS_VQ4_FUSED_KERNEL = False
+
 
 # ---------------------------------------------------------------------------
 # Pure-PyTorch dequant+matmul implementations (initial version)
@@ -112,6 +119,49 @@ def turbo_dequant_matmul(x, packed_indices, norms, Pi, centroids, bits, dim):
     return y.half()
 
 
+def _derive_vq4_codes(Q_rotated, centroids, vdim, in_d):
+    """Nearest-centroid assignment from Q_rotated + centroids → uint8 codes.
+
+    Runs on the CPU side (Q_rotated is fp16 on CPU when unpacked from
+    cross_layer_info.pt) so that only the resulting small uint8 codes
+    (out_d, in_d/vdim) get uploaded to GPU, not the large Q_rotated.
+
+    Args:
+        Q_rotated: (out_d, in_d) fp16 tensor (CPU)
+        centroids: (n_cb, K=256, vdim) fp16 tensor (CPU)
+        vdim: 4
+        in_d: input feature dim
+
+    Returns:
+        codes: (out_d, in_d/vdim) uint8 tensor (CPU)
+    """
+    out_d, _in_d = Q_rotated.shape
+    assert _in_d == in_d, f"in_d mismatch: {_in_d} vs {in_d}"
+    assert _in_d % vdim == 0, f"in_d {_in_d} not divisible by vdim {vdim}"
+    n_vecs = _in_d // vdim
+    n_cb, K, _v = centroids.shape
+    assert _v == vdim, f"centroid vdim {_v} != {vdim}"
+    codes_per_cb = n_vecs // n_cb
+
+    Qf = Q_rotated.float()
+    cf = centroids.float()  # (n_cb, K, vdim)
+    codes = torch.empty(out_d, n_vecs, dtype=torch.uint8)
+
+    # For each codebook block, assign vectors to nearest centroid.
+    for cb_id in range(n_cb):
+        v_lo = cb_id * codes_per_cb
+        v_hi = v_lo + codes_per_cb
+        # Q slice for this codebook: (out_d, codes_per_cb, vdim)
+        Q_block = Qf[:, v_lo * vdim:v_hi * vdim].reshape(out_d, codes_per_cb, vdim)
+        cb = cf[cb_id]  # (K, vdim)
+        # ||Q - c||^2 = ||Q||^2 + ||c||^2 - 2 Q·c
+        # (out_d, codes_per_cb, K)
+        d = (Q_block.unsqueeze(2) - cb.unsqueeze(0).unsqueeze(0)).pow(2).sum(-1)
+        codes[:, v_lo:v_hi] = d.argmin(-1).to(torch.uint8)
+
+    return codes
+
+
 def _unpack_indices(packed, bits, d):
     """
     Unpack bit-packed uint8 indices to long tensor.
@@ -187,7 +237,15 @@ class GLoRCQLinear(nn.Module):
         # LoRA compensation
         self.U = None                # (in_d, rank) fp16 — shared across cluster
         self.SV = None               # (out_d, rank) fp16 — S pre-fused into V: V * S[None,:]
+        self.Sa = None               # (in_d,) fp16 — per-input-channel activation scale (optional)
         self.cluster_id = None       # set by model_builder for cluster-parallel LoRA
+
+        # VQ4 (vdim=4 group-shared codebook) backend
+        self.vq_codes = None         # (out_d, in_d/vdim) uint8
+        self.vq_centroids = None     # (n_blocks, K, vdim) fp16
+        self.vq_perm = None          # (in_d,) long
+        self.vq_diag_signs = None    # (in_d,) fp16
+        self.vq_vdim = None
 
         # Bias
         self.bias_param = None       # (out_d,) fp16
@@ -246,27 +304,115 @@ class GLoRCQLinear(nn.Module):
         )
         self._turbo_dequant_W = turbo_quantizer.dequantize(q).half().to(device)
 
-    def load_lora(self, U, S, V, device="cuda"):
+    def load_lora(self, U, S, V, Sa=None, device="cuda"):
         """Load LoRA compensation matrices, pre-fusing S into V.
 
         Precomputes SV = V * S[None, :] so that inference uses
         ``a @ SV.T`` instead of ``(a * S) @ V.T``, eliminating the
         elementwise multiply kernel at each forward pass.
+
+        If ``Sa`` (per-input-channel activation scale) is provided, it is stored
+        and applied to ``x`` before the ``x @ U`` matmul in forward.
         """
         if U is not None:
             self.U = U.half().to(device)
             # Pre-fuse: SV[i, j] = V[i, j] * S[j]  (out_d, rank)
             self.SV = (V * S.unsqueeze(0)).half().to(device)
+            if Sa is not None:
+                self.Sa = Sa.half().to(device)
 
-    def load_sv(self, U, SV, device="cuda"):
+    def load_sv(self, U, SV, Sa=None, device="cuda"):
         """Load pre-fused SV matrix directly (new format).
 
         Used when SV = V_normed * S is pre-computed at quantization time;
-        no fusion step needed here.
+        no fusion step needed here. ``Sa`` is the per-input-channel activation
+        scale used to construct the original LoRA; applied to x in forward.
         """
         if U is not None:
             self.U  = U.half().to(device)
             self.SV = SV.half().to(device)  # (out_d, rank) fp16, already fused
+            if Sa is not None:
+                self.Sa = Sa.half().to(device)  # (in_d,) fp16
+
+    # Class-level cache: (in_d, rotate_size, partial_size, device) → diagI_rot fp16
+    _DIAGI_CACHE = {}
+
+    @classmethod
+    def _get_diagI(cls, in_d, rotate_size, partial_size, device):
+        key = (in_d, rotate_size, partial_size, str(device))
+        if key in cls._DIAGI_CACHE:
+            return cls._DIAGI_CACHE[key]
+        from utils.hadamard_utils import (
+            block_diagonal_walsh_matrix,
+            create_diagI_matrix_upper,
+        )
+        rs = int(rotate_size)
+        while rs > 1 and in_d % rs != 0:
+            rs //= 2
+        rot = block_diagonal_walsh_matrix(in_d, rs, device).to(torch.float16)
+        diagI = create_diagI_matrix_upper(rot, rot.shape[0] - partial_size).to(device).to(torch.float16)
+        cls._DIAGI_CACHE[key] = diagI
+        return diagI
+
+    def load_vq4(self, *, Q_rotated=None, centroids=None, perm, diag_signs, vdim,
+                 in_d, out_d, rotate_size=256, partial_size=256,
+                 codes=None,
+                 device="cuda"):
+        """Load vdim=4 group-shared VQ residual weights.
+
+        Two storage modes:
+          (a) Q_rotated: (out_d, in_d) fp16 — bit-exact, large
+          (b) codes + centroids: (out_d, in_d/vdim) uint8 + (n_cb, K, vdim) fp16 — packed
+
+        The Python fallback rebuilds Q from codes+centroids when available; else uses
+        Q_rotated directly. The CUDA kernel (when wired) operates on codes+centroids.
+
+        PD_rot is decomposed as Ppermute (gather) + diagI_rot (block-Walsh matmul).
+        We store only the (in_d,) permutation sigma per expert; diagI_rot is shared
+        across all experts with the same (in_d, rotate_size, partial_size).
+        """
+        self.quant_type = "vq4"
+        # DERIVE codes from Q_rotated + centroids IF codes not shipped in the
+        # checkpoint. Older cross_layer_info.pt files only store Q_rotated (fp16
+        # (out_d, in_d), ~117 MB per Mixtral expert × 768 = ~90 GB HBM if uploaded).
+        # Deriving codes on CPU keeps GPU memory usage low: only the 8-bit codes
+        # (~30 MB per Mixtral expert) get uploaded.
+        if codes is None and Q_rotated is not None and centroids is not None:
+            codes = _derive_vq4_codes(Q_rotated, centroids, vdim, in_d)
+
+        # If codes+centroids are provided (or derived), we DON'T need Q_rotated
+        # on GPU: the CUDA kernel operates on codes+centroids directly; the
+        # Python fallback also rebuilds Q from them.
+        if codes is not None and centroids is not None:
+            self.vq_Q_rotated = None
+        else:
+            self.vq_Q_rotated = (Q_rotated.half().to(device)
+                                 if Q_rotated is not None else None)
+        self.vq_centroids = centroids.half().to(device) if centroids is not None else None
+        if codes is not None:
+            self.vq_codes = codes.to(device)
+        self.vq_vdim = vdim
+        self.in_features = in_d
+        self.out_features = out_d
+
+        # Build the sigma index used by Ppermute (per-expert).
+        # Ppermute[col_idx, j] = 1 where sigma[j] = col_idx (see
+        # utils.hadamard_utils.construct_partial_permutation_matrix_upper).
+        # x @ Ppermute is equivalent to x[..., sigma] — a fast gather.
+        import numpy as np
+        S = np.array(perm.cpu())
+        all_indices = set(range(in_d))
+        S_set = set(int(x) for x in S)
+        front = list(int(x) for x in S)
+        back = sorted(all_indices - S_set)
+        sigma = torch.tensor(front + back, dtype=torch.long, device=device)
+        self.vq_perm_sigma = sigma                          # (in_d,) long
+
+        # Shared diagI_rot for this (in_d, rotate_size, partial_size)
+        self.vq_diagI = GLoRCQLinear._get_diagI(
+            in_d, rotate_size, partial_size, device)         # (in_d, in_d) fp16 — SHARED
+        # Kept for backwards-compat / debug: leave vq_PD_rot as None (unused).
+        self.vq_PD_rot = None
 
     def _dequant_gptq(self):
         """Dequantize GPTQ weights to fp16."""
@@ -282,6 +428,33 @@ class GLoRCQLinear(nn.Module):
             else:
                 W[:, col0:col1] = (q_slice - self.zeros[:, gi:gi+1]) * self.scales[:, gi:gi+1]
         return W
+
+    def _vq4_matmul_python(self, x):
+        """Python fallback for vq4: y = (x_permuted @ diagI) @ Q.T
+
+        If codes+centroids are loaded, Q is rebuilt by codebook lookup. Otherwise
+        fall back to the saved fp16 Q_rotated.
+        """
+        # Gather + block-Walsh rotation (replaces dense (in_d, in_d) matmul)
+        x_permuted = x.half()[..., self.vq_perm_sigma]
+        x_rot = x_permuted @ self.vq_diagI
+        if self.vq_codes is not None and self.vq_centroids is not None:
+            # Rebuild Q from codes + centroids
+            out_d, codes_per_row = self.vq_codes.shape
+            n_cb, K, vdim = self.vq_centroids.shape
+            codes_per_cb = codes_per_row // n_cb
+            in_d = codes_per_row * vdim
+            Q = torch.empty(out_d, in_d, dtype=torch.float16, device=x_rot.device)
+            for cb_idx in range(n_cb):
+                c0 = cb_idx * codes_per_cb
+                c1 = c0 + codes_per_cb
+                cb = self.vq_centroids[cb_idx]                          # (K, vdim) fp16
+                codes_blk = self.vq_codes[:, c0:c1].long()              # (out_d, codes_per_cb)
+                looked = cb[codes_blk]                                   # (out_d, codes_per_cb, vdim)
+                Q[:, c0*vdim:c1*vdim] = looked.reshape(out_d, codes_per_cb * vdim)
+            return x_rot @ Q.T
+        return x_rot @ self.vq_Q_rotated.T
+
 
     def forward(self, x, precomputed_xU=None, precomputed_x_rot=None):
         """
@@ -332,17 +505,57 @@ class GLoRCQLinear(nn.Module):
                 y = x @ self._turbo_dequant_W.T
             else:
                 raise RuntimeError("TurboQuant weights not loaded")
+        elif self.quant_type == "vq4":
+            n_cb, K_cb, vdim = (self.vq_centroids.shape
+                                if self.vq_centroids is not None else (0, 0, 0))
+            # Kernel shmem budget: (K + n_cb * K_CB * VDIM) * 2 bytes must fit
+            # in ~100 KB (A100 max opt-in). For Mixtral down_proj (in_d=14336,
+            # n_cb=56) this is 143 KB → exceeds → silent kernel-launch fail →
+            # "invalid argument" on next op. Fall back to Python for those.
+            K_in = self.in_features
+            shmem_bytes = (K_in + n_cb * K_cb * vdim) * 2
+            _MAX_SHMEM = 96 * 1024  # 96 KB safe margin below 100 KB A100 limit
+            can_use_kernel = (
+                _HAS_VQ4_FUSED_KERNEL
+                and self.vq_codes is not None
+                and shmem_bytes <= _MAX_SHMEM
+            )
+            if can_use_kernel:
+                # Rotate x (or reuse precomputed_x_rot), then call fused kernel
+                if precomputed_x_rot is not None:
+                    x_rot = precomputed_x_rot
+                else:
+                    x_permuted = x.half()[..., self.vq_perm_sigma]
+                    x_rot = x_permuted @ self.vq_diagI
+                codes_per_row = self.vq_codes.shape[1]
+                codes_per_cb = codes_per_row // n_cb
+                y = vq4_dequant_matmul(
+                    x_rot, self.vq_codes, self.vq_centroids,
+                    n_cb, codes_per_cb,
+                )
+            else:
+                y = self._vq4_matmul_python(x)
         else:
             raise RuntimeError(f"Unknown quant_type: {self.quant_type}")
 
         # 2. LoRA compensation: y += a @ SV.T  where SV = V * S[None,:]
         # SV is pre-fused at load time — no elementwise multiply needed here.
+        # If self.Sa is set, apply x_scaled = x * Sa before the x @ U matmul to
+        # match the training-time formula lora^T = diag(Sa) @ U @ diag(Si) @ V.
+        # NOTE: When Sa is set, we MUST recompute x @ U because Sa is per-expert
+        # while precomputed_xU shares x @ U across a cluster of experts.
         if self.SV is not None:
-            if precomputed_xU is not None:
-                a = precomputed_xU      # reuse cluster-parallel x @ U
+            if precomputed_xU is not None and self.Sa is None:
+                a = precomputed_xU      # reuse cluster-parallel x @ U (no Sa)
             else:
-                a = x @ self.U          # (..., rank)
-            y = y + a @ self.SV.T
+                # Cast Sa/U/SV to x's dtype on the fly so bf16 models (Mixtral)
+                # don't hit "invalid argument" from fp16↔bf16 broadcast.
+                if self.Sa is not None:
+                    x_for_lora = x * self.Sa.to(x.dtype)
+                else:
+                    x_for_lora = x
+                a = x_for_lora @ self.U.to(x.dtype)          # (..., rank)
+            y = y + a @ self.SV.T.to(y.dtype)
 
         # 3. Bias
         if self.bias_param is not None:

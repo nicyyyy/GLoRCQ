@@ -42,6 +42,9 @@ def main():
                         help="Number of few-shot examples (default: 0)")
     parser.add_argument("--output_json", type=str, default=None,
                         help="Path to save results as JSON")
+    parser.add_argument("--metric_mode", default="auto",
+                        choices=["auto", "acc", "acc_norm"],
+                        help="Metric priority: auto=prefer acc_norm, acc=prefer raw acc, acc_norm=force normalized")
     args = parser.parse_args()
 
     from lm_eval import evaluator
@@ -74,12 +77,18 @@ def main():
     print(f"  {'Task':<25} {'Metric':<15} {'Value':>10}")
     print(f"  {'-'*50}")
 
+    if args.metric_mode == "acc":
+        metric_priority = ("acc,none", "acc", "acc_norm,none", "acc_norm")
+    elif args.metric_mode == "acc_norm":
+        metric_priority = ("acc_norm,none", "acc_norm", "acc,none", "acc")
+    else:
+        metric_priority = ("acc_norm,none", "acc,none", "acc_norm", "acc")
+
     task_results = {}
     for task_name in task_list:
         if task_name in results["results"]:
             task_data = results["results"][task_name]
-            # Find the primary accuracy metric
-            for metric_key in ("acc_norm,none", "acc,none", "acc_norm", "acc"):
+            for metric_key in metric_priority:
                 if metric_key in task_data:
                     val = task_data[metric_key]
                     metric_label = metric_key.replace(",none", "")

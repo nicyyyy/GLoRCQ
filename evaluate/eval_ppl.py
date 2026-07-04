@@ -86,13 +86,15 @@ def main():
                         help="Stride between windows (default: 512)")
     parser.add_argument("--output_json", type=str, default=None,
                         help="Path to save results as JSON")
+    parser.add_argument("--real_quant", action="store_true", default=False,
+                        help="Load via GLoRCQ real-quant path (cross_layer_info.pt)")
     args = parser.parse_args()
 
     from utils.model_loader import load_model_and_tokenizer
 
-    print(f"Loading fake-quant model from {args.model_path} ...")
+    print(f"Loading {'real-quant' if args.real_quant else 'fake-quant'} model from {args.model_path} ...")
     model, tokenizer = load_model_and_tokenizer(
-        args.model_path, device=args.device, real_quant=False,
+        args.model_path, device=args.device, real_quant=args.real_quant,
     )
 
     ppl = eval_ppl_sliding_window(

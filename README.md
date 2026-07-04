@@ -2,25 +2,35 @@
 
 **G**lobal shared **Lo**w-**R**ank **C**ompensation for **Q**uantization
 
-GLoRCQ combines GPTQ quantization with LoRA residual compensation and cross-layer expert sharing on MoE models (Qwen1.5-MoE-A2.7B, Mixtral-8x7B). The core innovation is clustering similar experts across layers using Grassmannian manifold distance, then sharing their LoRA U matrices to reduce storage overhead.
+GLoRCQ quantizes MoE LLMs by combining TileQ's activation-scaled SVD with cross-layer
+sharing of the LoRA U matrix across groups of experts from different layers. For attention
+layers, plain scalar GPTQ (4-bit, no LoRA) is applied.
+
+**Best result on Qwen1.5-MoE-A2.7B: PPL = 6.90 at ~3.47 effective bits**
 
 ## Quick Start
 
 ```bash
-# 1. Setup environment (creates .venv, installs deps, builds CUDA kernels)
-cd glorcq/
+# 1. Setup environment (creates .venv, installs dependencies, builds CUDA kernels)
 bash scripts/setup_env.sh
 
-# 2. Run quantization
-uv run python run_quantize.py \
-    --model_path Qwen/Qwen1.5-MoE-A2.7B \
-    --output_path ./output/qwen-moe-2bit-rank64 \
-    --qbit 2 --w_clip --rank 64 \
-    --G_moe 128 --n_iter 10 \
-    --hessian_svd --use_turboquant --search_act_alpha
+# 2. Run quantization (E11: 2-bit MoE experts + 4-bit attention)
+bash run_e11.sh
 
-# 3. Evaluate
-uv run python ../evaluate/eval_ppl.py --model_path ./output/qwen-moe-2bit-rank64
+# Or run directly:
+.venv/bin/python run_quantize.py \
+    --model_path Qwen/Qwen1.5-MoE-A2.7B \
+    --output_path /path/to/output \
+    --qbit 2 --fix_rank 32 --G 128 --group_size 128 \
+    --lora_bit 16 --lora_iter 8 \
+    --ha_bsize 256 --id_bsize 256 \
+    --attn_bits 4
+
+# 3. Evaluate PPL
+.venv/bin/python evaluate/eval_ppl.py \
+    --model_path /path/to/output \
+    --device cuda:0 \
+    --output_json logs/result_ppl.json
 ```
 
 ## Environment Setup
@@ -28,63 +38,56 @@ uv run python ../evaluate/eval_ppl.py --model_path ./output/qwen-moe-2bit-rank64
 ### Prerequisites
 
 - Python >= 3.10
-- CUDA toolkit (for kernel compilation)
-- [uv](https://github.com/astral-sh/uv) package manager
+- CUDA toolkit (for inference kernel compilation)
+- The [TileQ](https://github.com/tilequant/tileq) repo cloned at `../tileq` (sibling directory)
 
-### Automated Setup
+### Setup
 
 ```bash
 bash scripts/setup_env.sh
 ```
 
-This will:
-1. Create a `.venv` virtualenv via `uv`
-2. Install all Python dependencies from `pyproject.toml`
-3. Install TurboQuant from `thirdpart/turboquant/` (if present)
-4. Compile CUDA inference kernels (GPTQ + TurboQuant fused matmul)
-
-### Manual Setup
+This creates a `.venv` virtualenv and installs all dependencies from `pyproject.toml`.
+The CUDA inference kernels are built separately:
 
 ```bash
-# Create virtualenv
-uv venv .venv
-
-# Install dependencies
-uv pip install -e ".[turboquant]"
-
-# (Optional) Install TurboQuant
-uv pip install -e thirdpart/turboquant
-
-# Build CUDA kernels
-cd inference/kernels
-uv run python setup.py build_ext --inplace
-cd ../..
+bash scripts/build_kernels.sh
 ```
 
-### CUDA Kernels
+## Pipeline
 
-The fused dequant+matmul kernels live in `inference/kernels/`. They support:
-- **GPTQ kernel**: int8 dequant + GEMV/GEMM with optional LoRA fusion
-- **TurboQuant kernel**: 2-bit packed dequant + GEMV/GEMM with optional LoRA fusion
+`run_quantize.py` runs three phases:
 
-Target architectures: sm_80 (A100), sm_86 (3090), sm_89 (4090), sm_90 (H100/H20).
+| Phase | Description |
+|-------|-------------|
+| **Phase 1** | Collect activation scales for all MoE routing experts; compute TileQ-style LoRA for attention and shared expert layers. Results cached to `{output}_phase1_cache.pt`. |
+| **Phase 2** | Cross-layer group sharing: group G=128 experts of the same type across layers, stack their activation-scaled weights, compute a shared U matrix via rank-1 sketch SVD. |
+| **Phase 2.5** | (Optional) 4-bit scalar GPTQ for attention layers (enabled with `--attn_bits 4`). |
+| **Phase 3** | TileQ's `gptvq_fwrd_lora`: VQ-quantize the residual for each MoE routing expert. |
 
-To rebuild:
-```bash
-bash scripts/build_kernels.sh          # incremental build
-bash scripts/build_kernels.sh --clean  # clean rebuild
+### Key Arguments
+
 ```
-
-If CUDA kernels are not built, inference falls back to pure-PyTorch implementations automatically.
+--model_path          HuggingFace model name or local path
+--output_path         Output directory for quantized model
+--qbit                VQ quantization bits for MoE experts (default: 2)
+--fix_rank            LoRA rank per expert (default: 32)
+--G                   Experts per cross-layer group (default: 128)
+--group_size          VQ group size in columns (default: 128)
+--lora_bit            Bits for U/V matrix storage (default: 16)
+--lora_iter           Rank-1 sketch iterations (default: 8)
+--attn_bits           GPTQ bits for attention layers (default: 16 = disabled)
+--no_cache            Force recompute Phase 1 even if cache exists
+--phase1_cache_path   Override Phase 1 cache path
+```
 
 ## Project Structure
 
 ```
-glorcq/
-├── run_quantize.py              # Pipeline entry point (Stages 1-5)
-├── joint_optim.py               # Stage 1: Joint GPTQ + Hessian-weighted LoRA
-├── cross_layer_share.py         # Stages 2-5: Clustering + shared U/V
-├── turbo_weight_quantizer.py    # TurboQuant 2-bit quantizer wrapper
+GLoRCQ/
+├── run_quantize.py              # Main entry point (Phases 1–3)
+├── run_e11.sh                   # Example run script for Qwen1.5-MoE-A2.7B
+├── joint_optim.py               # GPTQJoint class (used by Phase 2.5)
 │
 ├── quantizer/                   # Quantization primitives
 │   ├── quantizer.py             #   WeightQuantizer (MSE clipping, scale/zero)
@@ -92,94 +95,43 @@ glorcq/
 │   ├── scalar_quant_utils_lora.py
 │   └── vector_quant_utils_lora.py
 │
+├── sketch/
+│   └── r1_sketch.py             # Rank-1 sketch SVD (used in Phase 2)
+│
 ├── inference/                   # Real-quantized model inference
 │   ├── model_builder.py         #   load_glorcq_model() — load packed weights
 │   ├── quantized_linear.py      #   GLoRCQLinear layer (dequant + matmul + LoRA)
 │   ├── graph_wrapper.py         #   CUDA Graph acceleration for decode
 │   ├── eval_speed.py            #   Speed benchmark script
 │   └── kernels/                 #   Fused CUDA kernels
-│       ├── setup.py             #     Build script (CUDAExtension)
-│       ├── gptq_matmul.cu       #     GPTQ dequant+matmul kernel
-│       └── turbo_matmul.cu      #     TurboQuant dequant+matmul kernel
+│
+├── evaluate/                    # Evaluation scripts
+│   ├── eval_ppl.py              #   WikiText-2 perplexity
+│   ├── eval_speed.py            #   Decode throughput
+│   └── eval_zeroshot.py         #   Zero-shot benchmarks (lm-eval-harness)
 │
 ├── utils/                       # Shared utilities
-│   ├── model_loader.py          #   Unified model/tokenizer loader
-│   ├── moe_utils.py             #   Expert detection & layer info
+│   ├── model_loader.py          #   load_model_and_tokenizer()
+│   ├── moe_utils.py             #   MoE expert detection & layer info
 │   ├── get_calib_data.py        #   WikiText-2 / C4 calibration data
 │   └── ...
 │
-├── scripts/                     # Shell scripts
-│   ├── setup_env.sh             #   First-time environment setup
-│   ├── build_kernels.sh         #   Build CUDA kernels
-│   ├── run_glorcq.sh            #   Full quantization pipeline
-│   ├── run_e2e_test.sh          #   End-to-end test
-│   ├── run_eval_ppl.sh          #   PPL evaluation
-│   ├── run_eval_speed.sh        #   Speed benchmark
-│   └── run_eval_zeroshot.sh     #   Zero-shot benchmark
+├── scripts/                     # Setup and build scripts
+│   ├── setup_env.sh
+│   └── build_kernels.sh
 │
-└── pyproject.toml               # Python project metadata & dependencies
+└── exp/                         # Paper evaluation scripts
+    ├── paper_eval_qwen15moe.sh
+    └── ...
 ```
 
-## Pipeline
+## Results
 
-### Quantization (5 Stages)
+| Model | Method | Bits | PPL (WikiText-2) |
+|-------|--------|------|-----------------|
+| Qwen1.5-MoE-A2.7B | FP16 | 16.0 | ~4.41 |
+| Qwen1.5-MoE-A2.7B | TileQ-1D (paper) | ~2.3 | 7.49 |
+| Qwen1.5-MoE-A2.7B | GLoRCQ E11 (ours) | 3.47 | **6.90** |
 
-| Stage | Function | Description |
-|-------|----------|-------------|
-| 1 | `quantize_joint()` | Per-layer alternating GPTQ + Hessian-weighted SVD |
-| 2 | `cluster_residuals()` | Grassmannian manifold clustering of expert residuals |
-| 3+4 | `compute_shared_and_reconstruct()` | Shared U computation + fake-quant reconstruction |
-| 5 | `compute_avg_bits()` | Bit-width statistics |
-
-### Key Arguments
-
-```
---model_path          HuggingFace model name or local path
---output_path         Output directory for quantized model
---qbit                Weight quantization bits (2/3/4, default: 4)
---rank                LoRA / SVD rank (default: 64)
---G_moe               Cluster count for MoE experts (default: 128)
---n_iter              Alternating optimization iterations (default: 3)
---w_clip              Enable MSE clipping search
---hessian_svd         Use Hessian-weighted SVD in Stage 3
---use_turboquant      Hybrid: TurboQuant for MoE + GPTQ for attention
---search_act_alpha    Per-module grid search for activation equalization
---real_quant          Save packed int weights (for inference with CUDA kernels)
-```
-
-### Evaluation
-
-```bash
-# PPL (loads fake-quant fp16 model)
-uv run python evaluate/eval_ppl.py --model_path ./output/model
-
-# Speed benchmark (loads real-quant model, standard vs CUDA Graph)
-uv run python evaluate/eval_speed.py --model_path ./output/model
-
-# Zero-shot benchmark (loads fake-quant fp16 model, uses lm-eval-harness)
-uv run python evaluate/eval_zeroshot.py --model_path ./output/model
-```
-
-## Migration to Another Machine
-
-```bash
-# 1. Copy the project (thirdpart/turboquant is included inside glorcq/)
-scp -r glorcq/ user@remote:/path/to/glorcq/
-
-# 2. On the remote machine
-cd /path/to/glorcq/
-bash scripts/setup_env.sh
-
-# 3. Set HuggingFace cache (adjust to your paths)
-export HF_HOME=/path/to/huggingface_cache
-
-# 4. Run
-uv run python run_quantize.py --model_path ... --output_path ...
-```
-
-### Notes
-
-- CUDA kernels will be recompiled on the target machine (requires CUDA toolkit + PyTorch with CUDA support)
-- Pre-compiled `.so` files are Python-version and CUDA-version specific; do not copy them across different environments
-- The `--use_turboquant` flag requires `thirdpart/turboquant/` (bundled in the repo)
-- All shell scripts use `uv run` and auto-detect the `.venv` in the project root
+E11 configuration: 2-bit VQ for MoE routing experts (rank=32, G=128), 4-bit GPTQ for
+attention, FP16 for shared expert and embeddings.

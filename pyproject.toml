@@ -16,11 +16,11 @@ dependencies = [
     "numpy",
     "tqdm",
     "SentencePiece",
+    "fast-hadamard-transform",
 ]
 
 [project.optional-dependencies]
 turboquant = ["scipy"]
-hadamard = ["fast-hadamard-transform"]
 
 [build-system]
 requires = ["setuptools", "wheel"]

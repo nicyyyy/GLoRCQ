@@ -217,6 +217,7 @@ class VQQuantizer(nn.Module):
         vq_scaling_n_bits=4,
         vq_scaling_domain="log",
         quantize_during_kmeans=False,
+        pool_kmeans=False,
     ):
         super().__init__()
         self.vq_dim = vq_dim
@@ -236,6 +237,7 @@ class VQQuantizer(nn.Module):
         self.vq_scaling_norm = vq_scaling_norm
         self.vq_scaling_n_bits = vq_scaling_n_bits
         self.vq_scaling_domain = vq_scaling_domain
+        self.pool_kmeans = pool_kmeans
 
     def get_groupsize(self, X, groupsize):
         if self.columns_per_group is not None:
@@ -279,25 +281,48 @@ class VQQuantizer(nn.Module):
         assert weight
         assert len(X.shape) == 2
 
-        X = X.reshape(self.groups_per_column, -1, self.vq_dim)  # G x N x D
-        if H_inv_diag is not None:
-            H_inv_diag = H_inv_diag.reshape(1, -1, self.vq_dim)  # 1 x N x D
-            if self.rows_per_group > 1:
-                H_inv_diag = H_inv_diag.tile(1, self.rows_per_group, 1)
+        if self.pool_kmeans:
+            # Pool across all rows: treat as a single group_id with G=1.
+            # The resulting (1, K, vdim) codebook is broadcast back to
+            # (groups_per_column, K, vdim) at the end so downstream vq_quantize
+            # works unchanged. This trades per-row cluster quality for storage.
+            X_pooled = X.reshape(1, -1, self.vq_dim)            # (1, G*N, D)
+            if H_inv_diag is not None:
+                H_inv_diag_pooled = H_inv_diag.reshape(1, -1, self.vq_dim)
+                if self.rows_per_group > 1:
+                    H_inv_diag_pooled = H_inv_diag_pooled.tile(1, self.rows_per_group, 1)
+                # broadcast H_inv_diag across all rows (tile to match pooled N)
+                # Caller passes only one row of H_inv (per column group), so we tile.
+                n_pooled = X_pooled.shape[1]
+                n_unit   = H_inv_diag_pooled.shape[1]
+                if n_pooled != n_unit:
+                    H_inv_diag_use = H_inv_diag_pooled.tile(1, n_pooled // n_unit, 1)
+                else:
+                    H_inv_diag_use = H_inv_diag_pooled
+            else:
+                H_inv_diag_use = None
+            X_use = X_pooled
+        else:
+            X_use = X.reshape(self.groups_per_column, -1, self.vq_dim)  # G x N x D
+            if H_inv_diag is not None:
+                H_inv_diag = H_inv_diag.reshape(1, -1, self.vq_dim)  # 1 x N x D
+                if self.rows_per_group > 1:
+                    H_inv_diag = H_inv_diag.tile(1, self.rows_per_group, 1)
+            H_inv_diag_use = H_inv_diag
 
         if self.kmeans_init_method == "cdf":
             assert self.vq_dim == 1
-            X, _ = torch.sort(X, 1)
-            idx = torch.round(torch.linspace(0, X.shape[1] - 1, self.n_centroids)).long()
-            centroids = X[:, idx].clone()  # G x K x 1
+            X_use, _ = torch.sort(X_use, 1)
+            idx = torch.round(torch.linspace(0, X_use.shape[1] - 1, self.n_centroids)).long()
+            centroids = X_use[:, idx].clone()  # G' x K x 1
         elif self.kmeans_init_method == "kpp":
-            centroids = kpp_parallel_sampled(X, self.n_centroids)
+            centroids = kpp_parallel_sampled(X_use, self.n_centroids)
         elif self.kmeans_init_method == "mahalanobis":
-            centroids = mahalanobis_init(X, self.n_centroids)
+            centroids = mahalanobis_init(X_use, self.n_centroids)
         else:
             raise ValueError(f"Unkown k-means init method: {self.kmeans_init_method}")
 
-        # At this point, centroids should be shape G x K x D
+        # At this point, centroids should be shape G' x K x D where G'=1 if pool_kmeans
         extra_args = {}
         if self.quantize_during_kmeans and self.codebook_bitwidth is not None:
             extra_args = dict(
@@ -305,11 +330,11 @@ class VQQuantizer(nn.Module):
             )
 
         kmeans_vq(
-            X,
+            X_use,
             centroids,
             iters=self.kmeans_iters,
             assignment_chunk_size=self.assignment_chunk_size,
-            H_inv_diag=H_inv_diag,
+            H_inv_diag=H_inv_diag_use,
             **extra_args,
         )
 
@@ -317,6 +342,10 @@ class VQQuantizer(nn.Module):
             quantize_centroids(
                 centroids, self.codebook_bitwidth, per_codebook=self.quantize_per_codebook
             )
+
+        if self.pool_kmeans:
+            # Broadcast (1, K, vdim) → (groups_per_column, K, vdim) so vq_quantize is happy.
+            centroids = centroids.expand(self.groups_per_column, -1, -1).contiguous()
 
         self.all_centroids.append(centroids)
 

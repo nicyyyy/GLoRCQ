@@ -174,27 +174,73 @@ def _build_global_u_pool(u_cache):
 
 
 def _install_global_u_pool(model, u_cache):
-    """Build global U pool and install on all MoE blocks."""
+    """Build global U pool and install on all MoE blocks.
+
+    Handles both Qwen (`layer.mlp`) and Mixtral (`layer.block_sparse_moe`)
+    container attrs; iterates both and installs on whichever is a wrapped
+    GraphCompatibleMoeBlock.
+    """
     pools, id_maps = _build_global_u_pool(u_cache)
     m = getattr(model, "model", model)
     for layer in m.layers:
-        moe = getattr(layer, "mlp", None)
-        if moe is not None and hasattr(moe, "set_global_pool"):
-            moe.set_global_pool(pools, id_maps)
+        for attr in ("mlp", "block_sparse_moe"):
+            moe = getattr(layer, attr, None)
+            if moe is not None and hasattr(moe, "set_global_pool"):
+                moe.set_global_pool(pools, id_maps)
+                break
 
 
 def _replace_moe_blocks(model):
-    """Replace Qwen2MoeSparseMoeBlock with GraphCompatibleMoeBlock."""
+    """Replace MoE blocks with our graph-compatible wrapper.
+
+    Handles Qwen2Moe, Qwen3Moe, and Mixtral through a single
+    GraphCompatibleMoeBlock — the wrapper uses getattr for arch-specific
+    attributes (shared_expert, norm_topk_prob) and aliases w1/w3/w2 to
+    gate_proj/up_proj/down_proj so downstream code is uniform.
+    """
+    qwen_types = []
+    mixtral_types = []
     try:
         from transformers.models.qwen2_moe.modeling_qwen2_moe import (
             Qwen2MoeSparseMoeBlock,
         )
+        qwen_types.append(Qwen2MoeSparseMoeBlock)
     except ImportError:
+        pass
+    try:
+        from transformers.models.qwen3_moe.modeling_qwen3_moe import (
+            Qwen3MoeSparseMoeBlock,
+        )
+        qwen_types.append(Qwen3MoeSparseMoeBlock)
+    except ImportError:
+        pass
+    try:
+        from transformers.models.mixtral.modeling_mixtral import (
+            MixtralSparseMoeBlock,
+        )
+        mixtral_types.append(MixtralSparseMoeBlock)
+    except ImportError:
+        pass
+
+    if not qwen_types and not mixtral_types:
         return
+    qwen_tuple = tuple(qwen_types)
+    mixtral_tuple = tuple(mixtral_types)
+
     m = getattr(model, "model", model)
     for layer in m.layers:
-        if hasattr(layer, "mlp") and isinstance(layer.mlp, Qwen2MoeSparseMoeBlock):
-            layer.mlp = GraphCompatibleMoeBlock(layer.mlp)
+        for attr in ("mlp", "block_sparse_moe"):
+            mod = getattr(layer, attr, None)
+            if mod is None:
+                continue
+            # Qwen wrapper handles BOTH archs (getattr shared_expert/norm_topk_prob
+            # defaults, w1/w3/w2 aliasing, dtype-aware LoRA). Routing Mixtral
+            # through it inherits all decode-speed opts (CUDA Graph, grouped-GEMV,
+            # dual-stream, precompute-share, silu fuse).
+            if (qwen_tuple and isinstance(mod, qwen_tuple)) or \
+               (mixtral_tuple and isinstance(mod, mixtral_tuple)):
+                setattr(layer, attr, GraphCompatibleMoeBlock(mod))
+                break
 
 
 # ---------------------------------------------------------------------------
@@ -224,7 +270,20 @@ def load_glorcq_model(model_path, device="cuda:0"):
     glorcq_model_path = os.path.join(model_path, "glorcq_model.pt")
     cross_layer_path = os.path.join(model_path, "cross_layer_info.pt")
 
-    if not os.path.exists(glorcq_model_path):
+    # E11 method writes packed VQ residuals + attention GPTQ directly into
+    # cross_layer_info.pt rather than a separate glorcq_model.pt. Detect this
+    # and build a synthetic layers_data dict so _replace_linear_layers can
+    # be reused unchanged.
+    is_e11 = False
+    if os.path.exists(cross_layer_path):
+        _cli_probe = torch.load(cross_layer_path, map_location="cpu", weights_only=False)
+        if _cli_probe.get("config", {}).get("method") == "tileq_glorcq_e11":
+            is_e11 = True
+            cross_layer_info = _cli_probe
+        else:
+            del _cli_probe
+
+    if not is_e11 and not os.path.exists(glorcq_model_path):
         raise FileNotFoundError(
             f"glorcq_model.pt not found in {model_path}. "
             "This model was likely saved in fake-quant mode. "
@@ -232,25 +291,87 @@ def load_glorcq_model(model_path, device="cuda:0"):
         )
 
     # Create model on CPU with empty weights
-    with torch.device("meta"):
-        model = AutoModelForCausalLM.from_config(
-            config, trust_remote_code=True, torch_dtype=torch.float16,
+    # For E11: load from safetensors so non-quantized params (norms, embeddings,
+    # router gates) get their real fp16 values. The quantized linears are still
+    # replaced below by GLoRCQLinear.
+    #
+    # NOTE: explicit device_map='cpu' is critical for large models (Mixtral ~90GB
+    # fp16). Without it, `low_cpu_mem_usage=True` places weights on the first
+    # visible CUDA device by default → OOM before we can even replace linears.
+    if is_e11:
+        model = AutoModelForCausalLM.from_pretrained(
+            model_path, config=config, trust_remote_code=True,
+            torch_dtype=torch.float16, low_cpu_mem_usage=True,
+            device_map='cpu',
         )
+    else:
+        with torch.device("meta"):
+            model = AutoModelForCausalLM.from_config(
+                config, trust_remote_code=True, torch_dtype=torch.float16,
+            )
     model.seqlen = 4096
 
-    # 2. Load packed quantized weights
-    print("[GLoRCQ] Loading glorcq_model.pt ...")
-    model_data = torch.load(glorcq_model_path, map_location="cpu", weights_only=False)
-    model_config = model_data["model_config"]
-    layers_data = model_data["layers"]
+    if is_e11:
+        # ----- E11 path: build layers_data from cross_layer_info -----
+        cl_config       = cross_layer_info["config"]
+        shared_matrices = cross_layer_info["shared_matrices"]
+        per_expert_V    = cross_layer_info["per_expert_V"]
+        assignments     = cross_layer_info["assignments"]
+        vq_residuals    = cross_layer_info.get("vq_residuals", {})
+        attn_gptq_packs = cross_layer_info.get("attn_gptq_packs", {})
 
-    # 3. Load cross-layer info
-    print("[GLoRCQ] Loading cross_layer_info.pt ...")
-    cross_layer_info = torch.load(cross_layer_path, map_location="cpu", weights_only=False)
-    shared_matrices = cross_layer_info["shared_matrices"]
-    per_expert_V = cross_layer_info["per_expert_V"]
-    assignments = cross_layer_info["assignments"]
-    cl_config = cross_layer_info["config"]
+        # Container attr depends on MoE architecture (Qwen: `mlp`, Mixtral:
+        # `block_sparse_moe`). Look up from utils/moe_utils.
+        from utils.moe_utils import get_moe_config
+        expert_container = get_moe_config(config.model_type).get(
+            'expert_container') or 'mlp'
+
+        layers_data = {}
+        # Routing experts → vq4 packed
+        for wt in vq_residuals:
+            for entry, vq in zip(assignments[wt], vq_residuals[wt]):
+                if vq is None:
+                    continue
+                li, ei = entry['layer'], entry['expert']
+                mod_name = f"{expert_container}.experts.{ei}.{wt}"
+                layers_data.setdefault(li, {})[mod_name] = {
+                    "vq4_Q_rotated":     vq.get('Q_rotated'),
+                    "vq4_codes":         vq.get('codes'),
+                    "vq4_centroids":     vq['centroids'],
+                    "vq4_perm":          vq['perm'],
+                    "vq4_diag_signs":    vq['diag_signs'],
+                    "vq4_vdim":          vq['vdim'],
+                    "vq4_in_d":          vq['in_d'],
+                    "vq4_out_d":         vq['out_d'],
+                    "vq4_rotate_size":   vq.get('rotate_size', 256),
+                    "vq4_partial_size":  vq.get('partial_size', 256),
+                }
+        # Attention → GPTQ packed
+        for (li, an), packed in attn_gptq_packs.items():
+            layers_data.setdefault(li, {})[f"self_attn.{an}"] = packed
+
+        # Build model_config-like dict
+        model_config = {
+            "uv_bits": cl_config.get("u_bits", 8),
+            "u_bits":  cl_config.get("u_bits", 8),
+            "sv_bits": cl_config.get("sv_bits", 8),
+            "use_turboquant": False,
+            "method": "tileq_glorcq_e11",
+        }
+    else:
+        # 2. Load packed quantized weights
+        print("[GLoRCQ] Loading glorcq_model.pt ...")
+        model_data = torch.load(glorcq_model_path, map_location="cpu", weights_only=False)
+        model_config = model_data["model_config"]
+        layers_data = model_data["layers"]
+
+        # 3. Load cross-layer info
+        print("[GLoRCQ] Loading cross_layer_info.pt ...")
+        cross_layer_info = torch.load(cross_layer_path, map_location="cpu", weights_only=False)
+        shared_matrices = cross_layer_info["shared_matrices"]
+        per_expert_V    = cross_layer_info["per_expert_V"]
+        assignments     = cross_layer_info["assignments"]
+        cl_config       = cross_layer_info["config"]
 
     uv_bits = cl_config.get("uv_bits", model_config.get("uv_bits", 8))
     u_bits  = cl_config.get("u_bits",  uv_bits)
@@ -347,11 +468,18 @@ def _replace_linear_layers(model, layers_data, assignments, per_expert_V,
     """
     # _dequant_intN is defined at module level above
 
-    # Build lookup: (layer_idx, module_name) → assignment info
-    assignment_lookup = {}  # (wtype, layer_idx, expert_idx) → (group_id, local_idx)
+    # Build lookup: (norm_wtype, layer_idx, expert_idx) → (group_id, raw_wtype, local_idx)
+    # Downstream _load_lora_for_module normalizes wt keys via
+    #   {w1: gate_proj, w2: down_proj, w3: up_proj}
+    # so we key the lookup by the NORMALIZED name, while keeping the raw name
+    # (w1/w2/w3 or gate_proj/up_proj/down_proj) inside the tuple so that
+    # per_expert_V[raw_wtype] lookups still work.
+    _WT_NORMALIZE = {"w1": "gate_proj", "w2": "down_proj", "w3": "up_proj"}
+    assignment_lookup = {}
     for wtype, records in assignments.items():
+        norm_wt = _WT_NORMALIZE.get(wtype, wtype)
         for li, rec in enumerate(records):
-            key = (wtype, rec["layer"], rec["expert"])
+            key = (norm_wt, rec["layer"], rec["expert"])
             assignment_lookup[key] = (rec["group_id"], wtype, li)
 
     # Get model layers
@@ -379,7 +507,9 @@ def _replace_linear_layers(model, layers_data, assignments, per_expert_V,
             packed = layer_data[module_name]
 
             # Determine quant type
-            if "qweight_int" in packed:
+            if "vq4_Q_rotated" in packed or "vq4_codes" in packed:
+                quant_type = "vq4"
+            elif "qweight_int" in packed:
                 quant_type = "gptq"
             elif "packed_indices" in packed:
                 quant_type = "turbo"
@@ -398,11 +528,28 @@ def _replace_linear_layers(model, layers_data, assignments, per_expert_V,
                     out_f, in_f = packed["qweight_int"].shape
                 elif "weight_quant" in packed:
                     out_f, in_f = packed["weight_quant"].shape
+                elif "vq4_Q_rotated" in packed or "vq4_codes" in packed:
+                    in_f  = packed["vq4_in_d"]
+                    out_f = packed["vq4_out_d"]
 
             ql = GLoRCQLinear(in_f, out_f)
 
             # Load quantized weights
-            if quant_type == "gptq":
+            if quant_type == "vq4":
+                ql.load_vq4(
+                    Q_rotated=packed.get("vq4_Q_rotated"),
+                    codes=packed.get("vq4_codes"),
+                    centroids=packed["vq4_centroids"],
+                    perm=packed["vq4_perm"],
+                    diag_signs=packed["vq4_diag_signs"],
+                    vdim=packed["vq4_vdim"],
+                    in_d=packed["vq4_in_d"],
+                    out_d=packed["vq4_out_d"],
+                    rotate_size=packed.get("vq4_rotate_size", 256),
+                    partial_size=packed.get("vq4_partial_size", 256),
+                    device=device,
+                )
+            elif quant_type == "gptq":
                 ql.load_gptq(packed, device=device)
             elif quant_type == "turbo":
                 if rotation_cache is not None:
@@ -509,16 +656,17 @@ def _load_lora_for_module(ql, layer_idx, module_name, assignment_lookup,
     # Get per-expert SV (new format) or V+S (old format)
     if wtype_key in per_expert_V and per_expert_V[wtype_key][local_idx] is not None:
         v_data = per_expert_V[wtype_key][local_idx]
+        Sa = v_data["Sa"].to(device).half() if "Sa" in v_data else None
         if "SV_int4_packed" in v_data:
             # INT4 packed format: real 4-bit packing, 50% storage vs int8
             orig_rows = int(v_data["SV_orig_rows"].item())
             SV_int8 = _unpack_int4(v_data["SV_int4_packed"].to(device), orig_rows)
             SV = _dequant_intN(SV_int8, v_data["SV_scale"].to(device), 4).half()
-            ql.load_sv(U, SV, device=device)
+            ql.load_sv(U, SV, Sa=Sa, device=device)
         elif "SV_fp16" in v_data:
             # fp16 format: directly stored without quantization
             SV = v_data["SV_fp16"].to(device).half()
-            ql.load_sv(U, SV, device=device)
+            ql.load_sv(U, SV, Sa=Sa, device=device)
         elif "SV_int8" in v_data:
             # int8 (or other nbits stored in int8 container) format
             _sv_bits = sv_bits if sv_bits is not None else uv_bits
@@ -527,7 +675,7 @@ def _load_lora_for_module(ql, layer_idx, module_name, assignment_lookup,
                 v_data["SV_scale"].to(device),
                 _sv_bits,
             ).half()
-            ql.load_sv(U, SV, device=device)
+            ql.load_sv(U, SV, Sa=Sa, device=device)
         else:
             # Old format: V is stored separately; S is in u_cache
             V = _dequant_intN(
@@ -536,7 +684,7 @@ def _load_lora_for_module(ql, layer_idx, module_name, assignment_lookup,
                 uv_bits,
             ).half()
             S = S_shared
-            ql.load_lora(U, S, V, device=device)
+            ql.load_lora(U, S, V, Sa=Sa, device=device)
     else:
         return
 

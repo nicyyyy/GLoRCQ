@@ -12,7 +12,7 @@ import math
 import transformers
 import torch
 from utils import hadamard_utils
-# import fast_hadamard_transform
+import fast_hadamard_transform
 
 
 qtype = torch.float16

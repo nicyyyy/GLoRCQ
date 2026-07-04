@@ -39,6 +39,16 @@ setup(
                 "nvcc": _nvcc_flags,
             },
         ),
+        CUDAExtension(
+            name="_vq4_matmul_cuda",
+            sources=[
+                os.path.join(this_dir, "vq4_matmul.cu"),
+            ],
+            extra_compile_args={
+                "cxx": ["-O3"],
+                "nvcc": _nvcc_flags,
+            },
+        ),
     ],
     cmdclass={"build_ext": BuildExtension},
 )

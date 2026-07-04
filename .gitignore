@@ -21,3 +21,4 @@ thirdpart/
 # Misc
 .env
 *.tmp
+exp/*.pdf
