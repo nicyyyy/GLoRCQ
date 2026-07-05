@@ -51,7 +51,7 @@ uv pip install "torch==$TORCH_VER" --index-url https://download.pytorch.org/whl/
 
 echo ""
 echo "===== [$(date)] Install rest of deps ====="
-uv pip install "transformers==4.51.3" datasets accelerate peft huggingface_hub wheel packaging ninja 2>&1 | tail -3
+uv pip install "transformers==4.51.3" datasets accelerate peft huggingface_hub wheel packaging ninja sentencepiece protobuf 2>&1 | tail -3
 # fast-hadamard-transform: try wheel first, fall back to source, fall back to stub
 uv pip install fast-hadamard-transform --no-build-isolation 2>&1 | tail -3
 $PY -c "import fast_hadamard_transform" 2>/dev/null || {
