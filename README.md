@@ -8,6 +8,14 @@ layers, plain scalar GPTQ (4-bit, no LoRA) is applied.
 
 **Best result on Qwen1.5-MoE-A2.7B: PPL = 6.90 at ~3.47 effective bits**
 
+**Fair-bit results (2-bit + LoRA, Extra +0.16 bits matching TileQ, 2026-07-05):**
+
+| Model | Extra | PPL | vs TileQ | ZS avg | MMLU (5s) | Recipe |
+|---|---|---|---|---|---|---|
+| Qwen1.5-MoE-A2.7B | +0.1621 | **7.17** | WIN 0.39 vs TileQ_s 7.56 | 65.59% | 57.27% | `bash run_fair_qwen15.sh` |
+| Qwen3-30B-A3B | +0.1647 | **9.42** | WIN 0.68 vs TileQ_v 10.1 | 63.00% | 65.52% | `bash run_fair_qwen3.sh` |
+| Mixtral-8x7B-v0.1 | +0.1611 | **4.69** | WIN 0.29 vs TileQ_s 4.98 | 69.22% | 49.64% | `bash run_fair_mixtral.sh` |
+
 ## Quick Start
 
 ```bash
