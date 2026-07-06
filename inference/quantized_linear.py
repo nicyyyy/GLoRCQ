@@ -197,6 +197,35 @@ def _unpack_indices(packed, bits, d):
 
 
 # ---------------------------------------------------------------------------
+# Fp16LinearShim: fallback for experts whose quantization was skipped
+# ---------------------------------------------------------------------------
+class Fp16LinearShim(nn.Module):
+    """Passthrough for MoE-expert nn.Linear modules whose quant was skipped
+    at quant-time (max_err > threshold — typically Qwen3 down_proj with rank=16).
+
+    moe_block fast paths call ``expert.gate_proj(x, precomputed_xU=..., precomputed_x_rot=...)``
+    which plain nn.Linear rejects. This shim keeps the original fp16 weight and
+    accepts (ignores) the kwargs so mixed VQ4 + fp16 expert lists work uniformly.
+    Reports ``quant_type='fp16_passthrough'`` so callers can detect and dispatch.
+    """
+    quant_type = "fp16_passthrough"
+
+    def __init__(self, linear):
+        super().__init__()
+        w = linear.weight.data
+        self.weight = nn.Parameter(w, requires_grad=False)
+        if linear.bias is not None:
+            self.bias = nn.Parameter(linear.bias.data, requires_grad=False)
+        else:
+            self.register_parameter("bias", None)
+        self.in_features = linear.in_features
+        self.out_features = linear.out_features
+
+    def forward(self, x, **kwargs):
+        return torch.nn.functional.linear(x, self.weight, self.bias)
+
+
+# ---------------------------------------------------------------------------
 # GLoRCQLinear: quantized inference layer
 # ---------------------------------------------------------------------------
 class GLoRCQLinear(nn.Module):

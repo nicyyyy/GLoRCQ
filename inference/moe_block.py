@@ -1486,8 +1486,13 @@ class GraphCompatibleMoeBlock(nn.Module):
         kernel call (E experts each with their own input row and weight block).
         """
         # VQ4 experts: dispatch to vq4-specific graph forward.
-        e0 = self.experts[0]
-        if getattr(getattr(e0, 'gate_proj', None), 'quant_type', None) == 'vq4':
+        # Require ALL experts to be VQ4 — mixed VQ4 + fp16_passthrough (from
+        # quant-skipped experts) would crash the batched vq4 path.
+        all_vq4 = all(
+            getattr(getattr(e, 'gate_proj', None), 'quant_type', None) == 'vq4'
+            for e in self.experts
+        )
+        if all_vq4:
             return self._forward_graph_vq4(
                 hidden_states, routing_weights, selected_experts,
                 hidden_dim, xU_cache, rot_cache)

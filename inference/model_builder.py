@@ -500,8 +500,20 @@ def _replace_linear_layers(model, layers_data, assignments, per_expert_V,
 
         for module_name, (parent, attr_name, linear) in linear_modules.items():
             if module_name not in layer_data:
-                # Not a quantized module, move to device
-                setattr(parent, attr_name, _materialize_meta_module(linear, device))
+                # Two cases:
+                # (a) Non-quantized module (router, norm, etc.) — keep as-is.
+                # (b) Quantized MoE expert that was SKIPPED during quant (max_err
+                #     over threshold — e.g. Qwen3 down_proj rank=16 tripped 202
+                #     skips). Wrap in Fp16LinearShim so moe_block fast paths that
+                #     call ``expert.gate_proj(x, precomputed_xU=...)`` don't crash
+                #     with TypeError on the unrecognized kwarg.
+                from utils.moe_utils import is_regular_expert
+                materialized = _materialize_meta_module(linear, device)
+                if is_regular_expert(module_name):
+                    from inference.quantized_linear import Fp16LinearShim
+                    setattr(parent, attr_name, Fp16LinearShim(materialized))
+                else:
+                    setattr(parent, attr_name, materialized)
                 continue
 
             packed = layer_data[module_name]
