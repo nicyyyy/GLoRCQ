@@ -1485,6 +1485,18 @@ class GraphCompatibleMoeBlock(nn.Module):
         same input hidden_states).  Down now also uses a single grouped-GEMV
         kernel call (E experts each with their own input row and weight block).
         """
+        # Fp16LinearShim experts (quant skipped) don't have packed_indices /
+        # vq_codes — the batched graph paths would crash. Fall through to
+        # sparse forward which handles mixed dtype experts.
+        has_shim = any(
+            getattr(getattr(e, 'gate_proj', None), 'quant_type', None) == 'fp16_passthrough'
+            for e in self.experts
+        )
+        if has_shim:
+            return self._forward_sparse(
+                hidden_states, routing_weights, selected_experts,
+                hidden_dim, xU_cache, rot_cache)
+
         # VQ4 experts: dispatch to vq4-specific graph forward.
         # Require ALL experts to be VQ4 — mixed VQ4 + fp16_passthrough (from
         # quant-skipped experts) would crash the batched vq4 path.
