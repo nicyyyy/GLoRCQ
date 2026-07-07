@@ -61,20 +61,25 @@ def main():
         ).to(args.device)
         model.eval()
 
-    # Load tokenizer
-    # Try to get original model path from config
+    # Load tokenizer. Prefer the local model_path (fake/real quant ckpt dir usually
+    # ships tokenizer files) so this works on machines that don't have the original
+    # base model at the path stored in cross_layer_info.pt (quant-time recorded).
     try:
-        cross_layer_info = torch.load(
-            os.path.join(args.model_path, "cross_layer_info.pt"),
-            map_location="cpu", weights_only=False,
+        tokenizer = AutoTokenizer.from_pretrained(
+            args.model_path, use_fast=False, trust_remote_code=True,
         )
-        original_model = cross_layer_info["config"].get("model_path", args.model_path)
-    except (FileNotFoundError, KeyError):
-        original_model = args.model_path
-
-    tokenizer = AutoTokenizer.from_pretrained(
-        original_model, use_fast=False, trust_remote_code=True,
-    )
+    except Exception:
+        try:
+            cross_layer_info = torch.load(
+                os.path.join(args.model_path, "cross_layer_info.pt"),
+                map_location="cpu", weights_only=False,
+            )
+            original_model = cross_layer_info["config"].get("model_path", args.model_path)
+        except (FileNotFoundError, KeyError):
+            original_model = args.model_path
+        tokenizer = AutoTokenizer.from_pretrained(
+            original_model, use_fast=False, trust_remote_code=True,
+        )
 
     # Run benchmark
     from inference.graph_wrapper import run_speed_benchmark
