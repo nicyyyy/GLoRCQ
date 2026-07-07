@@ -416,7 +416,8 @@ def collect_phase1(model, layers, dataloader, nsamples, fix_rank, qbit, group_si
 # ---------------------------------------------------------------------------
 @torch.no_grad()
 def fill_phase2(WR, all_expert_recs, fix_rank, lora_bit, lora_iter, qbit,
-                G, quant_infos, wtypes, int8_lora=False, int8_lora_v=False):
+                G, quant_infos, wtypes, int8_lora=False, int8_lora_v=False,
+                max_err_threshold=60.0):
     """
     Group G routing experts of the same type from different layers.
     Stack their activation-scaled weights as (in_d, G*out_d) → shared SVD.
@@ -498,7 +499,7 @@ def fill_phase2(WR, all_expert_recs, fix_rank, lora_bit, lora_iter, qbit,
                 V_k  = Vh_all[:, k * out_d:(k + 1) * out_d]  # (srank, out_d)
                 Sa_k = r['Sa'].to(DEV).to(qtype)               # (in_d,)
 
-                # Sanity check: |(W - lora)|max < 60  (TileQ convention)
+                # Sanity check: |(W - lora)|max < max_err_threshold  (TileQ convention, default 60)
                 # lora_T = diag(Sa) @ U @ diag(Si) @ V, shape (in_d, out_d)
                 USiV = U_shared.float() @ torch.diag(Si.float()) @ V_k.float()  # (in_d, out_d)
                 lora_T = Sa_k.float().unsqueeze(1) * USiV                        # broadcast (in_d, out_d)
@@ -508,8 +509,8 @@ def fill_phase2(WR, all_expert_recs, fix_rank, lora_bit, lora_iter, qbit,
                 max_err = (W_orig_dev - lora).abs().max().item()
                 del lora_T, lora, W_orig_dev
 
-                if max_err > 60:
-                    print(f"    [WARN] {r['layer']}/{r['name']}: max_err={max_err:.1f} > 60, skip")
+                if max_err > max_err_threshold:
+                    print(f"    [WARN] {r['layer']}/{r['name']}: max_err={max_err:.1f} > {max_err_threshold:.1f}, skip")
                     WR[r['layer']][r['name']] = {'U': None}
                 else:
                     WR[r['layer']][r['name']] = {
@@ -997,7 +998,7 @@ def run_tileq_glorcq(model_path, output_path, qbit=2, fix_rank=32, G=128,
                      ha_bsize=256, id_bsize=256, use_cache=True, attn_bits=16,
                      phase1_cache_path=None, int8_lora=False, int8_lora_v=False,
                      export_real_quant=True, pool_kmeans=False,
-                     strip_fp16_quantized=False):
+                     strip_fp16_quantized=False, max_err_threshold=60.0):
     # ---- Load model ----
     config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
     config.use_cache = False
@@ -1032,6 +1033,7 @@ def run_tileq_glorcq(model_path, output_path, qbit=2, fix_rank=32, G=128,
     print(f"  model:      {model_path}")
     print(f"  output:     {output_path}")
     print(f"  qbit={qbit}  rank={fix_rank}  G={G}  lora_bit={lora_bit}  lora_iter={lora_iter}")
+    print(f"  max_err_threshold={max_err_threshold}  (Phase 2 shim skip cutoff)")
     print(f"  wtypes:     {wtypes}")
     print(f"  cache:      {phase1_cache} ({'hit' if (use_cache and os.path.exists(phase1_cache)) else 'miss'})")
     print("=" * 60)
@@ -1071,7 +1073,8 @@ def run_tileq_glorcq(model_path, output_path, qbit=2, fix_rank=32, G=128,
     # ---- Phase 2: cross-layer SVD ----
     print("\n[Phase 2] Cross-layer group sharing (G={}) ...".format(G), flush=True)
     fill_phase2(WR, all_expert_recs, fix_rank, lora_bit, lora_iter, qbit,
-                G, quant_infos, wtypes, int8_lora=int8_lora, int8_lora_v=int8_lora_v)
+                G, quant_infos, wtypes, int8_lora=int8_lora, int8_lora_v=int8_lora_v,
+                max_err_threshold=max_err_threshold)
     del all_expert_recs
     gc.collect()
     torch.cuda.empty_cache()
@@ -1188,6 +1191,10 @@ def parse_args():
                    help='Strip fp16 weights of quantized experts from safetensors after export '
                         '(saves ~85% checkpoint size; inference loader reconstructs from VQ codes). '
                         'Requires updated model_builder that handles missing tensors.')
+    p.add_argument('--max_err_threshold', type=float, default=60.0,
+                   help='Phase 2 shim skip threshold: if |W - lora|_max > threshold, expert '
+                        'is skipped and kept as Fp16LinearShim at inference. Pass "inf" to '
+                        'force all experts to VQ4 (no shim). Default 60.0 (TileQ convention).')
     return p.parse_args()
 
 
@@ -1212,4 +1219,5 @@ if __name__ == '__main__':
         export_real_quant = args.export_real_quant,
         pool_kmeans = args.pool_kmeans,
         strip_fp16_quantized = args.strip_fp16_quantized,
+        max_err_threshold = args.max_err_threshold,
     )
