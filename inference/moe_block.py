@@ -403,6 +403,37 @@ class GraphCompatibleMoeBlock(nn.Module):
             setattr(self, f'_vq4_{prefix}_cpcb', codes_per_row // n_cb)
             setattr(self, f'_vq4_{prefix}_vdim', vdim)
 
+            # ---- Fp16 shim (quant-skipped) experts: cache stacked weights ----
+            # These experts have vq_codes=None (Fp16LinearShim) and must contribute
+            # via a proper fp16 matmul, not zero-padding. Compute their output via
+            # batched bmm and scatter into y_all in _forward_graph_vq4. All indices
+            # are static → graph-safe.
+            fp16_idx_list = [ei for ei, p in enumerate(projs)
+                             if getattr(p, 'vq_codes', None) is None
+                             and getattr(p, 'weight', None) is not None]
+            if fp16_idx_list:
+                _dt_shim = projs[fp16_idx_list[0]].weight.dtype
+                fp16_weights = torch.stack(
+                    [projs[ei].weight.to(_dt_shim) for ei in fp16_idx_list], dim=0
+                ).contiguous()   # (num_fp16, out_d, in_d)
+                fp16_biases = None
+                if any(getattr(projs[ei], 'bias', None) is not None for ei in fp16_idx_list):
+                    fp16_biases = torch.stack([
+                        (projs[ei].bias if getattr(projs[ei], 'bias', None) is not None
+                         else torch.zeros(out_d, dtype=_dt_shim, device=_dev))
+                        for ei in fp16_idx_list
+                    ], dim=0).contiguous()   # (num_fp16, out_d)
+                fp16_idx = torch.tensor(fp16_idx_list, dtype=torch.long, device=_dev)
+                setattr(self, f'_fp16_indices_{prefix}',  fp16_idx)
+                setattr(self, f'_fp16_weights_{prefix}',  fp16_weights)
+                setattr(self, f'_fp16_biases_{prefix}',   fp16_biases)
+                setattr(self, f'_fp16_num_{prefix}', len(fp16_idx_list))
+            else:
+                setattr(self, f'_fp16_indices_{prefix}',  None)
+                setattr(self, f'_fp16_weights_{prefix}',  None)
+                setattr(self, f'_fp16_biases_{prefix}',   None)
+                setattr(self, f'_fp16_num_{prefix}', 0)
+
             # LoRA tensors (per-expert): Sa (in_d), U (in_d, rank), SV (out_d, rank)
             rank = None
             for p in projs:
@@ -1240,12 +1271,58 @@ class GraphCompatibleMoeBlock(nn.Module):
                 results[k] = results[k] + lora_outs[k]
         return results
 
+    def _apply_fp16_shim_override(self, y_all, x_input, prefix):
+        """Overlay fp16 matmul outputs onto vq4 y_all for quant-skipped experts.
+
+        Args:
+          y_all:   (N, E, out_d) — vq4 output with zeros at fp16 shim positions
+          x_input: input to project. For gate/up prefixes, shape is (N, in_d)
+                   (shared across experts). For 'down' it is (N, E, in_d) —
+                   each expert has its own input h_e.
+          prefix:  'gate' | 'up' | 'down'
+        Returns updated y_all (in-place index_copy).
+        """
+        num = getattr(self, f'_fp16_num_{prefix}', 0)
+        if num == 0:
+            return y_all
+        W = getattr(self, f'_fp16_weights_{prefix}')     # (num, out_d, in_d)
+        idx = getattr(self, f'_fp16_indices_{prefix}')    # (num,) long
+        b = getattr(self, f'_fp16_biases_{prefix}')       # (num, out_d) or None
+
+        y_dt = y_all.dtype
+        N = y_all.shape[0]
+        if prefix == 'down':
+            # x_input: (N, E, in_d) — pick shim experts' rows only
+            h_sel = x_input.index_select(1, idx).to(W.dtype)   # (N, num, in_d)
+            # (N, num, in_d) @ (num, in_d, out_d) via bmm on axis-permuted:
+            #   result[n, e, o] = sum_i h_sel[n, e, i] * W[e, o, i]
+            # bmm form: (num, N, in_d) @ (num, in_d, out_d) → (num, N, out_d)
+            fp16_out = torch.bmm(
+                h_sel.transpose(0, 1).contiguous(),          # (num, N, in_d)
+                W.transpose(1, 2)                             # (num, in_d, out_d)
+            ).transpose(0, 1).contiguous()                    # (N, num, out_d)
+        else:
+            # x_input: (N, in_d) — shared across experts
+            x_dt = x_input.to(W.dtype)                        # (N, in_d)
+            # y[n, e, o] = sum_i x[n, i] * W[e, o, i]
+            #            = x_dt @ W.transpose(1,2)   →  (N, num, out_d) via einsum
+            fp16_out = torch.einsum('ni,eoi->neo', x_dt, W)   # (N, num, out_d)
+        if b is not None:
+            fp16_out = fp16_out + b.unsqueeze(0)              # broadcast on N
+
+        # index_copy along expert dim (dim=1). Graph-safe: idx is a static buffer.
+        y_all.index_copy_(1, idx, fp16_out.to(y_dt))
+        return y_all
+
     def _forward_graph_vq4(self, hidden_states, routing_weights,
                             selected_experts, hidden_dim, xU_cache, rot_cache):
         """Graph-mode forward for VQ4 experts. All E experts execute on
         the full input; routing_weights scatter selects which contribute.
 
         Fixed-shape → CUDA Graph capture works.
+        Mixed vq4 + fp16-shim experts: vq4 kernel produces zeros for shim
+        positions; _apply_fp16_shim_override then overlays fp16 matmul output
+        at those positions using a batched bmm on static indices.
         """
         if not self._graph_cache_built:
             self._build_graph_cache_vq4()
@@ -1319,6 +1396,10 @@ class GraphCompatibleMoeBlock(nn.Module):
             ).transpose(0, 1)
         y_gate_all = y_gate_all + lora_gate
 
+        # fp16 shim override — quant-skipped experts contribute via fp16 matmul.
+        # x_h is the shared (unrotated) input across all experts.
+        y_gate_all = self._apply_fp16_shim_override(y_gate_all, x_h, 'gate')
+
         # ---- Up proj ---- (same input; reuse gate rotation if configs match)
         in_d_u = self._vq4_up_in_d
         if getattr(self, '_vq4_share_gate_up_rot', False):
@@ -1366,6 +1447,9 @@ class GraphCompatibleMoeBlock(nn.Module):
                 self._vq4_SV_T_up
             ).transpose(0, 1)
         y_up_all = y_up_all + lora_up
+
+        # fp16 shim override for up_proj (shared unrotated input x_h).
+        y_up_all = self._apply_fp16_shim_override(y_up_all, x_h, 'up')
 
         # ---- Activation ---- (fused SiLU * mul)
         h_all = silu_and_mul(y_gate_all, y_up_all)                # (N, E, inter_d)
@@ -1419,6 +1503,9 @@ class GraphCompatibleMoeBlock(nn.Module):
                 self._vq4_SV_T_down
             ).transpose(0, 1)
         y_down_all = y_down_all + lora_down
+
+        # fp16 shim override for down_proj — per-expert input h_all (unrotated).
+        y_down_all = self._apply_fp16_shim_override(y_down_all, h_all, 'down')
 
         # ---- Weighted accumulation ----
         # P2: gather selected experts (top_k, not E) and weighted-sum. Avoids
@@ -1485,26 +1572,14 @@ class GraphCompatibleMoeBlock(nn.Module):
         same input hidden_states).  Down now also uses a single grouped-GEMV
         kernel call (E experts each with their own input row and weight block).
         """
-        # Fp16LinearShim experts (quant skipped) don't have packed_indices /
-        # vq_codes — the batched graph paths would crash. Fall through to
-        # sparse forward which handles mixed dtype experts.
-        has_shim = any(
-            getattr(getattr(e, 'gate_proj', None), 'quant_type', None) == 'fp16_passthrough'
-            for e in self.experts
-        )
-        if has_shim:
-            return self._forward_sparse(
-                hidden_states, routing_weights, selected_experts,
-                hidden_dim, xU_cache, rot_cache)
-
-        # VQ4 experts: dispatch to vq4-specific graph forward.
-        # Require ALL experts to be VQ4 — mixed VQ4 + fp16_passthrough (from
-        # quant-skipped experts) would crash the batched vq4 path.
-        all_vq4 = all(
+        # VQ4 experts (possibly mixed with fp16-shim from quant-skipped
+        # experts): dispatch to vq4-specific graph forward. Its fp16-shim
+        # override path handles the mixed case in a graph-safe way.
+        any_vq4 = any(
             getattr(getattr(e, 'gate_proj', None), 'quant_type', None) == 'vq4'
             for e in self.experts
         )
-        if all_vq4:
+        if any_vq4:
             return self._forward_graph_vq4(
                 hidden_states, routing_weights, selected_experts,
                 hidden_dim, xU_cache, rot_cache)

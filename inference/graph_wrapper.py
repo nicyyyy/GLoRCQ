@@ -92,26 +92,13 @@ class GLoRCQGraphWrapper:
     def _set_moe_graph_mode(self, mode: bool):
         """Toggle graph_mode on all GraphCompatibleMoeBlock modules.
 
-        Blocks that contain any Fp16LinearShim expert (quant-skipped) cannot
-        run in graph_mode — the sparse fallback uses Python branching that
-        breaks CUDA Graph capture. Silently keep them in sparse mode.
+        Mixed vq4 + fp16-shim expert layers now handled by _forward_graph_vq4's
+        _apply_fp16_shim_override — everything runs graph-safe.
         """
         from .moe_block import GraphCompatibleMoeBlock
-        n_shim_blocks = 0
         for module in self.model.modules():
             if isinstance(module, GraphCompatibleMoeBlock):
-                has_shim = any(
-                    getattr(getattr(e, 'gate_proj', None), 'quant_type', None) == 'fp16_passthrough'
-                    for e in module.experts
-                )
-                if has_shim and mode:
-                    n_shim_blocks += 1
-                    module.graph_mode = False
-                else:
-                    module.graph_mode = mode
-        if n_shim_blocks > 0:
-            print(f"[GLoRCQ Graph] {n_shim_blocks} MoE blocks kept in sparse mode "
-                  f"(contain fp16_passthrough experts from quant-time skips).")
+                module.graph_mode = mode
 
     def capture_graph(self):
         """
@@ -122,21 +109,10 @@ class GLoRCQGraphWrapper:
           Step 1: Warmup (3 rounds to stabilize kernel selection)
           Step 2: Record graph
         """
-        # Detect Fp16LinearShim experts (quant-skipped) — their sparse fallback
-        # uses Python branching that breaks CUDA Graph capture. Skip capture.
-        from .moe_block import GraphCompatibleMoeBlock
-        for module in self.model.modules():
-            if isinstance(module, GraphCompatibleMoeBlock):
-                if any(
-                    getattr(getattr(e, 'gate_proj', None), 'quant_type', None) == 'fp16_passthrough'
-                    for e in module.experts
-                ):
-                    print("[GLoRCQ Graph] Skip capture: model contains fp16_passthrough "
-                          "experts (quant-skipped, e.g. Qwen3-30B down_proj rank<32) — "
-                          "sparse fallback is not CUDA-Graph-safe. Standard-mode inference "
-                          "still available.")
-                    self.graph = None
-                    return
+        # Fp16-shim experts are now handled by _forward_graph_vq4 via a
+        # graph-safe overlay path (see _apply_fp16_shim_override in moe_block).
+        # No need to skip capture — batched bmm on static indices is compatible
+        # with CUDA Graph.
         print(f"[GLoRCQ Graph] Capturing CUDA Graph "
               f"(batch_size={self.max_batch_size}) ...")
         self.model.eval()
