@@ -88,7 +88,10 @@ fi
 cd "$WORK"
 
 echo ""
+# Verify kernel import (need to cd into repo root; glorcq package has packages=[] in pyproject)
+cd "$GLORCQ_ROOT"
 $PY -c "from inference.kernels import is_vq4_cuda_available; print('vq4 kernel:', is_vq4_cuda_available())"
+cd "$WORK"
 
 echo ""
 echo "===== [$(date)] STEP 1 DONE ====="
