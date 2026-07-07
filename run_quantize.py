@@ -652,7 +652,7 @@ def gptq_attn_4bit(model, layers, dataloader, nsamples, attn_bits=4,
 # Real-quant export: dump U/SV/Sa to cross_layer_info.pt
 # ---------------------------------------------------------------------------
 @torch.no_grad()
-def _strip_fp16_quantized_weights(output_path, assignments, attn_gptq_packs):
+def _strip_fp16_quantized_weights(output_path, assignments, attn_gptq_packs, vq_residuals):
     """Remove fp16 weights for quantized layers from safetensors shards.
 
     This is the main storage win. Fake-quant save_pretrained writes full fp16
@@ -660,6 +660,11 @@ def _strip_fp16_quantized_weights(output_path, assignments, attn_gptq_packs):
     experts' fp16 weights are redundant — inference rebuilds them from
     cross_layer_info.pt's VQ codes / centroids / LoRA. Same for attention
     layers if attn_bits<16 (GPTQ int4 packed in attn_gptq_packs).
+
+    IMPORTANT: only strips layers that ACTUALLY got VQ-quantized. Experts
+    skipped by the max_err filter remain as fp16 `Fp16LinearShim` at inference
+    time and MUST keep their fp16 weight. Those live in `assignments` but
+    have `vq_residuals[wt][local_idx] is None` — we exclude those.
 
     On Qwen1.5-MoE-A2.7B: this drops safetensors from ~28 GB → ~1 GB.
     Total real-quant checkpoint size: ~32 GB → ~6 GB.
@@ -671,12 +676,16 @@ def _strip_fp16_quantized_weights(output_path, assignments, attn_gptq_packs):
     from safetensors.torch import safe_open, save_file
     from safetensors import safe_open as _safe_open_meta
 
-    # 1. Build set of param names to strip
+    # 1. Build set of param names to strip — ONLY layers that were actually
+    # VQ-quantized. Skipped experts (kept as Fp16LinearShim) MUST retain fp16.
     to_strip = set()
     for wt, records in assignments.items():
-        for r in records:
+        vq_list = vq_residuals.get(wt, [None] * len(records))
+        for local_idx, r in enumerate(records):
+            if local_idx >= len(vq_list) or vq_list[local_idx] is None:
+                # Skipped by max_err filter — kept as Fp16LinearShim, needs fp16 weight.
+                continue
             L, E = r['layer'], r['expert']
-            # Support both Qwen (`mlp.experts`) and Mixtral (`block_sparse_moe.experts`)
             for prefix in ('mlp.experts', 'block_sparse_moe.experts'):
                 to_strip.add(f"model.layers.{L}.{prefix}.{E}.{wt}.weight")
     for (L, an) in attn_gptq_packs.keys():
@@ -928,23 +937,13 @@ def _export_real_quant_pack(WR, output_path, model_path, *,
                         lin.gptvq_Q_rotated, lin.gptvq_centroids,
                         vdim, int(lin.weight.shape[1]),
                     )
-                # Bit-pack codes: 4-bit values (0-15) → 2 codes/byte for 2× disk win.
-                # Layout: packed[i, j] holds codes[i, 2j] in low nibble + codes[i, 2j+1] in high nibble.
-                # Marker `codes_packed=True` + original last-dim size stored for unpacking on load.
-                codes_u8 = codes.to(torch.uint8).contiguous()
-                out_d_c, n_vecs = codes_u8.shape
-                n_pad = n_vecs % 2
-                if n_pad:
-                    codes_u8 = torch.cat([codes_u8, torch.zeros(out_d_c, 1, dtype=torch.uint8)], dim=1)
-                lo = codes_u8[:, 0::2]
-                hi = codes_u8[:, 1::2]
-                codes_packed = (lo | (hi << 4)).to(torch.uint8)  # (out_d, ceil(n_vecs/2))
-
                 vq_residuals[wt][local] = {
                     # NOTE: `Q_rotated` intentionally omitted — redundant with codes+centroids
                     # (~25× larger than codes; kernel + Python fallback both work from codes).
-                    'codes_packed': codes_packed,                     # (out_d, ceil(n_vecs/2)) uint8, 4-bit pack
-                    'codes_n_vecs': n_vecs,                            # original last-dim (for unpack)
+                    # Codes NOT bit-packed: default codebook is K=256 (8-bit values), so each
+                    # code already fills a full uint8 byte. Packing at 4-bit lost half the bits
+                    # (verified via inspect: codes reduced to [0,15] after pack/unpack round-trip).
+                    'codes':         codes.to(torch.uint8),           # (out_d, in_d/vdim) uint8, 8-bit index
                     'centroids':     lin.gptvq_centroids,             # (n_blocks, K, vdim) fp16
                     'perm':          lin.gptvq_perm,                  # (in_d,) int32
                     'diag_signs':    lin.gptvq_diag_signs,            # (in_d,) fp16
@@ -976,8 +975,10 @@ def _export_real_quant_pack(WR, output_path, model_path, *,
         'attn_gptq_packs': attn_gptq_packs,
     }, out_path)
 
-    # Return assignments + attn_gptq_packs so caller can optionally strip fp16
-    return assignments, attn_gptq_packs
+    # Return assignments + vq_residuals + attn_gptq_packs so caller can optionally strip fp16.
+    # vq_residuals is critical: shim experts (max_err skip) have None entries and must
+    # NOT be stripped — the inference loader keeps them as Fp16LinearShim needing fp16.
+    return assignments, vq_residuals, attn_gptq_packs
 
     n_groups   = sum(len(g) for g in shared_matrices.values())
     n_experts  = sum(len(lst) for lst in per_expert_V.values())
@@ -1138,7 +1139,7 @@ def run_tileq_glorcq(model_path, output_path, qbit=2, fix_rank=32, G=128,
 
     if export_real_quant:
         print("\n[export] Building cross_layer_info.pt (int8 U/SV + Sa + vq_residuals) ...", flush=True)
-        assignments_out, attn_gptq_packs_out = _export_real_quant_pack(
+        assignments_out, vq_residuals_out, attn_gptq_packs_out = _export_real_quant_pack(
             WR, output_path, model_path,
             fix_rank=fix_rank, G=G, qbit=qbit,
             group_size=group_size, attn_bits=attn_bits,
@@ -1147,7 +1148,7 @@ def run_tileq_glorcq(model_path, output_path, qbit=2, fix_rank=32, G=128,
         )
         if strip_fp16_quantized:
             print("\n[strip] Removing fp16 weights for quantized experts from safetensors ...", flush=True)
-            _strip_fp16_quantized_weights(output_path, assignments_out, attn_gptq_packs_out)
+            _strip_fp16_quantized_weights(output_path, assignments_out, attn_gptq_packs_out, vq_residuals_out)
 
     print("✓ Done.")
 
