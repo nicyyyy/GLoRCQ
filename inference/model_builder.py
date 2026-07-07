@@ -299,6 +299,17 @@ def load_glorcq_model(model_path, device="cuda:0"):
     # fp16). Without it, `low_cpu_mem_usage=True` places weights on the first
     # visible CUDA device by default → OOM before we can even replace linears.
     if is_e11:
+        # If the checkpoint was saved with `--strip_fp16_quantized`, the safetensors
+        # only contain non-quantized params (embeddings, norms, router gates,
+        # attention when attn_bits=16, etc.). `from_pretrained` will still work —
+        # missing keys land in `missing_keys` and quantized-Linear weights stay at
+        # whatever `low_cpu_mem_usage` default-inits them to. They get overwritten
+        # by GLoRCQLinear in `_replace_linear_layers` below.
+        stripped_marker = os.path.join(model_path, ".stripped_real_quant")
+        is_stripped = os.path.exists(stripped_marker)
+        if is_stripped:
+            print(f"[GLoRCQ] Detected stripped real-quant checkpoint: fp16 weights for "
+                  f"quantized layers missing (will be reconstructed from cross_layer_info.pt)")
         model = AutoModelForCausalLM.from_pretrained(
             model_path, config=config, trust_remote_code=True,
             torch_dtype=torch.float16, low_cpu_mem_usage=True,
@@ -337,6 +348,8 @@ def load_glorcq_model(model_path, device="cuda:0"):
                 layers_data.setdefault(li, {})[mod_name] = {
                     "vq4_Q_rotated":     vq.get('Q_rotated'),
                     "vq4_codes":         vq.get('codes'),
+                    "vq4_codes_packed":  vq.get('codes_packed'),
+                    "vq4_codes_n_vecs":  vq.get('codes_n_vecs'),
                     "vq4_centroids":     vq['centroids'],
                     "vq4_perm":          vq['perm'],
                     "vq4_diag_signs":    vq['diag_signs'],
@@ -519,7 +532,7 @@ def _replace_linear_layers(model, layers_data, assignments, per_expert_V,
             packed = layer_data[module_name]
 
             # Determine quant type
-            if "vq4_Q_rotated" in packed or "vq4_codes" in packed:
+            if "vq4_Q_rotated" in packed or "vq4_codes" in packed or "vq4_codes_packed" in packed:
                 quant_type = "vq4"
             elif "qweight_int" in packed:
                 quant_type = "gptq"
@@ -540,7 +553,7 @@ def _replace_linear_layers(model, layers_data, assignments, per_expert_V,
                     out_f, in_f = packed["qweight_int"].shape
                 elif "weight_quant" in packed:
                     out_f, in_f = packed["weight_quant"].shape
-                elif "vq4_Q_rotated" in packed or "vq4_codes" in packed:
+                elif "vq4_Q_rotated" in packed or "vq4_codes" in packed or "vq4_codes_packed" in packed:
                     in_f  = packed["vq4_in_d"]
                     out_f = packed["vq4_out_d"]
 
@@ -551,6 +564,8 @@ def _replace_linear_layers(model, layers_data, assignments, per_expert_V,
                 ql.load_vq4(
                     Q_rotated=packed.get("vq4_Q_rotated"),
                     codes=packed.get("vq4_codes"),
+                    codes_packed=packed.get("vq4_codes_packed"),
+                    codes_n_vecs=packed.get("vq4_codes_n_vecs"),
                     centroids=packed["vq4_centroids"],
                     perm=packed["vq4_perm"],
                     diag_signs=packed["vq4_diag_signs"],

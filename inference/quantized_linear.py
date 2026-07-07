@@ -385,7 +385,7 @@ class GLoRCQLinear(nn.Module):
 
     def load_vq4(self, *, Q_rotated=None, centroids=None, perm, diag_signs, vdim,
                  in_d, out_d, rotate_size=256, partial_size=256,
-                 codes=None,
+                 codes=None, codes_packed=None, codes_n_vecs=None,
                  device="cuda"):
         """Load vdim=4 group-shared VQ residual weights.
 
@@ -401,6 +401,21 @@ class GLoRCQLinear(nn.Module):
         across all experts with the same (in_d, rotate_size, partial_size).
         """
         self.quant_type = "vq4"
+        # Unpack 4-bit codes if the checkpoint shipped packed form (2 codes/byte).
+        # codes_packed shape: (out_d, ceil(n_vecs/2)) uint8. Reconstruct by
+        # splitting low/high nibble; drop trailing pad if n_vecs was odd.
+        if codes is None and codes_packed is not None:
+            cp = codes_packed
+            lo = (cp & 0xF).to(torch.uint8)
+            hi = ((cp >> 4) & 0xF).to(torch.uint8)
+            # Interleave lo (even positions) and hi (odd positions).
+            out_d_c, n_half = cp.shape
+            codes = torch.empty(out_d_c, n_half * 2, dtype=torch.uint8, device=cp.device)
+            codes[:, 0::2] = lo
+            codes[:, 1::2] = hi
+            if codes_n_vecs is not None and codes_n_vecs < codes.shape[1]:
+                codes = codes[:, :codes_n_vecs].contiguous()
+
         # DERIVE codes from Q_rotated + centroids IF codes not shipped in the
         # checkpoint. Older cross_layer_info.pt files only store Q_rotated (fp16
         # (out_d, in_d), ~117 MB per Mixtral expert × 768 = ~90 GB HBM if uploaded).

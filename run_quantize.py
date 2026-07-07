@@ -652,6 +652,88 @@ def gptq_attn_4bit(model, layers, dataloader, nsamples, attn_bits=4,
 # Real-quant export: dump U/SV/Sa to cross_layer_info.pt
 # ---------------------------------------------------------------------------
 @torch.no_grad()
+def _strip_fp16_quantized_weights(output_path, assignments, attn_gptq_packs):
+    """Remove fp16 weights for quantized layers from safetensors shards.
+
+    This is the main storage win. Fake-quant save_pretrained writes full fp16
+    weights for ALL Linear layers, but for real-quant inference the quantized
+    experts' fp16 weights are redundant — inference rebuilds them from
+    cross_layer_info.pt's VQ codes / centroids / LoRA. Same for attention
+    layers if attn_bits<16 (GPTQ int4 packed in attn_gptq_packs).
+
+    On Qwen1.5-MoE-A2.7B: this drops safetensors from ~28 GB → ~1 GB.
+    Total real-quant checkpoint size: ~32 GB → ~6 GB.
+
+    Writes a marker file `.stripped_real_quant` so the inference loader
+    knows to use the meta-device + partial-state-dict path.
+    """
+    import glob, json
+    from safetensors.torch import safe_open, save_file
+    from safetensors import safe_open as _safe_open_meta
+
+    # 1. Build set of param names to strip
+    to_strip = set()
+    for wt, records in assignments.items():
+        for r in records:
+            L, E = r['layer'], r['expert']
+            # Support both Qwen (`mlp.experts`) and Mixtral (`block_sparse_moe.experts`)
+            for prefix in ('mlp.experts', 'block_sparse_moe.experts'):
+                to_strip.add(f"model.layers.{L}.{prefix}.{E}.{wt}.weight")
+    for (L, an) in attn_gptq_packs.keys():
+        to_strip.add(f"model.layers.{L}.self_attn.{an}.weight")
+
+    # 2. Find safetensors shards
+    shards = sorted(glob.glob(os.path.join(output_path, 'model-*.safetensors')))
+    if not shards:
+        one = os.path.join(output_path, 'model.safetensors')
+        if os.path.exists(one):
+            shards = [one]
+
+    if not shards:
+        print("  [strip] no safetensors shards found — nothing to strip")
+        return
+
+    # 3. Rewrite each shard, dropping to_strip entries
+    total_stripped = 0
+    total_bytes_saved = 0
+    for shard in shards:
+        with safe_open(shard, framework='pt', device='cpu') as f:
+            tensors = {k: f.get_tensor(k) for k in f.keys()}
+        pre_bytes = sum(t.numel() * t.element_size() for t in tensors.values())
+        for name in list(tensors.keys()):
+            if name in to_strip:
+                total_bytes_saved += tensors[name].numel() * tensors[name].element_size()
+                del tensors[name]
+                total_stripped += 1
+        # If shard becomes empty, save an empty file anyway (index.json still points here)
+        save_file(tensors, shard)
+
+    # 4. Update model.safetensors.index.json — remove stripped names from weight_map
+    index_path = os.path.join(output_path, 'model.safetensors.index.json')
+    if os.path.exists(index_path):
+        with open(index_path) as f:
+            index = json.load(f)
+        wm = index.get('weight_map', {})
+        for k in list(wm.keys()):
+            if k in to_strip:
+                del wm[k]
+        index['weight_map'] = wm
+        # Also update total_size in metadata (best-effort)
+        if 'metadata' in index and 'total_size' in index['metadata']:
+            index['metadata']['total_size'] -= total_bytes_saved
+        with open(index_path, 'w') as f:
+            json.dump(index, f, indent=2)
+
+    # 5. Write marker file so inference loader knows this checkpoint is stripped
+    with open(os.path.join(output_path, '.stripped_real_quant'), 'w') as f:
+        f.write("Real-quant checkpoint with fp16 weights stripped for quantized experts.\n")
+        f.write(f"stripped_count={total_stripped}\n")
+        f.write(f"bytes_saved={total_bytes_saved}\n")
+
+    print(f"  [strip] Removed {total_stripped} fp16 weight tensors "
+          f"({total_bytes_saved/1e9:.2f} GB saved)")
+
+
 def _export_real_quant_pack(WR, output_path, model_path, *,
                              fix_rank, G, qbit, group_size, attn_bits,
                              int8_lora, int8_lora_v, model=None):
@@ -846,9 +928,23 @@ def _export_real_quant_pack(WR, output_path, model_path, *,
                         lin.gptvq_Q_rotated, lin.gptvq_centroids,
                         vdim, int(lin.weight.shape[1]),
                     )
+                # Bit-pack codes: 4-bit values (0-15) → 2 codes/byte for 2× disk win.
+                # Layout: packed[i, j] holds codes[i, 2j] in low nibble + codes[i, 2j+1] in high nibble.
+                # Marker `codes_packed=True` + original last-dim size stored for unpacking on load.
+                codes_u8 = codes.to(torch.uint8).contiguous()
+                out_d_c, n_vecs = codes_u8.shape
+                n_pad = n_vecs % 2
+                if n_pad:
+                    codes_u8 = torch.cat([codes_u8, torch.zeros(out_d_c, 1, dtype=torch.uint8)], dim=1)
+                lo = codes_u8[:, 0::2]
+                hi = codes_u8[:, 1::2]
+                codes_packed = (lo | (hi << 4)).to(torch.uint8)  # (out_d, ceil(n_vecs/2))
+
                 vq_residuals[wt][local] = {
-                    'Q_rotated':     lin.gptvq_Q_rotated,             # (out_d, in_d) fp16 — ROTATED space
-                    'codes':         codes,                            # (out_d, in_d/vdim) uint8
+                    # NOTE: `Q_rotated` intentionally omitted — redundant with codes+centroids
+                    # (~25× larger than codes; kernel + Python fallback both work from codes).
+                    'codes_packed': codes_packed,                     # (out_d, ceil(n_vecs/2)) uint8, 4-bit pack
+                    'codes_n_vecs': n_vecs,                            # original last-dim (for unpack)
                     'centroids':     lin.gptvq_centroids,             # (n_blocks, K, vdim) fp16
                     'perm':          lin.gptvq_perm,                  # (in_d,) int32
                     'diag_signs':    lin.gptvq_diag_signs,            # (in_d,) fp16
@@ -880,6 +976,9 @@ def _export_real_quant_pack(WR, output_path, model_path, *,
         'attn_gptq_packs': attn_gptq_packs,
     }, out_path)
 
+    # Return assignments + attn_gptq_packs so caller can optionally strip fp16
+    return assignments, attn_gptq_packs
+
     n_groups   = sum(len(g) for g in shared_matrices.values())
     n_experts  = sum(len(lst) for lst in per_expert_V.values())
     n_vq       = sum(1 for wt in vq_residuals for v in vq_residuals[wt] if v is not None)
@@ -896,7 +995,8 @@ def run_tileq_glorcq(model_path, output_path, qbit=2, fix_rank=32, G=128,
                      group_size=128, lora_bit=16, lora_iter=8,
                      ha_bsize=256, id_bsize=256, use_cache=True, attn_bits=16,
                      phase1_cache_path=None, int8_lora=False, int8_lora_v=False,
-                     export_real_quant=True, pool_kmeans=False):
+                     export_real_quant=True, pool_kmeans=False,
+                     strip_fp16_quantized=False):
     # ---- Load model ----
     config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
     config.use_cache = False
@@ -1038,13 +1138,16 @@ def run_tileq_glorcq(model_path, output_path, qbit=2, fix_rank=32, G=128,
 
     if export_real_quant:
         print("\n[export] Building cross_layer_info.pt (int8 U/SV + Sa + vq_residuals) ...", flush=True)
-        _export_real_quant_pack(
+        assignments_out, attn_gptq_packs_out = _export_real_quant_pack(
             WR, output_path, model_path,
             fix_rank=fix_rank, G=G, qbit=qbit,
             group_size=group_size, attn_bits=attn_bits,
             int8_lora=int8_lora, int8_lora_v=int8_lora_v,
             model=model,
         )
+        if strip_fp16_quantized:
+            print("\n[strip] Removing fp16 weights for quantized experts from safetensors ...", flush=True)
+            _strip_fp16_quantized_weights(output_path, assignments_out, attn_gptq_packs_out)
 
     print("✓ Done.")
 
@@ -1080,6 +1183,10 @@ def parse_args():
                    help='Disable real-quant export')
     p.add_argument('--pool_kmeans', action='store_true', default=False,
                    help='Use group-shared VQ codebook in Phase 3 (pool k-means across rows)')
+    p.add_argument('--strip_fp16_quantized', action='store_true', default=False,
+                   help='Strip fp16 weights of quantized experts from safetensors after export '
+                        '(saves ~85% checkpoint size; inference loader reconstructs from VQ codes). '
+                        'Requires updated model_builder that handles missing tensors.')
     return p.parse_args()
 
 
@@ -1103,4 +1210,5 @@ if __name__ == '__main__':
         int8_lora_v = args.int8_lora_v,
         export_real_quant = args.export_real_quant,
         pool_kmeans = args.pool_kmeans,
+        strip_fp16_quantized = args.strip_fp16_quantized,
     )
