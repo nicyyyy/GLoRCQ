@@ -417,11 +417,20 @@ def collect_phase1(model, layers, dataloader, nsamples, fix_rank, qbit, group_si
 @torch.no_grad()
 def fill_phase2(WR, all_expert_recs, fix_rank, lora_bit, lora_iter, qbit,
                 G, quant_infos, wtypes, int8_lora=False, int8_lora_v=False,
-                max_err_threshold=60.0):
+                max_err_threshold=60.0, cluster_method='traversal',
+                cluster_recon_weight=0.0, cluster_seed=42, cluster_rank=None):
     """
     Group G routing experts of the same type from different layers.
     Stack their activation-scaled weights as (in_d, G*out_d) → shared SVD.
     Fill WR[layer][name] = {U: shared, V: per-expert, Si: shared, Sa: per-expert}.
+
+    Grouping metric (`cluster_method`):
+      - 'traversal' (default): flat slice of collect order; behavior unchanged
+        from prior HEAD. Same-group experts are consecutive in insertion order.
+      - 'grassmannian': subspace-distance spectral clustering. Same-group experts
+        share high overlap in the top-r singular subspace of activation-scaled W.
+        Attention wtypes are ignored (this pipeline routes attn through
+        `gptq_attn_4bit`, not through fill_phase2).
     """
     # Separate by weight type
     type_to_recs = defaultdict(list)
@@ -430,6 +439,81 @@ def fill_phase2(WR, all_expert_recs, fix_rank, lora_bit, lora_iter, qbit,
             if wt in r['name']:
                 type_to_recs[wt].append(r)
                 break
+
+    # Optional Grassmannian reordering: reorder each type_to_recs[wt] so that
+    # a slice of size G contains members of the same cluster.
+    #
+    # HEAD's Phase 2 uses G as the SVD-group size (# experts per shared U),
+    # not # clusters. We therefore ask cluster_residuals for
+    #     n_clusters = ceil(n_total / G)
+    # so that each cluster is roughly G experts, and consecutive slices of
+    # size G after argsort(labels) land in the same cluster (up to spectral
+    # imbalance, which we accept as an approximation).
+    if cluster_method == 'grassmannian':
+        try:
+            from cross_layer_share import cluster_residuals
+        except ImportError as e:
+            raise RuntimeError(
+                "cluster_method='grassmannian' requires cross_layer_share.py "
+                "at repo root; got ImportError: " + str(e))
+
+        print(f"\n[Phase 2 pre] cluster_method=grassmannian "
+              f"(recon_weight={cluster_recon_weight}, seed={cluster_seed})", flush=True)
+
+        # Number of clusters per wtype = ceil(N_wtype / G). All MoE wtypes share
+        # the same N here (one entry per expert per layer per wtype), so a single
+        # value is fine.
+        wt_order = list(wtypes)
+        n_per_wtype = max((len(type_to_recs[wt]) for wt in wt_order), default=0)
+        n_clusters = max(1, (n_per_wtype + G - 1) // G)
+        print(f"[Phase 2 pre] target n_clusters per wtype = "
+              f"ceil({n_per_wtype}/{G}) = {n_clusters}", flush=True)
+
+        # Auto-fallback: Grassmannian needs enough clusters to be discriminative.
+        # Empirically Mixtral-8x7B (256 experts, 4 clusters at G=64) degrades PPL
+        # by +1.3 vs traversal because each cluster absorbs too many heterogeneous
+        # experts. Fall back to traversal when n_clusters is too small.
+        _GRASS_MIN_CLUSTERS = 8
+        _grass_ok = (n_clusters >= _GRASS_MIN_CLUSTERS)
+        if not _grass_ok:
+            print(f"[Phase 2 pre] AUTO-FALLBACK to traversal: n_clusters={n_clusters} "
+                  f"< {_GRASS_MIN_CLUSTERS} (Grassmannian too coarse for this "
+                  f"expert count; small MoE like Mixtral).", flush=True)
+            cluster_method = 'traversal'
+
+        if _grass_ok:
+            all_residuals = []
+            for wt in wt_order:
+                for r in type_to_recs[wt]:
+                    all_residuals.append({
+                        'type': wt,
+                        'weight_orig': r['W_orig'],
+                        '_act_scale_cpu': r['scales'],
+                        'hessian_diag': None,
+                    })
+
+            _cluster_rank_eff = cluster_rank if cluster_rank is not None else fix_rank
+            print(f"[Phase 2 pre] clustering rank = {_cluster_rank_eff} "
+                  f"(fix_rank={fix_rank})", flush=True)
+            assignments, _wtype_indices = cluster_residuals(
+                all_residuals, rank=fix_rank,
+                G_moe=n_clusters, G_attn=n_clusters,
+                seed=cluster_seed, share_attn=False,
+                hessian_svd=False, recon_weight=cluster_recon_weight,
+                rank_cluster=_cluster_rank_eff,
+                cluster_on_original=True,
+            )
+
+            # Reorder each type_to_recs[wt] by group label (stable) so consecutive
+            # slices of size G land in the same cluster.
+            import numpy as _np
+            for wt in wt_order:
+                if wt not in assignments:
+                    continue
+                labels = assignments[wt]
+                order  = _np.argsort(labels, kind='stable')
+                type_to_recs[wt] = [type_to_recs[wt][int(i)] for i in order]
+            print("[Phase 2 pre] cluster_residuals done; type_to_recs reordered.\n", flush=True)
 
     for wtype, recs in type_to_recs.items():
         if not recs:
@@ -998,7 +1082,9 @@ def run_tileq_glorcq(model_path, output_path, qbit=2, fix_rank=32, G=128,
                      ha_bsize=256, id_bsize=256, use_cache=True, attn_bits=16,
                      phase1_cache_path=None, int8_lora=False, int8_lora_v=False,
                      export_real_quant=True, pool_kmeans=False,
-                     strip_fp16_quantized=False, max_err_threshold=60.0):
+                     strip_fp16_quantized=False, max_err_threshold=60.0,
+                     cluster_method='traversal', cluster_recon_weight=0.0,
+                     cluster_seed=42, cluster_rank=None):
     # ---- Load model ----
     config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
     config.use_cache = False
@@ -1074,7 +1160,11 @@ def run_tileq_glorcq(model_path, output_path, qbit=2, fix_rank=32, G=128,
     print("\n[Phase 2] Cross-layer group sharing (G={}) ...".format(G), flush=True)
     fill_phase2(WR, all_expert_recs, fix_rank, lora_bit, lora_iter, qbit,
                 G, quant_infos, wtypes, int8_lora=int8_lora, int8_lora_v=int8_lora_v,
-                max_err_threshold=max_err_threshold)
+                max_err_threshold=max_err_threshold,
+                cluster_method=cluster_method,
+                cluster_recon_weight=cluster_recon_weight,
+                cluster_seed=cluster_seed,
+                cluster_rank=cluster_rank)
     del all_expert_recs
     gc.collect()
     torch.cuda.empty_cache()
@@ -1195,6 +1285,21 @@ def parse_args():
                    help='Phase 2 shim skip threshold: if |W - lora|_max > threshold, expert '
                         'is skipped and kept as Fp16LinearShim at inference. Pass "inf" to '
                         'force all experts to VQ4 (no shim). Default 60.0 (TileQ convention).')
+    p.add_argument('--cluster_method', type=str, default='traversal',
+                   choices=['traversal', 'grassmannian'],
+                   help='Phase 2 expert grouping metric. "traversal" (default) is a flat '
+                        'slice of collect order (byte-identical to prior HEAD). "grassmannian" '
+                        'runs spectral clustering on the top-r singular subspaces of '
+                        'activation-scaled expert weights before Phase 2 SVD.')
+    p.add_argument('--cluster_recon_weight', type=float, default=0.0,
+                   help='Weight alpha in [0,1] for cross-reconstruction distance in the '
+                        'clustering metric: D = (1-alpha)*D_grass + alpha*D_recon. '
+                        'Only used when --cluster_method grassmannian. Default 0 (pure Grassmannian).')
+    p.add_argument('--cluster_seed', type=int, default=42,
+                   help='Random seed for spectral clustering (only used with --cluster_method grassmannian).')
+    p.add_argument('--cluster_rank', type=int, default=0,
+                   help='Rank used for computing SVD-basis subspace in Grassmannian distance. '
+                        '0 = fall back to --fix_rank (default). Old SOTA used 32.')
     return p.parse_args()
 
 
@@ -1220,4 +1325,8 @@ if __name__ == '__main__':
         pool_kmeans = args.pool_kmeans,
         strip_fp16_quantized = args.strip_fp16_quantized,
         max_err_threshold = args.max_err_threshold,
+        cluster_method = args.cluster_method,
+        cluster_recon_weight = args.cluster_recon_weight,
+        cluster_seed = args.cluster_seed,
+        cluster_rank = args.cluster_rank if args.cluster_rank > 0 else None,
     )
