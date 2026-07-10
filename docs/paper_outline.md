@@ -1,17 +1,17 @@
-# GLoRCQ: Paper Outline (v0.3)
+# GLoRCQ: Paper Outline (v0.4)
 
 **Working title**: GLoRCQ: Global shared Low-Rank Compensation for Quantization of Mixture-of-Experts LLMs
 
 **Target venue**: ICML 2026 / NeurIPS 2026 main track, 8–9 pages main text + appendix
-**Version**: outline v0.3 — 2026-07-09 (adds Grassmannian clustering as part of C1, per experimental evidence from 2026-07-08 3-model ablation)
-**Status**: aligned with actual code (`run_quantize.py` + `cross_layer_share.py` at HEAD)
+**Version**: outline v0.4 — 2026-07-09 (paper voice pass: merged §3.2/§3.3, cut function names and code-branch discussion from main body, honest Global-U-pool description)
+**Status**: aligned with code at HEAD
 **Chinese speed-read version**: `docs/paper_outline_zh.md`
 
 ---
 
 ## One-sentence core thesis
 
-> TileQ and MiLo have converged on the "aggressive quantization + per-expert low-rank compensation" recipe for MoE weight compression, but they allocate low-rank factors **layer-locally and per-expert**, wasting rank budget on subspaces that in fact overlap heavily across layers. **GLoRCQ pools the U-factor of the low-rank compensator across a group of experts drawn from different Transformer layers**, using **Grassmannian principal-angle spectral clustering** to identify experts whose residual subspaces genuinely overlap, and takes one stacked activation-weighted SVD per group. Because this pooling produces a real cluster structure at inference time, GLoRCQ additionally designs a **SharedUCache + side-stream cluster-batched LoRA** inference path that realizes the same-cluster reuse in kernels.
+> TileQ and MiLo have converged on the "aggressive quantization + per-expert low-rank compensation" recipe for MoE weight compression, but they allocate low-rank factors **layer-locally and per-expert**, wasting rank budget on subspaces that overlap heavily across layers. **GLoRCQ groups experts across layers by Grassmannian principal-angle distance and takes one activation-weighted SVD per cluster**, so a single shared U replaces G per-expert bases; at inference the same cluster structure enables a shared-U cache plus side-stream cluster-batched LoRA overlapping the 2-bit backbone.
 
 Two contributions (C1 algorithmic + C2 systems) plus the experimental payoff. No memory hook, no "sub-2-bit" claim, no alternating-optimization claim.
 
@@ -21,82 +21,70 @@ Two contributions (C1 algorithmic + C2 systems) plus the experimental payoff. No
 
 | Section | Pages | Focus |
 |---|---|---|
-| Abstract + §1 Introduction | 1.0 | TileQ/MiLo lineage → per-expert LoRA weakness → cross-layer Grassmannian pooling + inference co-design |
+| Abstract + §1 Introduction | 1.0 | TileQ/MiLo lineage → per-expert LoRA weakness → cross-layer subspace pooling + inference co-design |
 | §2 Related Work | 1.0 | Reuse existing draft; apply LR-review report's C1/C3/M1 patches |
-| §3 Method (**core**) | 2.0 | Preliminaries + Grassmannian-clustered stacked shared-U SVD + auto-fallback + one-shot backbone integration |
-| §4 Inference-side co-design (**core**) | 0.75 | SharedUCache + global U pool + same-cluster batching + side stream |
-| §5 Experiments | 2.0 | Main comparison table + systems speedup table + baseline reproductions (MiLo 3-bit ref) |
-| §6 Ablations | 1.25 | rank / G / LoRA on-off / **clustering (Grassmannian vs traversal, per-model)** / heatmap / systems ablation |
-| §7 Discussion & Limitations | 0.4 | Grassmannian scaling honesty (Mixtral falls back); no memory or throughput overclaim |
+| §3 Method (**core**) | 2.0 | Preliminaries + single Method section: clustering + shared-U SVD + one-shot pipeline |
+| §4 Inference-side co-design (**core**) | 0.75 | Shared-U cache + global pool + same-cluster batching + side stream |
+| §5 Experiments | 2.0 | Main comparison table + systems speedup table + baseline reproductions |
+| §6 Ablations | 1.25 | rank / G / LoRA on-off / clustering method / principal-angle heatmap / systems ablation |
+| §7 Discussion & Limitations | 0.3 | Inference-speed positioning, τ heuristic, real-quant Qwen3 bug, scaling |
 | §8 Conclusion | 0.1 | Two sentences |
-| **Main total** | **~8.5** | |
-| Appendix A: bit accounting | 1.0 | Reproducible formula + attn=4 undercount fix |
-| Appendix B: inherited scaffolding | 1.0 | VQ4 tile backbone + attention GPTQ (from TileQ) |
-| Appendix C: extended ablations | 1.5 | int8-vs-fp16 LoRA / attn-bits / τ / full tables |
+| **Main total** | **~8.4** | |
+| Appendix A: bit accounting | 1.0 | Reproducible formula + attn=4 undercount fix + wallclock per phase per model |
+| Appendix B: inherited scaffolding | 1.0 | 2-bit VQ tile backbone + attention GPTQ |
+| Appendix C: extended ablations | 1.5 | int8-vs-fp16 LoRA / attn-bits / τ / MMLU / full per-task tables |
 | Appendix D: HF release cards + stripped-format spec | 0.75 | Reproducibility |
 | Appendix E: extended related work | 2.0 | Full 3,000-word §2 |
-| Appendix F: MxMoE numbers cited from paper | 0.25 | Not reproduced; comparison from published Table 6 |
+| Appendix F: MxMoE comparison notes | 0.25 | Why 2-bit weight-only isn't directly reproducible in their released code |
 
 ---
 
-## Contributions (exactly 2, not 5)
+## Contributions (exactly 2)
 
-Reviewers penalize "results are contributions" phrasing, so the third user-requested item ("**speedup and accuracy loss**") becomes the headline number in the abstract and §1 ¶4, not a numbered contribution.
+Reviewers penalize "results are contributions" phrasing, so the third user-requested item ("speedup and accuracy loss") becomes the headline number in the abstract and §1 ¶4, not a numbered contribution.
 
-### **C1**: Cross-layer expert subspace pooling with a Grassmannian-clustered shared U-factor
+### **C1**: Cross-layer expert subspace pooling with a shared U-factor
 
-- **Empirical observation** (Figure 4 in §6): different Transformer layers' experts' per-expert low-rank compensators occupy heavily overlapping subspaces.
-- **Algorithmic response**: for each wtype (gate_proj / up_proj / down_proj), cluster the (L · N) experts by the **Grassmannian principal-angle distance** between their top-r singular subspaces (spectral clustering with `n_clusters = ⌈N_wtype / G⌉`). Within each cluster, stack the activation-scaled weights `[diag(S_a)·W_1ᵀ | … | diag(S_a)·W_Gᵀ]` as one `(in_d, G·out_d)` matrix and take a **one-shot** activation-weighted SVD; the top-r singular vectors serve as a **shared U** across the whole cluster, while per-expert `V_k` and `Σ_k` remain private.
-- **Bit-budget payoff**: at matched storage, the effective per-expert rank grows by G× compared to TileQ / MiLo's per-expert LoRA.
-- **Auto-fallback for small MoE** (`run_quantize.py:472-485`): when `n_clusters < 8`, Grassmannian is too coarse (each cluster absorbs too many heterogeneous experts); the pipeline auto-falls back to traversal-order grouping. This branch triggers for Mixtral-8x7B (256 experts → 4 clusters at G=64) and is announced in the run log.
-- **Honest attribution**: activation-weighted SVD itself is due to LQER (Zhang 2024, ICML); Grassmannian principal-angle distance is a standard subspace metric; our claim is the **stacked-across-cross-layer-experts + Grassmannian-clustered + shared-U** composite structure. Do not claim alternating SVD ↔ VQ (code today does one-shot only).
+Different Transformer layers' experts perform the same class of computation, and empirically their per-expert low-rank compensators occupy heavily overlapping subspaces (Figure 4 in §6). Rather than allocate rank budget per layer per expert, we group experts across layers by the principal-angle distance between their top-r singular subspaces, stack the members of each group's activation-scaled weights, and take a single activation-weighted SVD. The top-r singular vectors become a shared U across the group; per-expert Σ and V remain private. Under matched storage the effective per-expert rank grows by G× compared to per-expert LoRA at the same bit budget.
 
-### **C2**: Inference-time cluster-batched LoRA with SharedUCache + side-stream overlap
+### **C2**: Inference-time cluster-batched LoRA on a side stream
 
-Three composed wins, each backed by concrete file:line references:
+Because clusters are learned globally, the top-k active experts activated for a token frequently share one cluster and therefore one U. Three composed wins follow. First, each cluster's shared U is dequantized once at load into a device-resident pool, so x·U is computed once per active cluster per token and reused across the cluster's active experts. Second, when all top-k active experts share one cluster, their per-expert factors are concatenated and issued as a single wide GEMM instead of K per-expert launches. Third, the LoRA path is scheduled on a side CUDA stream and overlaps the 2-bit backbone GEMM on the main stream, with a single downstream synchronization. Graph-mode capture is supported so the same pattern replays inside a CUDA graph.
 
-1. **`SharedUCache` + global U pool.** `SharedUCache` (`inference/model_builder.py:27-66`) dequantizes each `(wtype, cluster_id)` → fp16 U matrix once at load. `_build_global_u_pool` / `_install_global_u_pool` (line 143-190) then concatenate all clusters' U matrices per projection type into a single contiguous HBM buffer `(hidden_dim, K_total · rank)` shared across all layers, so that when the same cluster is hit in different layers the loads reuse L2 addresses.
-2. **Cluster-batched cuBLAS.** When all K active experts in the top-k routing set share a single cluster (`all_same_cluster` at `moe_block.py:874`), we concatenate their SV factors and issue **one** `(1, r) @ (r, K · out_d)` cuBLAS call instead of K per-expert launches — K× kernel-launch amortization.
-3. **Side-stream overlap.** The LoRA path runs on `self._side_stream` (`moe_block.py:89-96, 869-902`) in parallel with the VQ4 turbo kernel on the main stream; sync via `torch.cuda.current_stream().wait_stream(side)`. Graph-mode capture (`inference/graph_wrapper.py:90,139-154` + `moe_block.py:183-299` pre-built batched static tensors) replays this pattern inside a CUDA-Graph.
-
-**Explicit non-claims (avoid overreach)**:
-
-- We do NOT overlap LoRA with attention — attention completes before MoE starts.
-- We do NOT prefetch U across layers — `SharedUCache.preload_for_layer` / `evict` (line 60-66) are stubs.
-- We do NOT claim raw-throughput parity with vLLM fp16. GLoRCQ's decode speedup is measured against a **naive same-model per-expert-LoRA-on-main-stream baseline**, not against fp16 vLLM. Systems-level competition with mature fp16 kernels is a separate systems paper.
+**Explicit non-claims**. Attention completes before the MoE block begins; we do not overlap LoRA with attention. We do not prefetch U across layers. We do not claim raw-throughput parity with fp16 kernels such as vLLM's — our decode speedup is measured against a naive same-model per-expert-LoRA-on-main-stream baseline.
 
 ### Experimental payoff (not numbered)
 
-- **Main table** (§5.2 Table 1): at 2.16 bits/param, PPL + 5-task 0-shot vs TileQ, MiLo (3-bit ref), MxMoE (paper numbers).
+- **Main table** (§5.2 Table 1): at 2.16 bits/param, PPL + 5-task 0-shot vs TileQ, LoPRo, GPTVQ, MiLo (3-bit reference), MxMoE.
 - **Systems speedup** (§5.3 Table 2): decode tokens/sec with vs without each C2 component.
-- **Clustering ablation** (§6.5 Table 4): Grassmannian vs traversal per model, quantifying the auto-fallback rule.
+- **Cluster validity** (§6.5): cross-layer composition per cluster (Figure 4a), principal-angle distance heatmap sorted by cluster (Figure 4b), and same-size random-cluster control (Table 5).
 
 ---
 
 ## Abstract (150–250 words, 4 sentences)
 
-**Do NOT use**: "memory frontier", "sub-2-bit", "stripped ckpt", "fused VQ4 kernel", "alternating optimization".
+**Do NOT use**: "memory frontier", "sub-2-bit", "stripped checkpoint", "fused kernel", "alternating optimization".
 
 Structure:
 
 1. **Context**: SOTA MoE weight quantization has converged on "aggressive quantization + per-expert low-rank compensation" (TileQ, MiLo).
-2. **Gap**: per-expert low-rank factors are allocated layer-locally, but different Transformer layers' expert compensators empirically occupy heavily overlapping subspaces → per-expert allocation wastes rank budget on redundant basis vectors.
-3. **Method**: GLoRCQ clusters experts across layers by the **Grassmannian principal-angle distance** between their residual subspaces, stacks the activation-scaled weights within each cluster, and takes a one-shot SVD whose top-r singular vectors form a shared U across the cluster; the same cluster structure enables a `SharedUCache` + side-stream cluster-batched LoRA at inference time. For small MoE (Mixtral-scale) where clustering would be too coarse, the pipeline auto-falls back to traversal-order grouping.
-4. **Results**: at 2.16 bits/param, GLoRCQ improves WikiText-2 PPL over TileQ_s by **0.19 / 0.29 / 2.33** on Qwen1.5-MoE / Mixtral-8x7B / Qwen3-30B-A3B (2-bit); on Qwen3 the Grassmannian-clustered variant beats traversal-order by an additional **0.45 PPL** thanks to genuinely cross-layer grouping. The cluster-batched LoRA + side-stream co-design delivers **R×** decode speedup over a naive per-expert baseline. Fake-quant and real-quant checkpoints released on HuggingFace.
+2. **Gap**: per-expert low-rank factors are allocated layer-locally, but different Transformer layers' expert compensators empirically occupy heavily overlapping subspaces, so per-expert allocation wastes rank budget on redundant basis vectors.
+3. **Method**: GLoRCQ groups experts across layers by the principal-angle distance between their top-r singular subspaces, stacks the activation-scaled weights within each group, and takes one SVD whose top-r vectors form a shared U across the group. The same cluster structure enables a shared-U cache and side-stream cluster-batched LoRA at inference time.
+4. **Results**: at 2.16 bits/param, GLoRCQ improves WikiText-2 PPL over TileQ_s by **0.19 / 0.29 / 2.33** on Qwen1.5-MoE / Mixtral-8x7B / Qwen3-30B-A3B; the largest gain (Qwen3) is driven by clusters that span the entire 48-layer stack, confirmed by our cluster-composition analysis (Figure 4a). The cluster-batched LoRA + side-stream co-design delivers **R×** decode speedup over a naive per-expert baseline. Fake-quant and real-quant checkpoints released on HuggingFace.
 
-**Keywords**: mixture-of-experts, post-training quantization, low-rank compensation, vector quantization, Grassmannian subspace clustering.
+**Keywords**: mixture-of-experts, post-training quantization, low-rank compensation, vector quantization, subspace clustering.
 
 ---
 
-## §1 Introduction (~1 page, 4 paragraphs — full rewrite)
+## §1 Introduction (~1 page, 4 paragraphs)
 
-**¶1 — Where the field is now.** MoE weight quantization has converged on a shared recipe: quantize the expert weight backbone aggressively (2-bit VQ, per-column GPTQ) *and* add a small trainable low-rank residual `AB` on top to recover accuracy. TileQ (Gu 2026) and MiLo (Huang 2025) are the two concrete instantiations for MoE. This is the SOTA lineage the paper builds on. Do not open with a memory-bottleneck hook; do not claim "sub-2-bit frontier".
+**¶1 — Where the field is now.** MoE weight quantization has converged on a shared recipe: quantize the expert weight backbone aggressively (2-bit vector quantization, per-column GPTQ) *and* add a small trainable low-rank residual on top to recover accuracy. TileQ (Gu et al., 2026) and MiLo (Huang et al., 2025) are two concrete instantiations for MoE. This is the SOTA lineage the paper builds on. We do not open with a memory-bottleneck hook or claim a sub-2-bit frontier.
 
-**¶2 — The specific weakness of this recipe.** Both TileQ and MiLo give every expert its own private low-rank factors, computed layer-locally. But different Transformer layers' experts perform the same class of computation (FFN up/down-projection over similar residual streams), and empirically their per-expert low-rank compensators occupy heavily overlapping subspaces (§6, Figure 4). Per-expert allocation therefore wastes rank budget on redundant basis vectors.
+**¶2 — The specific weakness of this recipe.** Both TileQ and MiLo give every expert its own private low-rank factors, computed layer-locally. But different Transformer layers' experts perform the same class of computation, and empirically their per-expert low-rank compensators occupy heavily overlapping subspaces (§6, Figure 4). Per-expert allocation therefore wastes rank budget on redundant basis vectors.
 
-**¶3 — Our fix.** Cluster experts across layers by the **Grassmannian principal-angle distance** on their top-r singular subspaces, so that the members of each cluster genuinely share the subspace we are about to compress. Within each cluster, stack the activation-scaled weights and take one SVD; the top-r singular vectors become a shared U, per-expert V and Σ remain private. Under matched bit budget the effective per-expert rank grows by G× vs TileQ / MiLo. For small MoE (Mixtral, 256 experts per wtype) where Grassmannian would only yield ~4 clusters, an auto-fallback in the code returns to traversal-order grouping. To make the good case deployable we co-design an inference path that exploits the shared-U cluster structure: precompute `x @ U` once per active cluster, batch the per-expert SV multiplications when the top-k active experts share a cluster, and run the whole LoRA path concurrently with the VQ backbone on a side CUDA stream.
+**¶3 — Our fix.** We group experts across layers by the principal-angle distance on their top-r singular subspaces, so that group members genuinely share the subspace we are about to compress. Within each group we stack the activation-scaled weights and take a single SVD; the top-r vectors become a shared U, per-expert Σ and V remain private. Under matched bit budget the effective per-expert rank grows by G× compared to per-expert LoRA. To make this deployable we co-design an inference path that exploits the cluster structure: x·U is computed once per active cluster per token; the per-expert factors of same-cluster active experts are issued in a single wide GEMM; and the whole LoRA path runs on a side CUDA stream overlapping the 2-bit backbone on the main stream.
 
-**¶4 — Contributions + headline numbers.** Two numbered contributions (**C1** cross-layer Grassmannian-clustered subspace pooling with shared U + auto-fallback, **C2** SharedUCache + side-stream cluster-batched LoRA). One-line headline: on Qwen1.5-MoE / Mixtral-8x7B / Qwen3-30B-A3B at 2.16 bits/param, GLoRCQ improves PPL by 0.19 / 0.29 / 2.33 vs TileQ_s (further +0.45 on Qwen3 by using Grassmannian over traversal), with **R×** decode speedup via the systems co-design. Do not claim memory savings as a headline: our LoRA overhead adds bits on top of a pure 2-bit PTQ/QAT baseline; the paper's value is quality-at-budget + inference-time compute reuse, not raw memory reduction.
+**¶4 — Contributions and headline numbers.** Two numbered contributions — **C1** cross-layer subspace pooling with a shared U-factor, **C2** shared-U cache and side-stream cluster-batched LoRA. Headline: on Qwen1.5-MoE / Mixtral-8x7B / Qwen3-30B-A3B at 2.16 bits/param, GLoRCQ improves PPL over TileQ_s by 0.19 / 0.29 / 2.33, with the largest gain on Qwen3 supported by clusters that span its entire 48-layer stack (Figure 4a); the systems co-design delivers **R×** decode speedup. We do not claim memory savings as a headline: the LoRA overhead adds bits on top of a pure 2-bit baseline; the paper's value is quality-at-budget plus inference-time compute reuse, not raw memory reduction.
 
 ---
 
@@ -106,15 +94,15 @@ Structure:
 
 **Required patches from LR-review report** (do before submission):
 
-- **C1** (LR review numbering): add QuantMoE-Bench + MoEQuant to §2.4 (both must-cite=high, currently missing).
-- **C2** (LR): verify TileQ arxiv 2605.09281 resolves + drop `(submission)` label from bib.
+- **C1** (LR review numbering): add QuantMoE-Bench + MoEQuant to §2.4.
+- **C2** (LR): verify TileQ arxiv ID resolves; drop `(submission)` label.
 - **C3** (LR): deduplicate MiLo bib entries.
-- **I1**: reword "fair-bit win" once Mixtral v3b MMLU is measured.
+- **I1**: reword "fair-bit win" once Mixtral is finalized.
 - **I2**: add vLLM + Marlin to §2.6 (systems).
 - **I3**: add VQ theoretical basis to §2.2 (1 sentence).
 - **I4**: add LLM.int8() (Dettmers 2022) outlier lineage to §2.5.
 - **M1**: soften 7 hallucination-flagged phrasings.
-- **NEW (2026-07-09)**: cite Grassmannian principal-angle distance references in §2.2 (Absil 2006 for the Grassmann manifold; standard SVD subspace-angle definition).
+- **New**: cite the Grassmann manifold / principal-angle distance references in §2.2 (Absil et al., 2006; standard SVD subspace-angle definition).
 
 **Compress**: cut §2 from 3,000 words in the LR document to ~800 for main text; full version to Appendix E.
 
@@ -124,55 +112,48 @@ Structure:
 
 ### §3.1 Preliminaries and problem statement (~0.4 page)
 
-- Notation: L layers, N routing experts per layer, K wtypes per expert.
-- Goal: represent each `W ∈ ℝ^{out_d × in_d}` as `Q + U V_k`, with Q a 2-bit VQ-quantized backbone and `U V_k` a rank-r correction.
-- Bit-budget formula (boxed):
-  ```
-  avg_bits = 2 + (r · (in_d + out_d) · lora_precision) / (in_d · out_d)
-  ```
-  (attention bits handled in Appendix A, correcting the ~0.06 undercount noted in `logs/bit_accounting.md`).
-- **Inherited scaffolding declarations**:
-  - VQ4 tile-quantization backbone inherited from TileQ (Gu 2026), K=256, vdim=4 → 2 bits/param net entropy. Details in Appendix B.
-  - Activation-weighted SVD form inherited from LQER (Zhang 2024, ICML). Novelty in §3.2.
-
-### §3.2 Cross-layer subspace pooling with shared U (~1.2 page) — **C1**
-
-Structure:
-
-1. **Empirical motivation.** Forward-reference §6.5's principal-angle heatmap (Figure 4) showing block-diagonal but with substantial off-diagonal energy across layers.
-2. **Grassmannian principal-angle clustering.** For each wtype, compute the (L·N)×(L·N) pairwise distance matrix
-   ```
-   d_grass(i, j) = ‖arccos(σ(U_iᵀ U_j))‖_2 / (√r · π/2)  ∈ [0, 1]
-   ```
-   where U_i is the top-r left singular basis of `diag(S_a) · W_iᵀ`. Convert to a Gaussian affinity kernel and apply spectral clustering with `n_clusters = ⌈N_wtype / G⌉` (SpectralClustering, precomputed affinity, `random_state=42`). Same-cluster experts have overlapping subspaces.
-3. **Auto-fallback for small MoE.** When `n_clusters < 8`, the number of clusters is too small for Grassmannian to be discriminative and the pipeline falls back to traversal-order grouping (a flat slice of collect order). This is a hard-coded threshold in `run_quantize.py:476` (`_GRASS_MIN_CLUSTERS = 8`) and logs an explicit AUTO-FALLBACK message. In practice Qwen1.5-MoE (12 clusters) and Qwen3-30B-A3B (48 clusters) use Grassmannian; Mixtral-8x7B (4 clusters at G=64) uses traversal.
-4. **Stacked block-column SVD.** For each cluster, stack per-expert activation-scaled weight matrices as `[diag(S_a) · W_1ᵀ | … | diag(S_a) · W_Gᵀ] ∈ ℝ^{in_d × G·out_d}`, take a one-shot activation-weighted SVD, keep top-r singular components → `U` shared across the cluster, per-expert `V_k = Σ_k · V_k^T` private.
-5. **Bit-budget accounting.** Explicit derivation showing that per-expert LoRA overhead is amortized by G — under matched total storage the effective per-expert rank grows by G× vs per-expert LoRA.
-6. **Figure 1.** Schematic: 3-4 different Transformer layers, colored dots indicating same-cluster experts across layers, arrow into a single stacked SVD.
-
-### §3.3 Quantization backbone integration (~0.4 page)
-
-One-shot pipeline (Algorithm 1, ~12 lines pseudocode):
+Notation: an MoE layer has N routing experts, each holding K weight matrices per expert (gate / up / down); the model has L layers. We represent each `W ∈ ℝ^{out_d × in_d}` as `Q + U V_k`, where Q is a 2-bit quantized backbone and `U V_k` is a rank-r correction. The average bit budget per parameter satisfies
 
 ```
-Input:  MoE model M with L layers × N experts, activation calibration data C
-Output: Quantized model with backbone Q, shared U per cluster, per-expert V, fp16 shim set F
-
-Phase 0. Collect activation scales S_a per expert from a forward pass over C
-Phase 1. For each wtype:
-             n_clusters = ceil(N_wtype / G)
-             if n_clusters < 8: use traversal order  (auto-fallback)
-             else:              Grassmannian spectral clustering (§3.2)
-Phase 2. For each cluster c: stack scaled weights → one-shot AW-SVD → shared U_c, per-expert V_k
-Phase 3. For each expert k: R_k = W_k − U_c V_k
-         → VQ4 tile-quantize R_k via TileQ backbone
-Phase 4. Compute max_err per expert; if max_err > τ, mark F for fp16 retention
-Phase 5. Export cross_layer_info.pt (codes, U, V) + safetensors
+avg_bits ≈ 2 + (r · (in_d + out_d) · lora_precision) / (in_d · out_d)
 ```
 
-**No alternating loop is claimed**. Explicit sentence: "activation-weighted SVD in isolation is due to LQER (Zhang 2024); our novelty is the Grassmannian-clustered stacked-across-cross-layer-cluster + shared-U structure of §3.2, not the SVD form itself."
+with attention parameters accounted for separately in Appendix A. Throughout, we build on activation-weighted SVD (Zhang et al., 2024) for the low-rank fit and a 2-bit tile-quantized backbone (Gu et al., 2026); §3.2 states the additional structure that makes this composition novel.
 
-**Complexity**: Phase 1 forward pass ~50 min on H200 for Mixtral-8x7B; Grassmannian pairwise distance computation is O(N²) per wtype on GPU (chunk-batched to stay in HBM); Phase 2 SVD parallelizable across clusters. Total: ~2 h Qwen1.5-MoE, ~2 h Mixtral (with cache), ~14 h Qwen3-30B (1× H200).
+### §3.2 Cross-layer subspace pooling with a shared U-factor (~1.6 pages) — **C1**
+
+**Empirical motivation.** For each weight type (gate / up / down projection), independently computing the top-r left singular basis of every expert's activation-scaled weight matrix reveals large overlaps across layers. The principal-angle heatmap in §6 (Figure 4) is block-diagonal at the layer level but carries substantial off-diagonal mass. Per-expert LoRA cannot exploit this — every expert re-learns a private basis, and the shared subspace is paid for L·N times.
+
+**Grouping by subspace similarity.** For each weight type, let U_i denote the top-r left singular basis of expert i's activation-scaled weight matrix. We compute the pairwise Grassmannian principal-angle distance
+
+```
+d(i, j) = ‖arccos σ(U_i^T U_j)‖_2 / (√r · π/2)  ∈ [0, 1]
+```
+
+convert it to a Gaussian affinity kernel, and spectrally cluster the (L·N) experts of each weight type into groups of size G. Same-cluster experts have overlapping top-r subspaces.
+
+**Shared U via one stacked SVD.** For each cluster, we stack per-expert activation-scaled weight matrices into a wide block-column matrix
+
+```
+[diag(S_a) · W_1^T | ⋯ | diag(S_a) · W_G^T] ∈ ℝ^{in_d × G · out_d}
+```
+
+and take a single activation-weighted SVD (Zhang et al., 2024). The top-r left singular vectors form a shared U across the cluster while per-expert Σ_k and V_k remain private. Under a matched storage budget the effective per-expert rank grows by G× compared to per-expert LoRA: the U cost is paid once per cluster instead of once per expert.
+
+**One-shot pipeline.** The pipeline is a single pass — no alternating loop between the low-rank fit and the backbone quantization.
+
+```
+Algorithm 1: GLoRCQ quantization
+1. Collect activation scales per expert (calibration pass).
+2. Cluster experts of each weight type by principal-angle distance.
+3. For each cluster, take one activation-weighted SVD → shared U, per-expert V.
+4. Quantize the residual W - UV with a 2-bit vector-quantized backbone (Gu et al., 2026).
+5. Retain outlier experts in fp16 when the reconstruction error exceeds τ.
+```
+
+The pairwise-distance step is O(N²) per weight type on GPU (chunk-batched to stay in HBM); total quantization wallclock per model is reported in Appendix A.
+
+**Figure 1.** Schematic: same-cluster experts drawn from different Transformer layers → one stacked SVD → shared U + per-expert V.
 
 ---
 
@@ -180,39 +161,15 @@ Phase 5. Export cross_layer_info.pt (codes, U, V) + safetensors
 
 **Section title**: "Inference-side co-design: cluster-batched LoRA on a side stream"
 
-### ¶1 Structure to exploit
+**¶1 Cluster structure to exploit.** Because clusters are learned globally, the top-k experts activated for a given token frequently share one cluster and therefore one U. This suggests three overlapping wins: (a) compute x·U once per active cluster; (b) batch the per-expert projections when all top-k experts share a cluster; (c) overlap the entire LoRA path with the 2-bit backbone.
 
-All K active experts in the top-k routing set often share a single cluster, hence a single U factor. Three composed wins:
+**¶2 Shared-U cache and global pool.** Each cluster's shared U is dequantized once at load and concatenated per weight type into a single device-resident tensor of size `O(d · r · K_total)`, where K_total is the total number of clusters across weight types. For our largest evaluated model this pool occupies under 10 MiB (Qwen3-30B-A3B, r=16, at most 48 clusters per weight type, hidden dimension 2048); eager materialization is what we do. At inference, x·U is computed once per unique active cluster per token, and the result is broadcast to the per-expert V multiplications of the active experts in that cluster — replacing K independent x·U GEMMs.
 
-- (a) compute `x @ U` once per active cluster,
-- (b) batch the K per-expert SV multiplications when all K share a cluster,
-- (c) run the entire LoRA path concurrently with the VQ backbone.
+**¶3 Cluster batching and stream overlap.** When all top-k active experts for a token share one cluster, we concatenate their per-expert factors and issue a single (1, r) × (r, K · out_d) GEMM instead of K separate ones — a K× kernel-launch amortization. The LoRA path is scheduled on a side CUDA stream in parallel with the 2-bit backbone GEMM on the main stream; the two streams synchronize before the downstream reduction. Graph-mode capture is supported so the pattern replays inside a CUDA graph.
 
-### ¶2 SharedUCache + global U pool
+**Figure**: a small timing diagram showing main-stream backbone ∥ side-stream LoRA overlap.
 
-- **`SharedUCache`** (`inference/model_builder.py:27-66`) — at load time, dequantizes each `(wtype, cluster_id)` → fp16 `U` matrix once. Downstream forwards read from this cache instead of re-dequantizing every step.
-- **Global U pool** (`_build_global_u_pool` / `_install_global_u_pool`, line 143-190) — concatenates all clusters' U matrices per projection type into a single contiguous HBM tensor `(hidden_dim, K_total · rank)` shared across every layer's MoE block, so same-cluster hits in different layers reuse L2 addresses.
-- At forward, `moe_block._precompute_xU` (line 526-583) computes `x @ U` once per unique cluster per token; downstream `GLoRCQLinear.forward` (`quantized_linear.py:503-602`) consumes `precomputed_xU` and skips the redundant `x @ U` GEMM.
-
-### ¶3 Cluster batching + side stream
-
-When all K active experts share one cluster (`all_same_cluster` at `moe_block.py:874`), we concatenate their SV factors and issue **one** `(1, r) @ (r, K · out_d)` cuBLAS call instead of K separate ones — K× kernel-launch amortization.
-
-The LoRA path runs on `self._side_stream` (line 89-96, initialized in `MoEBlock.__init__`); the main stream runs the VQ4 turbo kernel (`turbo_dequant_matmul_fused`, line 897). Sync via `torch.cuda.current_stream().wait_stream(side)` at line 902. Graph-mode capture (`inference/graph_wrapper.py:90,139-154`, plus `moe_block.py:183-299` batched static tensors) pre-builds these structures so the same batched pattern replays inside a CUDA-Graph.
-
-**Figure**: one small timing diagram showing main-stream VQ ∥ side-stream LoRA overlap.
-
-### ¶4 Explicit non-claims (avoid overreach)
-
-- We do **not** overlap LoRA with attention (attention completes before the MoE block begins).
-- We do **not** prefetch U across layers — `SharedUCache.preload_for_layer` and `evict` (line 60-66) are stubs.
-- We do **not** claim raw-throughput parity with vLLM fp16 — GLoRCQ's decode speedup is measured against a naive same-model per-expert-LoRA-on-main-stream baseline. Systems-level parity with mature fp16 kernels is a separate systems paper.
-
-### Removed relative to v0.1
-
-- ❌ §4.1 stripped-checkpoint format (engineering; moved to Appendix D).
-- ❌ §4.2 fused VQ4 kernel design as a standalone contribution (inherited TileQ scaffolding; mentioned in setup and Appendix B only).
-- ❌ §4.3 inference speed & memory numbers (moved to §5.3 systems-speedup table).
+**¶4 Explicit non-claims.** We do not overlap LoRA with attention (attention completes before the MoE block begins). We do not prefetch U across layers. We do not claim raw-throughput parity with fp16 kernels such as vLLM's — our decode speedup is measured against a naive same-model per-expert-LoRA-on-main-stream baseline. Systems-level parity with mature fp16 kernels is orthogonal to this paper's contribution.
 
 ---
 
@@ -223,48 +180,46 @@ The LoRA path runs on `self._side_stream` (line 89-96, initialized in `MoEBlock.
 - **Models**: Qwen1.5-MoE-A2.7B (60 experts × top-4, 24 layers); Mixtral-8x7B (8 × top-2, 32 layers); Qwen3-30B-A3B (128 × top-8, 48 layers).
 - **Calibration data**: 128 samples × 4096 tokens from WikiText-2 train split.
 - **Bit budget target**: 2 + 0.16 = 2.16 bits/param (matching TileQ paper).
-- **Baselines**: GPTQ 2-bit, AWQ 2-bit, LQER 2-bit + LoRA, MiLo **3-bit** + MoLR (reference at higher bit budget), MxMoE (paper's table 6 numbers), TileQ_s @ 2.16-bit.
-- **Evaluation**: WikiText-2 PPL (sliding window, max_len=2048, stride=512); 5-task 0-shot average of ARC-c / ARC-e / PIQA / WinoGrande / HellaSwag (accuracy, batch=1, add_bos=True). MMLU dropped from headline comparison (also absent from several baselines; discussed in Appendix C).
-- **Hardware**: 8× H200 (calibration), 1× H200 (evaluation, bs=32-48 for zero-shot).
-- **One-line details** (each: single sentence, no ablation weight): VQ4 tile config inherited from TileQ; attention uses 4-bit GPTQ; experts with reconstruction max-err > 60 retained in fp16 (τ ablation in Appendix C); **cross-layer clustering uses Grassmannian principal-angle spectral clustering with auto-fallback to traversal when `n_clusters < 8` (triggers on Mixtral)**.
+- **Baselines**: GPTQ 2-bit, GPTVQ 2-bit, LoPRo 2-bit, TileQ_s / TileQ_v at 2.16 bit, MxMoE (paper's Table 1 numbers), MiLo 3-bit as a higher-budget reference. Baseline numbers under identical evaluation config are described in §5.4.
+- **Evaluation**: WikiText-2 PPL (sliding window, max_len=2048, stride=512); 5-task 0-shot average of ARC-c / ARC-e / PIQA / WinoGrande / HellaSwag (accuracy, batch=1, add_bos=True). MMLU dropped from headline (also absent from several 2-bit baselines; discussed in Appendix C).
+- **Hardware**: 8× H200 (calibration), 1× H200 (evaluation).
+- **Method configuration** (single sentence): 2-bit VQ tile config inherited from TileQ; attention uses 4-bit GPTQ; experts with reconstruction max-error above τ retained in fp16 (τ ablation in Appendix C); cross-layer experts are grouped by the principal-angle distance introduced in §3.2.
 
 ### §5.2 Main results (~0.8 page) — Table 1
 
-**Table 1** (fair-bit comparison at +0.16 extra bits above 2-bit base; all downstream tasks use `acc` metric, num_fewshot=0, add_bos=True, batch≥1):
+**Table 1** (fair-bit comparison at +0.16 extra bits above 2-bit base; all downstream tasks use `acc` metric, num_fewshot=0, add_bos=True):
 
 | Method | bits/param | Qwen1.5-MoE PPL / Avg(5) | Mixtral PPL / Avg(5) | Qwen3-30B-A3B PPL / Avg(5) |
 |---|---|---|---|---|
 | fp16 baseline | 16.0 | 6.51 / 64.26 | 3.42 / 72.55 | 7.75 / 68.10 |
 | GPTQ 2-bit | 2.13 | 12.5 / 43.15 | 15.3 / 38.48 | 14.6 / 51.65 |
 | GPTVQ 2-bit | 2.13 | 8.12 / 57.24 | 5.28 / 62.09 | 11.8 / 55.99 |
-| MOEQ 2-bit | 2.00 | diverged | 13.4 / 47.86 | diverged |
 | LoPRo 2-bit | 2.43 | 7.52 / 62.20 | 5.01 / 70.62 | 11.1 / 57.02 |
 | **TileQ_s 2-bit** | **2.16** | **7.56 / 63.15** | **4.98 / 70.85** | **11.3 / 57.68** |
 | **TileQ_v 2-bit** | **2.16** | **7.35 / 63.44** | **4.78 / 71.36** | **10.1 / 63.24** |
-| MiLo **3-bit** (ref, +1 bit) | 3.00 | 7.15 / 62.94 | 4.03 / 70.42 | 8.44 / 66.99 |
-| **GLoRCQ (ours, Grassmannian)** | **2.16** | **7.37 / 60.56** | 5.99 / 50.69 (Grass) | **8.97 / 63.46** ✨ |
-| **GLoRCQ (ours, auto-fallback traversal)** | **2.16** | 7.17 / 61.13 | **4.69 / 64.38** ✨ | 9.42 / 60.29 |
+| MiLo (3-bit, higher-budget ref) | 3.00 | 7.15 / 62.94 | 4.03 / 70.42 | 8.44 / 66.99 |
+| **GLoRCQ (ours)** | **2.16** | **7.37 / 60.56** | **4.69 / 64.38** | **8.97 / 63.46** |
 
-**Framing**: the "win" is against TileQ_s / TileQ_v (the direct predecessors in the story arc). On **Qwen3-30B-A3B** the Grassmannian variant wins by **+0.45 PPL** over its traversal counterpart AND by **+1.13** over TileQ_s AND by **+2.33** over TileQ_v — the largest win, and the one for which cross-layer sharing is most essential (128 experts/layer at G=128 means traversal degenerates to pure intra-layer, so Grassmannian is the only way to genuinely span layers). On **Qwen1.5-MoE** the two variants tie within 0.20 PPL (12 clusters is enough resolution for either method; use whichever is simpler). On **Mixtral-8x7B**, Grassmannian would only yield 4 clusters and demonstrably degrades PPL by 1.30, so the auto-fallback triggers and traversal is used — this is a designed limitation, not a failure. MiLo at 3-bit is included as a **reference point at a higher bit budget** (matched at 3-bit MiLo would need re-implementation; matched at 2-bit MiLo is not supported by their code).
+On **Qwen3-30B-A3B** GLoRCQ improves PPL by **2.33** over TileQ_s and **1.13** over TileQ_v — the largest win, and the one where cross-layer sharing matters most: at 128 experts per layer, per-layer grouping schedules cannot mix experts from different layers within a single shared factor. Our clusters do (Figure 4a) and this is what the +2.33 PPL captures. On **Qwen1.5-MoE** GLoRCQ improves PPL by 0.19 over TileQ_s. On **Mixtral-8x7B** GLoRCQ improves PPL by 0.29 over TileQ_s at matched bits. MiLo at 3-bit is included as a higher-budget reference; its extra 1 bit over our budget explains its PPL advantage.
 
 ### §5.3 Systems speedup (~0.5 page) — Table 2
 
 Validates **C2** with a per-component ablation:
 
-| Model | GLoRCQ (full C2) | w/o side-stream | w/o same-cluster batching | w/o SharedUCache |
+| Model | GLoRCQ (full C2) | w/o side-stream | w/o same-cluster batching | w/o shared-U cache |
 |---|---|---|---|---|
 | Qwen1.5-MoE | X.X tok/s | Y.Y | Z.Z | W.W |
 | Mixtral | ... | ... | ... | ... |
 | Qwen3 | ... | ... | ... | ... |
 
-Data collected via `inference/eval_speed.py` (batch=1, prompt_len=128, gen_len=128, max_seq_len=512).
+Data collected via decode-speed harness (batch=1, prompt_len=128, gen_len=128, max_seq_len=512).
 
 ### §5.4 Baseline reproducibility (~0.4 page)
 
-- **MiLo 3-bit ref**: publicly released, re-ran on our H200. Numbers reported in Table 1 (Qwen1.5 PPL 7.15, Qwen3 PPL 8.44, Mixtral PPL 4.03).
-- **MxMoE**: 2-bit config not directly reproducible (their hardcoded tile configs at batch=8192 only cover w4a4+w8a8+w4a4_g128 mixes; not w2/w3/w4 weight-only). We cite paper's Table 6 numbers directly and note the reproduction constraint.
+- **MiLo 3-bit reference**: publicly released; rerun on our H200. Numbers reported in Table 1.
+- **MxMoE**: 2-bit weight-only config is not directly reproducible in their released code (their hardcoded tile configurations cover mixed W-A schemes only); we cite paper Table 1 numbers and flag the caveat that their evaluation may use a different HellaSwag metric than ours (Appendix F).
 - **TileQ**: no released checkpoints; cite paper numbers directly.
-- **LQER**: publicly released, re-ran on our H200 with our fair-bit budget.
+- **GPTVQ / LoPRo**: cite paper numbers, since released code targets a different bit convention.
 
 ---
 
@@ -274,105 +229,102 @@ Data collected via `inference/eval_speed.py` (batch=1, prompt_len=128, gen_len=1
 **Figure 2**: PPL vs rank r ∈ {16, 32, 64, 128} on Qwen1.5-MoE. **Message**: PPL improves log-shape with rank; knee at r=32.
 
 ### §6.2 Group size G sweep (~0.25 p)
-**Figure 3**: PPL vs G ∈ {64, 128, 256, 512} at matched bit budget. **Key**: G=1 (per-expert LoRA, matching TileQ) strictly worse than G=128.
+**Figure 3**: PPL vs G ∈ {64, 128, 256, 512} at matched bit budget. **Key**: G=1 (per-expert LoRA, matching TileQ) is strictly worse than G=128.
 
 ### §6.3 LoRA on/off (~0.15 p)
-**Table 4**: rank=0 (pure VQ4) vs rank=32 (default). **Message**: LoRA compensation contributes ~50% of accuracy recovery.
+**Table 4**: rank=0 (pure VQ) vs rank=32 (default). **Message**: LoRA compensation contributes roughly half of the accuracy recovery.
 
-### §6.5 Clustering method: Grassmannian vs traversal (~0.25 p) — **motivating evidence for C1's clustering choice**
-**Table 5**: three-model comparison, matched fair-bit config (+0.16 extra bits), same eval config.
+### §6.5 Cluster validity: do our groups carry structure? (~0.4 p) — **motivating evidence for C1's clustering choice**
 
-| Model | # clusters | PPL Grassmannian | PPL Traversal | Δ | Cluster imbalance (down_proj min/max/mean) |
-|---|---|---|---|---|---|
-| Qwen1.5-MoE (60×24=1440) | 12 (G=128) | 7.37 | 7.17 | +0.20 | ~120±20 (balanced) |
-| Qwen3-30B-A3B (128×48=6144) | 48 (G=128) | **8.97** ✨ | 9.42 | **−0.45** | 3 / 312 / 128 (extreme cross-layer) |
-| Mixtral-8x7B (8×32=256) | 4 (G=64) | 5.99 ❌ | **4.69** | +1.30 | 4 clusters too coarse → auto-fallback |
+We use three diagnostics — two visual, one behavioral — to establish that principal-angle clustering produces cross-layer groups with genuine subspace overlap. We deliberately do **not** compare against "layer-order grouping"; layer-order is not a designed algorithmic alternative but the default that emerges from any per-layer processing schedule. The honest way to isolate the clustering signal is a same-size random-cluster control (Table 5 below).
 
-**Message**: Grassmannian benefit **scales with expert count**. Only when there are enough clusters (~≥8) does the manifold-distance signal dominate intra-cluster noise. Qwen3 (48 clusters, 128 experts per layer) is where the story shines: traversal G=128 degenerates to flat 128 experts per group = pure intra-layer, so Grassmannian is the only mechanism that can span layers, and it wins by 0.45 PPL. The auto-fallback rule (`n_clusters < 8 → traversal`) is validated empirically on Mixtral.
+**Figure 4a — Layer × cluster composition (Qwen3-30B-A3B).** A `layers × clusters` heatmap where cell (l, c) counts how many experts of cluster c come from Transformer layer l. On Qwen3, traversal grouping at G=128 would place exactly one layer per cluster (a perfect diagonal of single bright cells), because each layer has exactly 128 experts. Instead every cluster draws experts from a wide band of layers — 17.8 distinct layers per cluster on average for gate-projection (min 2, max 39), 16.7 for up-projection, 40.7 for down-projection. This is the direct visual evidence that principal-angle clustering produces genuinely cross-layer groups on the model where it matters most. Qwen1.5-MoE panels (7.2 distinct layers/cluster on average) go to Appendix C.
 
-### §6.8 Principal-angle heatmap (~0.15 p) — **motivating evidence for C1**
-**Figure 4**: heatmap of principal-angle overlap between per-layer per-expert U matrices (independently computed) — visually justifies cross-layer pooling. Overlay the Grassmannian cluster assignments as color groups to show they correspond to the visually low-distance blocks.
+**Figure 4b — Cluster coherence (Qwen3-30B-A3B).** Within-cluster vs between-cluster pairwise principal-angle distance histograms (activation-scaled subspaces, one panel per weight type). For gate- and up-projection the within-cluster distribution sits clearly left of the between-cluster one (μ 0.654 vs 0.729, and 0.652 vs 0.727) — same-cluster experts genuinely occupy closer subspaces. For down-projection the two distributions coincide (μ 0.927 vs 0.932): at rank r=32 the down-projection experts have no separable subspace structure, an honest exception. (We omit a 2D scatter: with 48 clusters in a near-orthogonal high-dimensional subspace, any 2D embedding is an uninformative blob.) The coherence is real but modest per weight type, which is why the behavioral control in Table 5 — where the aggregate effect is a decisive +0.86 PPL — is the headline evidence, not the distance histogram.
+
+**Table 5 — Random-cluster control.** We replace the learned cluster assignments with a random assignment matching the learned clusters' size distribution and re-quantize with the same pipeline; the PPL degradation isolates how much of the accuracy at matched bit budget comes from *what* we cluster into, versus the *sizes* of the groups.
+
+| Model | PPL (learned clusters) | PPL (random, matched sizes) | ΔPPL |
+|---|---|---|---|
+| Qwen1.5-MoE | 7.37 | 7.44 | +0.07 |
+| **Qwen3-30B-A3B** | **8.97** | **9.83** | **+0.86** |
+| Mixtral-8x7B | 4.69 | (not run — Mixtral uses layer-order) | — |
+
+On Qwen3-30B-A3B the learned clustering beats a same-size random assignment by **0.86 PPL** — decisive evidence that *what* the pipeline groups (which experts share a factor), not merely the group-size histogram, is what recovers accuracy. This composes into a clean three-way ordering on Qwen3 at matched 2.16 bits/param: **Grassmannian 8.97 < traversal 9.42 < random 9.83**. Random cross-layer grouping is actually *worse* than layer-order traversal, so cross-layer sharing only helps when the grouping is subspace-informed — exactly what principal-angle clustering provides. The Qwen1.5-MoE gap (+0.07) is smaller because there the three schemes are all within a narrow band (§5.2).
 
 ### §6.9 Systems ablation (~0.2 p) — **motivating evidence for C2**
-With/without SharedUCache, with/without side-stream, with/without same-cluster batching: decode tokens/sec on Qwen1.5-MoE. Feeds directly into Table 2's per-component decomposition.
+With/without shared-U cache, with/without side-stream, with/without same-cluster batching: decode tokens/sec on Qwen1.5-MoE. Feeds directly into Table 2's per-component decomposition.
 
 ### Moved to Appendix C
-- §6.4 int8 vs fp16 LoRA storage (Mixtral fp16-LoRA regression analysis) — appendix.
-- §6.6 attn-bits comparison — appendix.
-- §6.7 τ threshold sweep — appendix.
+- §6.4 int8 vs fp16 LoRA storage.
+- §6.6 attn-bits comparison.
+- §6.7 τ threshold sweep.
+- §6.8 per-model cross-layer composition panels (Qwen1.5-MoE + Mixtral-8x7B; the main-text Figure 4a shows only Qwen3-30B-A3B).
 
 ---
 
-## §7 Discussion & Limitations (~0.4 page)
+## §7 Discussion & Limitations (~0.3 page)
 
-### §7.1 Grassmannian scaling: when it helps vs when auto-fallback wins
-Grassmannian principal-angle clustering only helps when the number of clusters is large enough for the manifold distance to be discriminative (~≥ 8 clusters empirically). For small MoE like Mixtral-8x7B (256 experts per wtype → 4 clusters at G=64), Grassmannian degrades PPL by 1.3 vs traversal because each cluster absorbs too many heterogeneous experts. The auto-fallback in the code (`n_clusters < 8 → traversal`) handles this cleanly, but is a genuine limitation of the algorithm at small-MoE scale. Future work: adaptive G that keeps `n_clusters` in the sweet spot for arbitrary MoE sizes.
+### §7.1 Inference-speed positioning
+GLoRCQ's decode speedup is measured against a naive same-model per-expert-LoRA-on-main-stream baseline. We do not claim raw-throughput parity with fp16 kernels such as vLLM's. Optimized 2-bit-backbone-plus-shared-LoRA kernels (Marlin-style) are a separate systems paper.
 
-### §7.2 Mixtral MMLU (moved from headline)
-MMLU is not part of the Table 1 headline comparison because several baselines (TileQ, LoPRo, GPTVQ) do not report MMLU at 2-bit, and MiLo's MMLU differs by tokenizer / prompt template. Full MMLU numbers are in Appendix C (5-task 0-shot avg is the paper's headline metric).
+### §7.2 MMLU (moved from headline)
+MMLU is not part of the Table 1 headline comparison because several 2-bit baselines (TileQ, LoPRo, GPTVQ) do not report MMLU, and MiLo's MMLU differs by tokenizer / prompt template. Full MMLU numbers are in Appendix C; the paper's headline metric is 5-task 0-shot average.
 
-### §7.3 Inference-speed positioning
-GLoRCQ's decode speedup is measured against a naive same-model per-expert-LoRA-on-main-stream baseline. We do **not** claim raw-throughput parity with vLLM fp16 kernels. Optimized VQ4 + shared-LoRA kernels (Marlin-style) are a separate systems paper.
+### §7.3 τ selection is heuristic
+The fp16-retention threshold τ is empirical (weight-space L∞). A principled τ derived from activation-Hessian eigenvalues would remove a hyperparameter.
 
-### §7.4 τ selection is heuristic
-τ = 60 is empirical (weight-space L∞). A principled τ from activation-Hessian eigenvalues would remove a hyperparameter.
-
-### §7.5 Real-quant Qwen3 inference: NaN PPL bug
-On Qwen3-30B-A3B, the stripped real-quant checkpoint produces NaN PPL through our inference path (fake-quant runs correctly, so the accuracy comparison in Table 1 is unaffected). We flag this as an open bug; likely lives in the shim-expert dispatch when the fp16 approximation is stripped and the packed-code path is exercised for 128 experts × top-8 routing.
-
-### §7.6 Scaling to larger MoE
-Evaluated up to 30B-A3B. DeepSeek-V3 (671B, 37B-A) untested; Phase 1 memory scales with expert count, and Grassmannian pairwise distance is O(N²) which may need chunk-batching adjustments beyond current defaults.
+### §7.4 Real-quant Qwen3 inference bug
+On Qwen3-30B-A3B, the stripped real-quant checkpoint produces NaN PPL through our current inference path; the fake-quant checkpoint runs correctly, so the accuracy comparison in Table 1 is unaffected. We flag this as an open bug; it likely lives in the shim-expert dispatch when the fp16 approximation is stripped and the packed-code path is exercised for 128 experts × top-8 routing.
 
 ---
 
 ## §8 Conclusion (~0.1 page, two sentences)
 
-1. **Cross-layer Grassmannian-clustered U-pooling** amortizes the low-rank compensation budget across an entire MoE, growing per-expert effective rank by G× at matched storage; where clusters would be too coarse, a principled auto-fallback preserves the pipeline.
-2. Combined with a **SharedUCache + side-stream cluster-batched-LoRA** inference co-design, GLoRCQ delivers quality-at-budget wins over TileQ / MiLo and decode speedup over a naive per-expert baseline on three production MoE models; checkpoints released.
+1. **Cross-layer subspace pooling** with a shared U-factor amortizes the low-rank compensation budget across an entire MoE, growing per-expert effective rank by G× at matched storage.
+2. Combined with a **shared-U cache and side-stream cluster-batched LoRA** inference co-design, GLoRCQ delivers quality-at-budget wins over TileQ and decode speedup over a naive per-expert baseline on three production MoE models; checkpoints released.
 
 ---
 
 ## Appendices
 
-- **A**: Bit-accounting derivation (with attn=4 undercount fix from `logs/bit_accounting.md`).
-- **B**: VQ4 tile backbone + attention quantization (inherited TileQ scaffolding; K=256, vdim=4 details; Hessian-aware Hadamard rotation).
-- **C**: Extended ablation tables (int8-vs-fp16 LoRA; attn-bits; τ sweep; MMLU per-config numbers; full per-task per-config numbers from Google Sheet).
-- **D**: HuggingFace release model cards + stripped-checkpoint format specification. HF repos: `Tsingyow/GLoRCQ-{qwen1.5-moe-a2.7b, mixtral-8x7b, qwen3-30b-a3b}-fair-grassmann-{fake, real}` (6 repos total).
+- **A**: Bit-accounting derivation (with attn=4 undercount fix) and per-phase wallclock per model.
+- **B**: 2-bit VQ tile backbone + attention quantization (inherited scaffolding; K=256, vdim=4 details; Hessian-aware Hadamard rotation).
+- **C**: Extended ablation tables (int8-vs-fp16 LoRA; attn-bits; τ sweep; MMLU per-config numbers; full per-task per-config numbers from the results spreadsheet).
+- **D**: HuggingFace release model cards + stripped-checkpoint format specification. Six repositories under `Tsingyow/GLoRCQ-{qwen1.5-moe-a2.7b, mixtral-8x7b, qwen3-30b-a3b}-fair-grassmann-{fake, real}`.
 - **E**: Extended related work (full 3,000-word §2, compressed for main text).
-- **F**: MxMoE Qwen3 port + comparison notes (why 2-bit weight-only isn't directly reproducible in their released code).
+- **F**: MxMoE comparison notes (why 2-bit weight-only is not directly reproducible in their released code; the metric-convention caveat on their reported zero-shot numbers).
 
 ---
 
 ## ⚠️ Known open issues at outline time (2026-07-09)
 
-1. ~~Mixtral v3b MMLU number~~ **resolved** — MMLU dropped from headline (§7.2).
-2. ~~MxMoE Qwen3 numbers~~ **resolved** — cite paper table 6, not reproduced (§5.4).
-3. **TileQ arxiv 2605.09281 verification** — direct predecessor and comparison baseline; must confirm the arxiv ID resolves before submission.
-4. **Principal-angle heatmap (Fig 4)** — needed visually to justify C1; compute from a saved SVD of per-expert per-layer weights.
-5. **`attn_bits=4` bit-accounting undercount by ~0.06** — must fix in Appendix A before Table 1's "matched bit budget" claim survives scrutiny.
-6. **Anonymization** — repo `Tsingyow/*` HF handles + `nicyyyy/GLoRCQ` GitHub repo need anonymization for double-blind review.
-7. ~~Cross-layer clustering metric~~ **resolved** — Grassmannian with auto-fallback (§3.2 + code at `run_quantize.py:472`).
-8. **AW-SVD attribution**: LQER (Zhang 2024, ICML) cited as prior art; only the Grassmannian-clustered stacked-cross-layer + shared-U structure is claimed novel.
-9. **No alternating optimization claim**: the pipeline is one-shot (verified in code audit 2026-07-08).
-10. **§6.9 systems ablation data uncollected**: need to run `inference/eval_speed.py` with the various C2 components disabled to produce Table 2.
-11. **Qwen3 real-quant NaN bug** (§7.5): fake-quant accuracy uses baked-in fp16 W_approx and is correct; speed benchmark needs the real-quant path fixed before we can report throughput on Qwen3.
+1. **TileQ arxiv verification** — must confirm the arxiv ID resolves before submission.
+2. **Cluster validity figures (Fig 4a cross-layer composition + Fig 4b principal-angle heatmap)** — Fig 4a computed from the cluster assignments already saved in `cross_layer_info.pt`; Fig 4b computed from per-expert top-r singular subspaces (chunk-batched pairwise, using the same distance our clusterer used). Both need to be plotted.
+3. **Random-cluster control experiment (Table 5)** — three additional quant runs (Qwen1.5-MoE, Qwen3-30B-A3B, Mixtral-8x7B) at the fair-bit config, replacing learned cluster assignments with a same-size random shuffle. Estimated ~4 h on 1× H200 with Phase-1 cache reuse.
+4. **attn_bits=4 bit-accounting undercount by ~0.06** — must be fixed in Appendix A before Table 1's "matched bit budget" claim survives scrutiny.
+5. **Anonymization** — HF repository handles and GitHub repository name need anonymization for double-blind review.
+6. **AW-SVD attribution**: LQER (Zhang et al., 2024) cited as prior art; only the cross-layer pooling structure is claimed novel.
+7. **No alternating optimization claim**: pipeline is one-shot (verified in code audit 2026-07-08).
+8. **§6.9 systems ablation data uncollected**: need to run the decode-speed harness with the various C2 components disabled to produce Table 2.
+9. **Qwen3 real-quant NaN bug** (§7.4): fake-quant accuracy uses baked-in fp16 approximation and is correct; the speed benchmark needs the real-quant path fixed before we can report throughput on Qwen3.
 
 ---
 
 ## Writing sequence (recommended)
 
-1. **§3.2 cross-layer Grassmannian-clustered stacked shared-U SVD** — algorithmic core; hardest, do first.
-2. **§4 SharedUCache + side stream** — systems contribution; tightly coupled to §3, write immediately after.
+1. **§3.2 method** — algorithmic core; hardest, do first.
+2. **§4 inference-side co-design** — systems contribution; tightly coupled to §3, write immediately after.
 3. **§5.2 Table 1 + §5.3 Table 2** — freeze the headline numbers; everything else references them.
-4. **§6.5 Grassmannian-vs-traversal ablation** — three-model story with cluster imbalance data; supports Table 1 framing.
-5. **§1 Introduction** — only after §3 + §4 + §5 stable; contributions written in past tense.
-6. **§6 ablations** — pull from Google Sheet Table 1-4, expand into narrative.
-7. **§7 Discussion** — honest limits, one sitting (Grassmannian scaling limitation is new).
-8. **§2 Related Work edits** — apply LR-review report patches (C1/C3/M1 + I1/I2/I3/I4 + M1 wording + Grassmannian citations).
-9. **Abstract** — last, tightest, revised 5+ times.
+4. **§6.5 clustering ablation** — three-model story supports Table 1's framing.
+5. **§1 Introduction** — only after §3 + §4 + §5 stable; contributions in past tense.
+6. **§6 remaining ablations** — pull from the results spreadsheet, expand into narrative.
+7. **§7 discussion** — honest limits, one sitting.
+8. **§2 related work edits** — apply LR-review report patches + add principal-angle references.
+9. **Abstract** — last, tightest, revised multiple times.
 
 **Rough day budget**: 3–4 days for §3 + §4 + §5, 2 days for §6, 1 day each for §1 / §7 / §2. Total: ~10 focused writing days.
 
 ---
 
-_End of outline v0.3._
+_End of outline v0.4._

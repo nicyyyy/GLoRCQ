@@ -449,6 +449,21 @@ def fill_phase2(WR, all_expert_recs, fix_rank, lora_bit, lora_iter, qbit,
     # so that each cluster is roughly G experts, and consecutive slices of
     # size G after argsort(labels) land in the same cluster (up to spectral
     # imbalance, which we accept as an approximation).
+    if cluster_method == 'random_matched':
+        # Same-size random control (for §6.5 Table 5 cluster-validity ablation):
+        # shuffle each wtype's records with a seeded RNG. Downstream slice loop
+        # then produces the same size-G chunks as grassmannian / traversal but
+        # with randomised membership.
+        import numpy as _np
+        rng = _np.random.default_rng(cluster_seed)
+        print(f"\n[Phase 2 pre] cluster_method=random_matched (seed={cluster_seed})",
+              flush=True)
+        for wt in list(type_to_recs.keys()):
+            perm = rng.permutation(len(type_to_recs[wt]))
+            type_to_recs[wt] = [type_to_recs[wt][int(i)] for i in perm]
+        print(f"[Phase 2 pre] random_matched shuffle applied to "
+              f"{list(type_to_recs.keys())}\n", flush=True)
+
     if cluster_method == 'grassmannian':
         try:
             from cross_layer_share import cluster_residuals
@@ -1286,7 +1301,7 @@ def parse_args():
                         'is skipped and kept as Fp16LinearShim at inference. Pass "inf" to '
                         'force all experts to VQ4 (no shim). Default 60.0 (TileQ convention).')
     p.add_argument('--cluster_method', type=str, default='traversal',
-                   choices=['traversal', 'grassmannian'],
+                   choices=['traversal', 'grassmannian', 'random_matched'],
                    help='Phase 2 expert grouping metric. "traversal" (default) is a flat '
                         'slice of collect order (byte-identical to prior HEAD). "grassmannian" '
                         'runs spectral clustering on the top-r singular subspaces of '

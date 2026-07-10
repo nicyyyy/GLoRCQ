@@ -3,14 +3,16 @@
 **标题**: GLoRCQ: Global shared Low-Rank Compensation for Quantization of Mixture-of-Experts LLMs（全局共享低秩补偿的 MoE 大模型量化）
 
 **目标会议**: ICML 2026 / NeurIPS 2026 主赛道，8-9 页正文 + 附录
-**版本**: outline v0.3 — 2026-07-09（Grassmannian 聚类正式加入 C1，含 auto-fallback）
+**版本**: outline v0.4 — 2026-07-09（Paper voice 通读：合并 §3.2/§3.3；正文去除函数名、行号、代码分支；Global U pool 描述与代码实际行为一致）
 **详细英文版**: `docs/paper_outline.md`（本文档是同结构精简版）
 
 ---
 
 ## 一句话核心论点
 
-> **TileQ 和 MiLo 已经在做"2-bit 量化 + per-expert 低秩补偿"**；它们的缺点是每个 expert 的低秩因子**各自独立**，rank 预算被切碎。**GLoRCQ 用 Grassmannian 主成分角谱聚类**把不同层的 expert 按残差子空间相似度分到同 cluster，把 G 个跨层同 cluster 的 experts 激活加权权重堆起来一次 SVD，共享 U 因子 → per-expert 有效 rank 提升 G 倍；再顺势设计 **SharedUCache + 侧流并行 + 同 cluster 融 K-GEMM** 的推理路径，让这份共享结构在系统层也变现。**对于小 MoE（Mixtral 只有 256 experts）**，聚类数 <8 时代码自动 fallback 到 traversal-order 分组，避免过粗聚类拖累精度。
+> **TileQ 和 MiLo 已经在做"2-bit 量化 + per-expert 低秩补偿"**；它们的缺点是每个 expert 的低秩因子**各自独立**，rank 预算被切碎。**GLoRCQ 用主成分角距离在层间聚类 experts，每个 cluster 内做一次激活加权 SVD，共享 U 因子替代 G 个 per-expert basis**；推理端顺势利用 cluster 结构：cluster 级 x·U 复用 + 同 cluster K-融 GEMM + LoRA 侧流并行 2-bit backbone。
+
+两个 contribution（C1 算法 + C2 系统）+ 实验 payoff。不谈 memory hook，不声称 sub-2-bit，不声称 alternating optimization。
 
 ---
 
@@ -18,16 +20,16 @@
 
 | 章节 | 页 | 主要 message |
 |---|---|---|
-| Abstract + §1 引言 | 1.0 | TileQ/MiLo lineage → per-expert LoRA 缺点 → 跨层 Grassmannian 共享 U + 推理 co-design |
-| §2 相关工作 | 1.0 | 复用 LR + 应用 review 报告的 C1/C3/M1 补丁 + Grassmannian 引用 |
-| §3 方法（**核心**） | 2.0 | Grassmannian 谱聚类 → stacked SVD + shared U + 小 MoE auto-fallback |
-| §4 推理端 co-design（**核心**） | 0.75 | SharedUCache + global U pool + 同 cluster K-融 + 侧流并行 |
-| §5 实验 | 2.0 | Table 1 主对比 + Table 2 系统加速 + baseline 复现 (MiLo 3-bit 参考) |
-| §6 消融 | 1.25 | rank/G/LoRA + **Grassmannian vs traversal 三模型比较** + heatmap + 系统 ablation |
-| §7 讨论与局限 | 0.4 | Grassmannian scaling 老实说；auto-fallback 是设计而非失败 |
+| Abstract + §1 引言 | 1.0 | TileQ/MiLo lineage → per-expert LoRA 缺点 → 跨层子空间共享 U + 推理 co-design |
+| §2 相关工作 | 1.0 | 复用现有 LR + 应用 review 报告 C1/C3/M1 补丁 |
+| §3 方法（**核心**） | 2.0 | 前置 + 单一 Method 小节：聚类 + 共享 U 的 SVD + One-shot pipeline |
+| §4 推理端 co-design（**核心**） | 0.75 | 共享 U 缓存 + 全局 U pool + 同 cluster K-融 + 侧流并行 |
+| §5 实验 | 2.0 | Table 1 主对比 + Table 2 系统加速 + baseline 复现 |
+| §6 消融 | 1.25 | rank / G / LoRA / 聚类方法 / 主成分角 heatmap / 系统 ablation |
+| §7 讨论与局限 | 0.3 | 推理速度定位、τ 是启发式、Qwen3 real-quant NaN bug |
 | §8 结论 | 0.1 | 两句话 |
-| **正文总计** | **~8.5** | |
-| 附录 A-F | 6.5+ | Bit accounting / 全消融表 / Speed protocol / HF cards + stripped 格式 |
+| **正文总计** | **~8.4** | |
+| 附录 A-F | 6.5+ | Bit accounting + 继承 scaffolding + 全消融表 + HF cards + 扩展相关工作 + MxMoE 对比说明 |
 
 ---
 
@@ -35,64 +37,46 @@
 
 **Reviewer 讨厌"结果作为 contribution"，所以第 3 项只写进 abstract 头号数字，不编号进 contribution 列表。**
 
-### **C1**: Cross-layer expert subspace pooling with Grassmannian-clustered shared U-factor
+### **C1**: Cross-layer expert subspace pooling with a shared U-factor
 
-- **经验观察**（Figure 4 in §6）: 不同层的 expert 低秩补偿因子占据高度重叠的子空间
-- **算法回应**: 对每 wtype 用 **Grassmannian 主成分角距离** 
-  ```
-  d_grass(i, j) = ‖arccos(σ(U_iᵀ U_j))‖_2 / (√r · π/2) ∈ [0, 1]
-  ```
-  谱聚类 (`n_clusters = ⌈N_wtype / G⌉`)，同 cluster experts 子空间真的重叠。把 cluster 内的 G 个 experts 激活加权权重堆成 `[diag(S_a)·W_1ᵀ | … | diag(S_a)·W_Gᵀ]`（`(in_d, G·out_d)` 大矩阵），做**一次** AW-SVD → top-r 奇异向量作为**共享 U**，per-expert 的 V_k 和 Σ_k 私有
-- **收益**: 同 bit 预算下 per-expert 有效 rank ×G
-- **小 MoE 自动降级** (`run_quantize.py:472-485`): 当 `n_clusters < 8` 时（Grassmannian 太粗，每 cluster 会吃太多异质 experts），代码自动 fallback 到 traversal-order 分组，并 print `AUTO-FALLBACK` 消息。Mixtral-8x7B（256 experts, G=64 → 4 clusters）触发此分支；Qwen1.5（12 clusters）+ Qwen3（48 clusters）不触发
-- **老实归属**: AW-SVD 本身来自 LQER (Zhang 2024)；Grassmannian 主成分角是标准子空间度量；我们的贡献是 **Grassmannian 聚类 + stacked-across-cross-layer + shared U** 三者的组合结构
+不同 Transformer 层的 experts 做的是同类计算，实测上它们的 per-expert 低秩补偿因子占据高度重叠的子空间（Figure 4 in §6）。我们不再层内 per-expert 分配 rank，而是按 top-r 奇异子空间的主成分角距离在层间聚类 experts；cluster 内把成员的激活加权权重堆起来，做**一次**激活加权 SVD。top-r 左奇异向量成为 cluster 内共享的 U，per-expert Σ 和 V 私有。同 bit 预算下 per-expert 有效 rank 相对 per-expert LoRA 提升 **G×**。
 
-### **C2**: Inference-time cluster-batched LoRA with SharedUCache + side-stream
+### **C2**: Inference-time cluster-batched LoRA on a side stream
 
-- **`SharedUCache`** (`inference/model_builder.py:27-66`): 加载时把每个 (wtype, cluster_id) → fp16 U dequant 一次
-- **Global U pool concat** (`model_builder.py:143-190`): 所有 cluster 的 U 拼成一个大 HBM buffer，跨层共享地址 → L2 复用
-- **`x @ U` cluster-级预算** (`moe_block._precompute_xU`, line 526-583): 每 token 每 cluster 只算一次
-- **同 cluster K-融** (`moe_block.py:874`): 当所有 K 个激活 expert 同一 cluster 时，concat SV → 一次 `(1,r) @ (r, K·out_d)` cuBLAS，省 K 次 kernel launch
-- **侧流并行** (`moe_block.py:89-96, 869-902`): LoRA 侧流 ∥ VQ4 主流，`wait_stream` 汇合
-- **Graph mode** (`graph_wrapper.py:90,139-154` + `moe_block.py:183-299`): 预 build 批量结构支持 CUDA-Graph capture
+因为 cluster 是全局学出来的，一个 token 激活的 top-k experts 常常同一 cluster，也就共享一个 U。由此有三件可复合的收益。**第一**，每个 cluster 的共享 U 在加载时 dequant 一次进 device pool，x·U 每 token 每 active cluster 只算一次，在该 cluster 的所有 active experts 之间复用。**第二**，当 top-k 全部同一 cluster 时，per-expert 因子 concat 成单个宽 GEMM 发出，省 K 次 kernel launch。**第三**，LoRA 侧流并行 2-bit backbone 主流，单点 downstream 同步；graph mode 下这个 pattern 能进 CUDA Graph。
 
-**关键说清（避免 overclaim）**:
-- ❌ 不重叠 LoRA 与 attention（attention 完了 MoE 才开始）
-- ❌ 不跨层 prefetch U（`preload_for_layer`/`evict` 是 stub）
-- ❌ 不声称与 vLLM fp16 raw throughput 打平 — 我们的加速比是**同模型 naive per-expert baseline** 的对比，不是 fp16 vLLM
+**关键不吹**。attention 在 MoE block 之前完成，我们**不**把 LoRA 与 attention 重叠。我们**不**跨层预取 U。我们**不**声称与 fp16 kernel（vLLM 等）raw throughput 打平 —— 加速比是**同模型 naive per-expert-LoRA-on-main-stream** 的对比。
 
 ### 实验 payoff（不编号）
 
-- **主结果** (§5.2 Table 1): 2.16 bits/param 下，PPL vs TileQ / MiLo (3-bit ref) / MxMoE
+- **主结果** (§5.2 Table 1): 2.16 bits/param 下 PPL + 5-task 0-shot vs TileQ / LoPRo / GPTVQ / MiLo (3-bit 参考) / MxMoE
 - **系统加速** (§5.3 Table 2): decode tokens/sec, with/without C2 优化
-- **Grassmannian 消融** (§6.5 Table 5): 三模型对比 Grassmannian vs traversal，验证 auto-fallback 规则
+- **聚类有效性** (§6.5): 每 cluster 跨层组成图 (Fig 4a) + 主成分角距离 heatmap sorted by cluster (Fig 4b) + 同尺寸随机对照 (Table 5)
 
 ---
 
 ## Abstract 段（150-250 词）
 
-**四句结构**（不用 memory hook，不用 sub-2-bit）:
+**四句结构**（不用 memory hook，不用 sub-2-bit，不用 stripped ckpt，不用 fused kernel，不用 alternating optimization）:
 
 1. **背景**: MoE 量化的当前 SOTA 配方（TileQ、MiLo）= 权重激进量化 + per-expert 低秩补偿
 2. **缺口**: per-expert 低秩因子各自独立，但不同层的 expert 补偿因子子空间高度重叠 → rank 预算浪费
-3. **方法**: GLoRCQ 用 **Grassmannian 主成分角谱聚类**把不同层的 experts 按残差子空间相似度归 cluster，cluster 内 stack + 一次 AW-SVD，共享 U；对小 MoE (Mixtral-scale) 当 clusters<8 时自动降级到 traversal；顺势设计 SharedUCache + 侧流并行的推理路径
-4. **结果**: 2.16 bits/param 下，Qwen1.5-MoE / Mixtral / Qwen3-30B-A3B 的 PPL 相比 TileQ_s 分别提升 **0.19 / 0.29 / 2.33**；在 Qwen3 上 Grassmannian 变体比 traversal 再赢 **0.45 PPL** — 因为 128 experts/layer + G=128 让 traversal 退化为单层内分组，Grassmannian 是唯一真跨层的方式。推理端 decode 相比 naive baseline 加速 R×
+3. **方法**: GLoRCQ 用 top-r 奇异子空间之间的主成分角距离在层间聚类 experts，cluster 内堆叠激活加权权重做一次 SVD，top-r 向量作为 cluster 级共享 U。同样的 cluster 结构使推理端可以做共享 U 缓存 + 侧流 cluster-batched LoRA
+4. **结果**: 2.16 bits/param 下，相对 TileQ_s 在 Qwen1.5-MoE / Mixtral / Qwen3-30B-A3B 上 PPL 分别提升 **0.19 / 0.29 / 2.33**；最大 win 在 Qwen3 上，来自跨越全部 48 层的 cluster 组成（Figure 4a 印证）。推理端 decode 相比 naive baseline 加速 R×。Fake-quant 与 stripped real-quant checkpoint 已发布到 HuggingFace
 
-**关键词**: mixture-of-experts, post-training quantization, low-rank compensation, vector quantization, Grassmannian subspace clustering
-
-**Abstract 里不要说**: "memory frontier"、"sub-2-bit"、"stripped ckpt"、"fused VQ4 kernel"、"alternating optimization"
+**关键词**: mixture-of-experts, post-training quantization, low-rank compensation, vector quantization, subspace clustering
 
 ---
 
-## §1 引言（1 页 4 段，全部重写）
+## §1 引言（1 页 4 段）
 
 **¶1 — 当前 SOTA lineage**: MoE 量化已经收敛到"权重激进量化 + 小 rank 低秩补偿"的配方。TileQ 和 MiLo 是两个代表性实现。**不提** memory bottleneck，**不提** sub-2-bit frontier。
 
-**¶2 — 具体缺陷**: TileQ 和 MiLo 都给每个 expert 独立的 (A, B) 因子，layer-local 计算。但不同 Transformer 层的 expert 做的是同类计算（FFN up/down projection over similar residual streams），实测上它们的低秩补偿因子占据高度重叠子空间（Figure 4）→ per-expert 分配浪费 rank 预算在冗余的基向量上。
+**¶2 — 具体缺陷**: TileQ 和 MiLo 都给每个 expert 独立的 (A, B) 因子，layer-local 计算。但不同 Transformer 层的 expert 做的是同类计算，实测上它们的低秩补偿因子占据高度重叠子空间（Figure 4）→ per-expert 分配浪费 rank 预算在冗余的基向量上。
 
-**¶3 — 我们的修复**: 用 **Grassmannian 主成分角距离**对每 wtype 的 (L·N) experts 做谱聚类，同 cluster 的 experts 的 top-r 奇异子空间真的重叠 → cluster 内 stack 激活加权权重 → 一次 SVD → 共享 U。同 bit 预算下 per-expert 有效 rank × G。**对小 MoE（Mixtral 256 experts，Grassmannian 只能出 4 cluster 太粗）代码自动 fallback 到 traversal-order**，避免过粗聚类拖累精度。为让方法可部署，顺势设计推理路径利用 shared-U cluster 结构: `x@U` per-cluster 只算一次；同 cluster experts 的 SV concat 后一次 cuBLAS；LoRA 侧流跟 VQ backbone 主流并行。
+**¶3 — 我们的修复**: 用 top-r 奇异子空间之间的主成分角距离在层间聚类 experts；同 cluster 的 experts 子空间真的重叠 → cluster 内堆叠激活加权权重 → 一次 SVD → 共享 U，per-expert Σ 和 V 私有。同 bit 预算下 per-expert 有效 rank ×G。为让方法可部署，顺势设计推理路径利用 shared-U cluster 结构: x·U 每 active cluster 每 token 只算一次；同 cluster active experts 的 per-expert 因子 concat 成一次宽 GEMM；LoRA 侧流并行 2-bit backbone 主流。
 
-**¶4 — Contributions + 头号数字**: 两个编号 contribution（C1 跨层 Grassmannian + shared U + auto-fallback，C2 SharedUCache + 侧流并行）+ 一句头号: 2.16 bits/param 下 Qwen1.5/Mixtral/Qwen3 PPL 提升 0.19/0.29/2.33 vs TileQ_s（Qwen3 上 Grassmannian 比 traversal 再 +0.45），decode 相比 naive baseline 加速 R×。**不吹** memory saving。
+**¶4 — Contributions + 头号数字**: 两个编号 contribution（**C1** 跨层子空间 pooling + 共享 U，**C2** 共享 U 缓存 + 侧流 cluster-batched LoRA）+ 一句头号: 2.16 bits/param 下 Qwen1.5/Mixtral/Qwen3 相对 TileQ_s PPL 提升 0.19/0.29/2.33，最大 win 来自 Qwen3 上跨越全部 48 层的 cluster（Figure 4a 支撑），decode 相比 naive baseline 加速 R×。**不吹** memory saving。
 
 ---
 
@@ -106,7 +90,7 @@
 - **C3** (LR review 编号): 去 `.bib` 里的 MiLo 重复条目
 - **I1-I4**: 补 vLLM、Marlin、VQ 理论依据、LLM.int8() 溯源
 - **M1**: 软化 7 处 hallucination 用词
-- **新（2026-07-09）**: 加 Grassmannian 主成分角距离引用（Absil 2006 主 Grassmann 流形，标准 SVD 子空间角定义）
+- **新**: 加主成分角 / Grassmann 流形引用（Absil 2006 主 Grassmann 流形，标准 SVD 子空间角定义）到 §2.2
 
 **正文压缩**: 3000 词砍到 ~800，完整版进附录 E
 
@@ -116,81 +100,64 @@
 
 ### §3.1 前置定义（~0.4 页）
 
-- 记号: L 层，每层 N experts，K wtypes
-- 目标: W ≈ Q + UV，总存储 b bits/param
-- Bit 预算公式（框起来）:
-  ```
-  avg_bits = 2 + (r · (in_d + out_d) · lora_precision / (in_d · out_d))
-  ```
-- **归属声明**:
-  - VQ4 tile backbone 继承自 TileQ (Gu 2026)，K=256、vdim=4 → 2 bits/param（详见附录 B，不推导）
-  - AW-SVD 形式沿用 LQER (Zhang 2024)；novelty 是 Grassmannian 聚类 + stacked shared-U 结构（§3.2）
+记号: 每层 N 个 routing experts，每 expert K 种权重（gate / up / down），共 L 层。每个权重 `W ∈ ℝ^{out_d × in_d}` 表示为 `Q + U V_k`，Q 是 2-bit 量化 backbone，`U V_k` 是 rank-r 修正项。Bit 预算：
 
-### §3.2 跨层子空间 pooling + shared U（~1.2 页 — **C1**）
-
-**内容**:
-1. **经验动机**: 前指 §6 主成分角 heatmap (Figure 4)
-2. **Grassmannian 谱聚类**（具体聚类算法）: 对每 wtype 计算 (L·N)×(L·N) 主成分角距离矩阵 → Gaussian affinity 核 → SpectralClustering (n_clusters=⌈N_wtype/G⌉, random_state=42)。同 cluster 的 experts 子空间真的重叠
-3. **小 MoE Auto-fallback**: `n_clusters < 8` 时 fallback 到 traversal-order（`run_quantize.py:476` 硬编码阈值 `_GRASS_MIN_CLUSTERS = 8`）。实际触发情况：Mixtral (4 clusters at G=64) → fallback；Qwen1.5 (12 clusters) 和 Qwen3 (48 clusters) 走 Grassmannian
-4. **Stacked block-column SVD**: `[diag(S_a)·W_1ᵀ | … | diag(S_a)·W_Gᵀ] = U Σ V^T`。共享 U，per-expert V_k / Σ_k 私有
-5. **Bit accounting**: 明式推 G× 摊销
-6. **Figure 1**: 组员来自 3-4 个不同层的示意图 + Grassmannian 聚类颜色
-
-### §3.3 量化 backbone 集成（~0.4 页）
-
-**One-shot pipeline**（**不写** alternating）:
 ```
-Phase 0. 校准 forward 收集 S_a
-Phase 1. 每 wtype: 若 n_clusters >= 8 → Grassmannian 谱聚类；否则 traversal (auto-fallback)
-Phase 2. 每 cluster: stack + AW-SVD → 共享 U_c + per-expert V_k
-Phase 3. 每 expert: R_k = W_k − U_c V_k → VQ4 tile 量化 R_k
-Phase 4. max_err > τ 的 expert 保 fp16
-Phase 5. 导出 cross_layer_info.pt + safetensors
+avg_bits ≈ 2 + (r · (in_d + out_d) · lora_precision) / (in_d · out_d)
 ```
-- Algorithm 1: ~12 行伪代码
-- 声明: AW-SVD 独立形式来自 LQER，我们的 novelty 在 §3.2 的 Grassmannian + stacked + shared 组合结构
 
-**复杂度**: Phase 1 forward ~50 min (Mixtral)；Grassmannian pairwise O(N²) GPU chunk-batched；总: ~2h Qwen1.5、~2h Mixtral (cache 复用)、~14h Qwen3 (1× H200)
+（attention bits 见附录 A）。全文的激活加权 SVD 沿用 LQER (Zhang et al., 2024)，2-bit tile 量化 backbone 沿用 TileQ (Gu et al., 2026)；§3.2 说明我们在此基础上引入的额外结构。
 
-**去除**（相比 v0.1）:
-- ❌ §3.4 fp16 fallback 独立小节 → 挪到 §5.1 setup 一行 + §7 局限
-- ❌ §3.5 attention 量化 → 挪到 §5.1 setup 一行
-- ❌ Alternating optimization 声称（代码里没有）
+### §3.2 跨层子空间 pooling + 共享 U（~1.6 页 — **C1**）
+
+**经验动机**。对每种权重类型，独立计算每个 expert 激活加权矩阵的 top-r 左奇异 basis，得到的 basis 之间跨层重叠明显。§6 (Figure 4) 的主成分角 heatmap 是层级 block 对角、但 off-diagonal 也有大量能量。Per-expert LoRA 不能利用这一点 —— 每个 expert 重新学一个私有 basis，共享子空间被"付了 L·N 次"。
+
+**按子空间相似度分组**。对每种权重类型，设 U_i 为 expert i 激活加权矩阵的 top-r 左奇异 basis。计算成对主成分角距离
+
+```
+d(i, j) = ‖arccos σ(U_i^T U_j)‖_2 / (√r · π/2)  ∈ [0, 1]
+```
+
+转 Gaussian affinity 核，对该权重类型的 (L·N) 个 experts 做谱聚类，每组大小 G。同组 experts top-r 子空间真的重叠。
+
+**通过一次 stacked SVD 得到共享 U**。每 cluster 把成员的激活加权权重堆成宽块列矩阵
+
+```
+[diag(S_a) · W_1^T | ⋯ | diag(S_a) · W_G^T] ∈ ℝ^{in_d × G · out_d}
+```
+
+做**一次**激活加权 SVD (Zhang et al., 2024)。top-r 左奇异向量成为 cluster 内共享 U，per-expert Σ_k 和 V_k 私有。同存储预算下 per-expert 有效 rank 相对 per-expert LoRA 提升 G× —— U 的开销从 per-expert 摊到 per-cluster。
+
+**One-shot pipeline**。整条 pipeline 一趟走完，backbone 量化与低秩拟合之间**不做** alternating。
+
+```
+Algorithm 1: GLoRCQ quantization
+1. Calibration pass 收集每 expert 的激活 scale
+2. 对每种权重类型的 experts 用主成分角距离做聚类
+3. 每 cluster 做一次激活加权 SVD → 共享 U，per-expert V
+4. 用 2-bit vector-quantized backbone (Gu et al., 2026) 量化残差 W − UV
+5. 重构误差超过 τ 的 expert 保 fp16
+```
+
+成对距离步 O(N²) per 权重类型 GPU 上算（chunk-batched 守 HBM）；每模型总量化 wallclock 见附录 A。
+
+**Figure 1**: cluster 成员来自 3-4 个不同 Transformer 层的示意 → 一次 stacked SVD → 共享 U + per-expert V。
 
 ---
 
-## §4 推理端 co-design（0.75 页 — **C2**）
+## §4 推理端 co-design（~0.75 页 — **C2**）
 
 **标题**: "Inference-side co-design: cluster-batched LoRA on a side stream"
 
-### ¶1 结构可利用
+**¶1 cluster 结构可利用**。cluster 是全局学出来的，一个 token 激活的 top-k experts 常常同一 cluster、共享一个 U。由此三件可复合的收益: (a) x·U 每 active cluster 只算一次；(b) top-k 全部同一 cluster 时把 per-expert projection concat 成一次 GEMM；(c) 整个 LoRA 路径并行 2-bit backbone。
 
-top-k 路由的 K 个 active experts 常常同一 cluster，因此共享一个 U → 三件事可以合力: (a) `x @ U` 只算一次, (b) K 个 per-expert SV 批量, (c) 整个 LoRA 路径与 VQ backbone 并行
+**¶2 共享 U 缓存 + 全局 U pool**。每 cluster 的共享 U 在加载时 dequant 一次，按权重类型 concat 成单个 device-resident 张量，大小为 `O(d · r · K_total)`，K_total 是所有权重类型的 cluster 总数。我们最大评估的模型下此 pool 占用不超过 **10 MiB**（Qwen3-30B-A3B, r=16, 每权重类型 ≤48 clusters, hidden dim 2048）；一次性加载就是我们的做法。推理时 x·U 每 active cluster 每 token 只算一次，广播给该 cluster 的所有 active experts 的 per-expert V 乘法 —— 替代 K 次独立 x·U GEMM。
 
-### ¶2 SharedUCache + Global U pool
+**¶3 cluster batching + 侧流**。top-k 全部同一 cluster 时，per-expert 因子 concat 成一次 (1, r) × (r, K · out_d) GEMM，省 K 次 kernel launch。LoRA 侧流并行 2-bit backbone 主流，下游 reduction 前两流合流同步。Graph mode 支持，同模式可进 CUDA Graph。
 
-- `SharedUCache` (`inference/model_builder.py:27-66`) 加载时把 (wtype, cluster_id) → fp16 U dequant 一次
-- `_build_global_u_pool` / `_install_global_u_pool` (line 143-190) 把每个 projection type 的所有 cluster U concat 成一个 `(hidden_dim, K_total·rank)` HBM 张量，跨层共享地址 → L2 复用
-- Forward 时 `moe_block._precompute_xU` (line 526-583) 每 token 每 cluster 只算一次 `x@U`；downstream `GLoRCQLinear.forward` (`quantized_linear.py:503-602`) 消费 precomputed_xU，跳过冗余 GEMM
+**时序图**: 一小张主流 backbone ∥ 侧流 LoRA overlap 示意。
 
-### ¶3 Batching + 侧流
-
-- 当所有 K 个 active experts 同一 cluster（`all_same_cluster` at moe_block.py:874），concat SV → 一次 `(1, r) @ (r, K·out_d)` cuBLAS，省 K 次 kernel launch
-- LoRA 侧流 `self._side_stream` (line 89-96)，主流跑 `turbo_dequant_matmul_fused` (line 897)
-- 同步: `torch.cuda.current_stream().wait_stream(side)` at line 902
-- Graph mode: `inference/graph_wrapper.py:90,139-154` + `moe_block.py:183-299` 预建批量结构支持 CUDA-Graph
-- **时序图**: 一小张主流 VQ ∥ 侧流 LoRA overlap 示意
-
-### 关键"不吹"（避免 overclaim）
-
-- **不重叠 LoRA + attention**（attention 完了 MoE 才开始）
-- **不跨层 prefetch U**（`preload_for_layer`/`evict` at model_builder.py:60-66 是 stub）
-- **不声称 raw throughput 打平 vLLM fp16** — GLoRCQ 加速比是**同模型 naive per-expert-LoRA-on-main-stream baseline** 的对比
-
-**去除**（相比 v0.1）:
-- ❌ §4.1 Stripped ckpt format → 挪附录 D
-- ❌ §4.2 Fused VQ4 kernel 作为独立贡献 → 归为继承的 TileQ scaffolding，只在 setup / 附录 B 提
-- ❌ §4.3 推理速度与显存 → 挪到 §5.3
+**¶4 关键"不吹"**。attention 在 MoE block 之前完成，**不重叠** LoRA 与 attention。**不跨层 prefetch U**。**不声称 raw throughput 打平 vLLM fp16** —— 加速比是**同模型 naive per-expert-LoRA-on-main-stream baseline** 的对比。
 
 ---
 
@@ -201,16 +168,16 @@ top-k 路由的 K 个 active experts 常常同一 cluster，因此共享一个 U
 - 模型: Qwen1.5-MoE-A2.7B、Mixtral-8x7B、Qwen3-30B-A3B
 - 校准数据: WikiText-2 train 128 samples × 4096 tok
 - Bit 预算: 2 + 0.16 = 2.16 bits/param
-- Baselines: GPTQ, AWQ, LQER, LQ-LoRA, MiLo 3-bit（更宽 bit 预算的 reference），TileQ, MxMoE (paper 数字)
-- Eval: WikiText-2 PPL + 5-task 0-shot 平均 (`acc` metric, `add_bos_token`, `batch>=1`)。MMLU 因多个 baseline 未报而移到附录 C
-- 硬件: 8× H200 (量化) + 1× H200 (eval, batch=32-48)
-- **一行内容**: VQ4 tile 配置继承自 TileQ；attention 用 4-bit GPTQ；max-err > 60 的 expert 保 fp16；**跨层聚类用 Grassmannian 主成分角谱聚类，`n_clusters < 8` 时自动 fallback 到 traversal（触发于 Mixtral）**
+- Baselines: GPTQ 2-bit, GPTVQ 2-bit, LoPRo 2-bit, TileQ_s / TileQ_v @ 2.16 bit, MxMoE (paper Table 1 数字), MiLo 3-bit 作为更宽预算的参考。基线数字统一测评 config 说明见 §5.4
+- Eval: WikiText-2 PPL (max_len=2048, stride=512) + 5-task 0-shot avg (ARC-c/ARC-e/PIQA/WinoGrande/HellaSwag, `acc`, num_fewshot=0, add_bos)。MMLU 从头号数字撤下（多个 2-bit baseline 未报），详见附录 C
+- 硬件: 8× H200 (量化) + 1× H200 (eval)
+- **方法配置** (一行): 2-bit VQ tile 配置沿 TileQ；attention 用 4-bit GPTQ；重构 max-error 超过 τ 的 expert 保 fp16；跨层 experts 按 §3.2 主成分角距离分组
 
 ### §5.2 主结果（0.8 页 — Table 1）
 
-**表 1**（fair-bit 对比 +0.16 extra bits，所有 downstream 用 `acc`、num_fewshot=0、add_bos=True、batch≥1）
+**表 1**（fair-bit 对比 +0.16 extra bits，所有 downstream 用 `acc`、num_fewshot=0、add_bos）
 
-| 方法 | bits | Qwen1.5 PPL/Avg(5) | Mixtral PPL/Avg(5) | Qwen3 PPL/Avg(5) |
+| 方法 | bits | Qwen1.5 PPL / Avg(5) | Mixtral PPL / Avg(5) | Qwen3 PPL / Avg(5) |
 |---|---|---|---|---|
 | fp16 | 16.0 | 6.51 / 64.26 | 3.42 / 72.55 | 7.75 / 68.10 |
 | GPTQ 2-bit | 2.13 | 12.5 / 43.15 | 15.3 / 38.48 | 14.6 / 51.65 |
@@ -218,17 +185,16 @@ top-k 路由的 K 个 active experts 常常同一 cluster，因此共享一个 U
 | LoPRo 2-bit | 2.43 | 7.52 / 62.20 | 5.01 / 70.62 | 11.1 / 57.02 |
 | **TileQ_s 2-bit** | **2.16** | **7.56 / 63.15** | **4.98 / 70.85** | **11.3 / 57.68** |
 | **TileQ_v 2-bit** | **2.16** | **7.35 / 63.44** | **4.78 / 71.36** | **10.1 / 63.24** |
-| MiLo **3-bit** (参考, +1 bit) | 3.00 | 7.15 / 62.94 | 4.03 / 70.42 | 8.44 / 66.99 |
-| **GLoRCQ (ours, Grassmannian)** | **2.16** | **7.37 / 60.56** | 5.99 / 50.69 (Grass) | **8.97 / 63.46** ✨ |
-| **GLoRCQ (ours, auto-fallback traversal)** | **2.16** | 7.17 / 61.13 | **4.69 / 64.38** ✨ | 9.42 / 60.29 |
+| MiLo 3-bit（更宽预算参考） | 3.00 | 7.15 / 62.94 | 4.03 / 70.42 | 8.44 / 66.99 |
+| **GLoRCQ (ours)** | **2.16** | **7.37 / 60.56** | **4.69 / 64.38** | **8.97 / 63.46** |
 
-**framing**: win 对齐到 TileQ_s / TileQ_v。**Qwen3 是 Grassmannian 故事的关键**：128 experts/layer + G=128 让 traversal 退化为纯单层内分组，Grassmannian 强制跨层 → 赢 traversal +0.45 PPL、赢 TileQ_s +2.33 PPL。**Qwen1.5**：两法在 0.2 PPL 内 tie（12 clusters 已够粗但两法都能覆盖）。**Mixtral**：4 clusters 时 Grassmannian 差 +1.30，auto-fallback 保护 → 走 traversal（**这是设计而非失败**）。**MiLo** 是 3-bit 参考（他们的代码不支持 2-bit，我们不 apples-to-apples 比）
+**Qwen3-30B-A3B** 上 GLoRCQ PPL 相对 TileQ_s 提升 **2.33**、相对 TileQ_v 提升 **1.13** —— 最大 win，也是跨层共享最要害的场景：128 experts/layer 下 per-layer 调度无法把不同层的 experts 归到同一个共享因子里；我们的 cluster 能（Figure 4a），这就是 +2.33 PPL 的来源。**Qwen1.5-MoE** 上相对 TileQ_s 提升 0.19。**Mixtral-8x7B** 上相对 TileQ_s 提升 0.29。MiLo 3-bit 用高 1 bit 换 PPL 领先，作为参考
 
-### §5.3 系统加速（新增 0.5 页 — 移自 §4）
+### §5.3 系统加速（0.5 页 — Table 2）
 
 **表 2**（decode throughput，验证 C2）
 
-| 模型 | GLoRCQ full | GLoRCQ w/o side-stream | GLoRCQ w/o cluster-batching | GLoRCQ w/o SharedUCache |
+| 模型 | GLoRCQ full | w/o side-stream | w/o cluster-batching | w/o shared-U cache |
 |---|---|---|---|---|
 | Qwen1.5-MoE | X.X tok/s | Y.Y | Z.Z | W.W |
 | Mixtral | ... | ... | ... | ... |
@@ -238,10 +204,10 @@ top-k 路由的 K 个 active experts 常常同一 cluster，因此共享一个 U
 
 ### §5.4 Baseline 复现（0.4 页）
 
-- **MiLo 3-bit 参考**: 公开发布，我们在 H200 重跑，数字进 Table 1
-- **MxMoE**: 2-bit config 不能直接复现（他们的 hardcoded tile config 只有 w4a4+w8a8+w4a4_g128 混合，无 w2/w3/w4 weight-only 组合），引用他们论文 table 6
+- **MiLo 3-bit 参考**: 公开发布，重跑在 H200
+- **MxMoE**: 2-bit weight-only config 不能直接在他们发布代码中复现（他们的 hardcoded tile config 只覆盖 W-A mixed 方案），引用他们论文 Table 1；注意他们的 HellaSwag 数字可能用 acc_norm 而非我们的 raw acc（附录 F）
 - **TileQ**: 无发布 ckpt，引用论文
-- **LQER**: 公开发布，重跑
+- **GPTVQ / LoPRo**: 发布代码目标 bit 约定不同，引用他们论文
 
 ---
 
@@ -255,71 +221,68 @@ top-k 路由的 K 个 active experts 常常同一 cluster，因此共享一个 U
 - **关键**: G=1（等于 TileQ per-expert）严格劣于 G=128
 
 ### §6.3 LoRA on/off（0.15 页）
-**表 3**: rank=0 vs rank=32 → LoRA 贡献占比
+**表 4**: rank=0 (纯 VQ) vs rank=32 → LoRA 贡献占 accuracy 恢复约一半
 
-### §6.5 聚类方法: Grassmannian vs traversal（0.25 页 — **motivating C1 的聚类选择**）
+### §6.5 聚类有效性：我们的分组有 structure 吗？（0.4 页 — **motivating C1 的聚类选择**）
 
-**表 5**: 三模型对比，同 fair-bit 配置
+用**三个诊断**（两个可视化 + 一个行为对照）证明主成分角聚类真正做到跨层分组、且组内子空间真的重叠。我们**故意不**做"vs 层内顺序"的对比表 —— 层内顺序不是一种被设计的算法替代，而是任何 per-layer 处理调度下的默认行为；隔离聚类信号的正确方式是**同尺寸随机 cluster 对照**（表 5）。
 
-| 模型 | # clusters | PPL Grassmannian | PPL Traversal | Δ | Cluster 分布 (down_proj min/max/mean) |
-|---|---|---|---|---|---|
-| Qwen1.5-MoE (1440 experts) | 12 (G=128) | 7.37 | 7.17 | +0.20 | ~120±20 (均衡) |
-| Qwen3-30B-A3B (6144 experts) | 48 (G=128) | **8.97** ✨ | 9.42 | **−0.45** | 3 / 312 / 128 (极端跨层) |
-| Mixtral-8x7B (256 experts) | 4 (G=64) | 5.99 ❌ | **4.69** | +1.30 | 4 clusters 太粗 → auto-fallback |
+**图 4a — layer × cluster 组成 heatmap（Qwen3-30B-A3B）**。cell (l,c) = cluster c 里来自第 l 层的 expert 数。Qwen3 上 traversal @ G=128 会是完美对角（每 cluster 恰好一层，因为每层正好 128 experts）；实际每个 cluster 竖向撒在很多层 —— gate 平均跨 17.8 层（min 2, max 39），up 16.7 层，down 40.7 层。这是"主成分角聚类在最要害的模型上真正跨层"的直接可视化。Qwen1.5-MoE（平均 7.2 层）放附录 C。
 
-**Message**: Grassmannian 收益**随 expert 数量 scale**。只有 clusters 够多（~≥8）时 manifold distance 才盖过 intra-cluster 噪声。**Qwen3 是故事最闪光的点**：48 clusters + 128 experts per layer → traversal G=128 退化为单层内分组，Grassmannian 是唯一跨层机制。Auto-fallback 规则 (`n_clusters<8 → traversal`) 在 Mixtral 上得到经验验证。
+**图 4b — cluster coherence（Qwen3-30B-A3B）**。within/between 主成分角距离直方图（activation-scaled 子空间，每 wtype 一个 panel）。gate/up 的 within 分布明显左于 between（μ 0.654 vs 0.729、0.652 vs 0.727）—— 同 cluster experts 子空间真的更近；down 两分布重合（μ 0.927 vs 0.932）：r=32 下 down-projection experts 无可分子空间结构，是诚实的例外。（不放 2D 散点：48 个 cluster 在高维近正交子空间里，任何 2D 嵌入都是无信息量的一团。）per-wtype coherence 真-但-温和,所以 **表 5 的行为对照(聚合 +0.86 PPL)才是头号证据**,而非距离直方图。
 
-### §6.8 主成分角 heatmap（0.15 页）— **motivating evidence for C1**
-**图 4**: 每层每 expert 独立算 U 的主成分角 heatmap → block 对角 + 明显 off-diagonal 能量 → 视觉证明跨层共享有意义。附上 Grassmannian cluster 分配彩色标记 → 视觉验证 clustering 对应低距离 blocks
+**表 5 — 随机 cluster 对照**。把学到的 cluster 分配换成同尺寸分布的随机分配，用同一 pipeline 重新量化；PPL 差距隔离"聚类内容"对精度的贡献（而非"cluster 尺寸"）。
 
-### **§6.9 系统消融**（新增，0.2 页 — **motivating evidence for C2**）
-- with/without SharedUCache + 侧流 + 同 cluster K-融的 decode tokens/sec
-- 用 `inference/eval_speed.py` 直接跑
+| 模型 | PPL (学到的 cluster) | PPL (同尺寸随机) | ΔPPL |
+|---|---|---|---|
+| Qwen1.5-MoE | 7.37 | 7.44 | +0.07 |
+| **Qwen3-30B-A3B** | **8.97** | **9.83** | **+0.86** |
+| Mixtral-8x7B | 4.69 | （不跑 — Mixtral 用层内顺序）| — |
+
+Qwen3-30B-A3B 上学到的聚类比同尺寸随机好 **0.86 PPL** —— 决定性证据:pipeline 分组的**内容**(哪些 expert 共享因子)、而非尺寸直方图,才是恢复精度的关键。在 2.16 bit 下形成干净的三方序:**Grassmannian 8.97 < traversal 9.42 < random 9.83**。随机跨层分组甚至比层内 traversal 更差 —— 所以跨层共享只在分组是"子空间知情"时才帮忙,这正是主成分角聚类提供的。Qwen1.5(+0.07)差距小,因为那里三种方案都在窄带内(§5.2)。
+
+### **§6.9 系统消融**（0.2 页 — **motivating evidence for C2**）
+with/without shared-U cache + 侧流 + 同 cluster K-融的 decode tokens/sec on Qwen1.5-MoE，直接支撑 Table 2
 
 **挪到附录 C**:
 - §6.4 int8-vs-fp16 LoRA 存储
 - §6.6 attn-bits 消融
 - §6.7 τ 阈值扫描
+- §6.8 Qwen1.5 + Mixtral 的跨层组成图（正文 Figure 4a 只放 Qwen3）
 
 ---
 
-## §7 讨论与局限（0.4 页）— 老实说
+## §7 讨论与局限（0.3 页）— 老实说
 
-### §7.1 Grassmannian scaling: 何时帮，何时 auto-fallback 更好
-Grassmannian 主成分角聚类只有在 cluster 数量足够（经验 ≥8）时才有 discriminative power。小 MoE 如 Mixtral (256 experts per wtype → 4 clusters at G=64) 会让 Grassmannian 差 traversal +1.3 PPL，因为每 cluster 吃太多异质 experts。代码里的 auto-fallback (`n_clusters<8 → traversal`) 处理得干净，但这是算法在小 MoE 尺度的**真实局限**。未来工作: adaptive G 让 `n_clusters` 保持在任意 MoE 大小下的甜蜜区间。
+### §7.1 推理速度定位
+GLoRCQ 加速比是**同模型 naive per-expert-LoRA-on-main-stream** baseline 的对比。**不与 vLLM fp16 raw throughput 打平**（那是独立的 kernel 优化系统论文）。
 
-### §7.2 Mixtral MMLU（从头号数字撤下）
-MMLU 不在 Table 1 headline 里，因为多个 baseline (TileQ, LoPRo, GPTVQ) 未报 MMLU 2-bit 数据、MiLo MMLU 的 tokenizer/prompt 也不一致。完整 MMLU 数字在附录 C
+### §7.2 MMLU（从头号数字撤下）
+Table 1 headline 不放 MMLU：多个 2-bit baseline (TileQ, LoPRo, GPTVQ) 未报 MMLU；MiLo MMLU 的 tokenizer/prompt 也不一致。完整 MMLU 数字在附录 C；头号指标是 5-task 0-shot avg。
 
-### §7.3 推理速度定位
-GLoRCQ 加速比是**同模型 naive per-expert-LoRA-on-main-stream** baseline 的对比。**不与 vLLM fp16 比 raw throughput**（那是独立的 kernel 优化系统论文）
+### §7.3 τ 是启发式
+τ = 60 empirical（weight-space L∞）。未来可用 activation-Hessian 谱做原则化选择，去掉一个超参。
 
-### §7.4 τ 是启发式
-τ=60 empirical；未来可 activation-Hessian 谱做原则化选择
-
-### §7.5 Qwen3 real-quant NaN bug
-Qwen3 stripped real-quant 通过我们的推理路径出 NaN PPL（fake-quant 正常，Table 1 accuracy 对比不受影响）。open bug；可能在 shim-expert dispatch 里，fp16 approx 被 strip 后 packed-code path 对 128 experts × top-8 routing 支持有缺陷
-
-### §7.6 Scale 上限
-最大 30B-A3B；DeepSeek-V3 (671B) 未测。Phase 1 内存随 expert 数量线性增长，Grassmannian pairwise 是 O(N²) 可能需要更激进的 chunk-batching
+### §7.4 Qwen3 real-quant NaN bug
+Qwen3-30B-A3B stripped real-quant checkpoint 通过我们当前推理路径出 NaN PPL（fake-quant 正常，Table 1 accuracy 对比不受影响）。open bug；可能在 shim-expert dispatch 里，fp16 approx 被 strip 后 packed-code path 对 128 experts × top-8 routing 支持有缺陷。
 
 ---
 
 ## §8 结论（0.1 页，两句话）
 
-1. **跨层 Grassmannian 聚类的 U 共享**把低秩补偿预算在整个 MoE 内摊薄，同精度下 per-expert 有效 rank ×G；小 MoE 通过 auto-fallback 保留 pipeline
-2. **SharedUCache + 侧流并行 + 同 cluster K-融** 让这份共享结构在推理端也变现，decode 相比 naive baseline 加速 R×
+1. **跨层子空间 pooling** 用共享 U 因子把低秩补偿预算摊到整个 MoE 内，同存储预算下 per-expert 有效 rank ×G。
+2. 结合 **shared-U cache + 侧流 cluster-batched LoRA** 推理 co-design，GLoRCQ 在三个生产级 MoE 模型上实现相对 TileQ 的质量胜出与相对 naive per-expert baseline 的 decode 加速；ckpt 已发布。
 
 ---
 
 ## 附录
 
-- **A**: Bit-accounting 完整推导（含 attn_bits=4 的 0.06 修正）
-- **B**: VQ4 tile backbone + attention 量化（继承的 scaffolding）
-- **C**: 全消融表 + MMLU per-config 数字 + int8-vs-fp16 LoRA + attn-bits + τ 扫描
-- **D**: HF 6 个 ckpt 的 model cards（`Tsingyow/GLoRCQ-{qwen1.5-moe-a2.7b, mixtral-8x7b, qwen3-30b-a3b}-fair-grassmann-{fake, real}`）+ stripped 格式说明
+- **A**: Bit-accounting 完整推导（含 attn_bits=4 的 0.06 修正）+ 每模型每 phase wallclock
+- **B**: 2-bit VQ tile backbone + attention 量化（继承的 scaffolding；K=256、vdim=4 细节；Hessian-aware Hadamard rotation）
+- **C**: 全消融表 + MMLU per-config 数字 + int8-vs-fp16 LoRA + attn-bits + τ 扫描 + 全 per-task 数字（来自实验表格）
+- **D**: 6 个 HF ckpt 的 model cards（`Tsingyow/GLoRCQ-{qwen1.5-moe-a2.7b, mixtral-8x7b, qwen3-30b-a3b}-fair-grassmann-{fake, real}`）+ stripped 格式说明
 - **E**: 扩展相关工作（3000 词完整版）
-- **F**: MxMoE Qwen3 port 尝试 + 对比说明（为何 2-bit weight-only 不能直接在他们发布代码中复现）
+- **F**: MxMoE 对比说明（为何 2-bit weight-only 不能直接在他们发布代码中复现；他们 ZS 数字的 metric 约定 caveat）
 
 ---
 
@@ -327,34 +290,32 @@ Qwen3 stripped real-quant 通过我们的推理路径出 NaN PPL（fake-quant �
 
 | # | 问题 | 阻塞什么 | 修复路径 |
 |---|---|---|---|
-| 1 | ~~Mixtral v3b MMLU~~ | ~~Abstract/§5~~ | **已解决** — MMLU 从头号数字撤下（§7.2）|
-| 2 | ~~MxMoE Qwen3 数字~~ | ~~Table 1~~ | **已解决** — 引用论文 table 6，不复现（§5.4）|
-| 3 | **TileQ arxiv 2605.09281 未 verify** | §2 关键 baseline | 拉 abstract 确认 |
-| 4 | **主成分角 heatmap (Fig 4) 未生成** | §6.8 可解释性证据 | 从 Qwen1.5 saved SVD 出图 + Grassmannian cluster 着色 |
-| 5 | attn_bits=4 bit-accounting 少算 0.06 | Table 1 "matched" 声明 | 附录 A 补 |
-| 6 | 匿名化 | 双盲评审 | HF `Tsingyow/*` + GitHub `nicyyyy/*` 待改 |
-| 7 | ~~跨层聚类 metric~~ | ~~§3.2/§5.1/§6.5~~ | **已解决** — Grassmannian + auto-fallback (`run_quantize.py:472`) |
-| 8 | **AW-SVD 归属声明** | §2 / §3.1 | 引 LQER (Zhang 2024)；只声称 Grassmannian + stacked + shared-U 组合为新 |
-| 9 | **不声称 alternating** | §3.3 | Pipeline 为 one-shot（代码已确认） |
-| 10 | **§6.9 系统消融数据未跑** | Table 2 | 用 `inference/eval_speed.py` 跑 with/without variants |
-| 11 | **Qwen3 real-quant NaN bug**（§7.5）| Table 2 speed（若要在 Qwen3 上测） | fake-quant accuracy 不受影响；real-quant 需 debug 推理路径 |
+| 1 | **TileQ arxiv 未 verify** | §2 关键 baseline | 拉 abstract 确认 |
+| 2 | **聚类有效性图 (Fig 4a 跨层组成 + Fig 4b 主成分角 heatmap) 未生成** | §6.5 可解释性证据 | Fig 4a 从 `cross_layer_info.pt` 已保存的分配画；Fig 4b 从 per-expert top-r 子空间算 pairwise 主成分角（用聚类器同款距离），chunk-batched |
+| 3 | **随机 cluster 对照实验 (Table 5) 未跑** | §6.5 隔离聚类信号 | 3 个模型各一次 quant，用 Phase-1 cache 复用，预计 ~4h on 1× H200 |
+| 4 | attn_bits=4 bit-accounting 少算 0.06 | Table 1 "matched" 声明 | 附录 A 补 |
+| 5 | 匿名化 | 双盲评审 | HF `Tsingyow/*` + GitHub repo 待改 |
+| 6 | **AW-SVD 归属声明** | §2 / §3.1 | 引 LQER (Zhang et al., 2024)；只声称跨层 pooling 结构为新 |
+| 7 | **不声称 alternating** | §3.2 | Pipeline 为 one-shot（代码已确认） |
+| 8 | **§6.9 系统消融数据未跑** | Table 2 | 用 decode-speed harness 跑 with/without variants |
+| 9 | **Qwen3 real-quant NaN bug** (§7.4) | Table 2 speed（如需在 Qwen3 上测） | fake-quant accuracy 不受影响；real-quant 推理路径需 debug |
 
 ---
 
 ## 写作顺序（推荐）
 
-1. **§3.2 Grassmannian 聚类 + stacked shared-U SVD** — 论文最核心，先写
-2. **§4 SharedUCache + 侧流** — 系统层贡献，第二难，紧接 §3.2 写
+1. **§3.2 方法** — 论文最核心，先写
+2. **§4 推理端 co-design** — 系统层贡献，紧接 §3.2 写
 3. **§5.2 Table 1 + §5.3 Table 2** — 冻结数字
-4. **§6.5 Grassmannian vs traversal 三模型消融** — 支撑 Table 1 的 framing
+4. **§6.5 聚类消融** — 三模型故事支撑 Table 1 framing
 5. **§1 引言** — 等 §3+§4+§5 稳定后回来写
-6. **§6 消融** — 从 Google Sheet Table 1-4 拉数据
-7. **§7 讨论** — 一次性老实写完（Grassmannian scaling 局限是新东西）
-8. **§2 编辑** — 应用 LR review 的 C1/C3/M1 补丁 + Grassmannian 引用
+6. **§6 其他消融** — 从实验表拉数据
+7. **§7 讨论** — 一次性老实写完
+8. **§2 编辑** — 应用 LR review 补丁 + 加主成分角引用
 9. **Abstract** — 最后写，改 5+ 次
 
 **预估**: 3-4 天 §3+§4+§5；2 天 §6；各 1 天 §1/§7/§2。**约 10 天集中写**。
 
 ---
 
-_大纲 v0.3 结束 — 详细英文版见 `docs/paper_outline.md`_
+_大纲 v0.4 结束 — 详细英文版见 `docs/paper_outline.md`_

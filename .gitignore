@@ -22,3 +22,7 @@ thirdpart/
 .env
 *.tmp
 exp/*.pdf
+
+# Cluster-validity large regenerable artifacts (exp/cluster)
+exp/cluster/*.npz
+exp/cluster/qwen3_assignments.pkl
