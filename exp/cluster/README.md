@@ -32,7 +32,7 @@ Figure scheme (v2, chosen 2026-07-09 for readability):
 
 | Model | learned clusters PPL | random matched-size PPL | ΔPPL |
 |---|---|---|---|
-| Qwen1.5-MoE | 7.37 | 7.44 | +0.07 (learned better) |
+| Qwen1.5-MoE | 7.14 | 7.44 | +0.30 (learned better; both A100+same cache) |
 | Qwen3-30B-A3B | 8.97 | 9.83 | **+0.86** (learned better) |
 
 Three-way at matched 2.16 bits on Qwen3: Grassmannian 8.97 < traversal 9.42 < random 9.83.
@@ -53,7 +53,7 @@ within<between separation (Δμ≈0.075); down_proj has no separable structure a
 The learned Grassmannian assignments used throughout come from the winning fair-bit
 Qwen1.5 fake-quant checkpoint at
 `/mnt/Data/yqy/resource_dir/glorcq_grassmann/qwen15_fair_grassmann_v3a_r32_recon0/`
-(PPL = 7.37, +0.16 extra bits, `fix_rank=20`, `G=128`, `cluster_rank=32`,
+(A100 canonical PPL = 7.14; the v3a ckpt itself scored 7.22 due to cross-run kmeans variance; +0.16 extra bits, `fix_rank=20`, `G=128`, `cluster_rank=32`,
 `cluster_recon_weight=0.0`, `seed=42`). `cross_layer_info.pt` in that directory
 stores `assignments[wtype]` as a list of `{layer, expert, group_id}` records.
 `group_id` here is the SVD-sharing group (size-G slabs of the sorted spectral
