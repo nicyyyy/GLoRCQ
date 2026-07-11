@@ -1092,6 +1092,22 @@ def _export_real_quant_pack(WR, output_path, model_path, *,
 # Main pipeline
 # ---------------------------------------------------------------------------
 @torch.no_grad()
+def _set_all_seeds(seed: int):
+    """Pin every RNG the pipeline touches so results reproduce regardless of
+    Phase-1 cache hit/miss. The rank-1 sketch (sketch/r1_sketch.py) inits U/V
+    with numpy.random, the Grassmannian distance uses torch.svd_lowrank
+    (random projection); both must start from a fixed state. Called at run
+    start and again right before Phase 2 (so a cached Phase 1, which skips the
+    Phase-1 RNG consumption, still enters Phase 2 at the same state as a fresh
+    run)."""
+    import random as _random
+    import numpy as _np
+    _random.seed(seed)
+    _np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
 def run_tileq_glorcq(model_path, output_path, qbit=2, fix_rank=32, G=128,
                      group_size=128, lora_bit=16, lora_iter=8,
                      ha_bsize=256, id_bsize=256, use_cache=True, attn_bits=16,
@@ -1100,6 +1116,7 @@ def run_tileq_glorcq(model_path, output_path, qbit=2, fix_rank=32, G=128,
                      strip_fp16_quantized=False, max_err_threshold=60.0,
                      cluster_method='traversal', cluster_recon_weight=0.0,
                      cluster_seed=42, cluster_rank=None):
+    _set_all_seeds(cluster_seed)
     # ---- Load model ----
     config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
     config.use_cache = False
@@ -1172,6 +1189,10 @@ def run_tileq_glorcq(model_path, output_path, qbit=2, fix_rank=32, G=128,
             _wr_to_dev(WR, DEV)
 
     # ---- Phase 2: cross-layer SVD ----
+    # Re-pin seeds so Phase-2 sketch/clustering RNG is identical whether Phase 1
+    # was cached or freshly computed (a cached Phase 1 skips the Phase-1 forward,
+    # which would otherwise leave the RNG at a different state).
+    _set_all_seeds(cluster_seed)
     print("\n[Phase 2] Cross-layer group sharing (G={}) ...".format(G), flush=True)
     fill_phase2(WR, all_expert_recs, fix_rank, lora_bit, lora_iter, qbit,
                 G, quant_infos, wtypes, int8_lora=int8_lora, int8_lora_v=int8_lora_v,
