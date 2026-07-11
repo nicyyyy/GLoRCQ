@@ -198,9 +198,9 @@ The pairwise-distance step is O(N²) per weight type on GPU (chunk-batched to st
 | **TileQ_s 2-bit** | **2.16** | **7.56 / 63.15** | **4.98 / 70.85** | **11.3 / 57.68** |
 | **TileQ_v 2-bit** | **2.16** | **7.35 / 63.44** | **4.78 / 71.36** | **10.1 / 63.24** |
 | MiLo (3-bit, higher-budget ref) | 3.00 | 7.15 / 62.94 | 4.03 / 70.42 | 8.44 / 66.99 |
-| **GLoRCQ (ours)** | **2.16** | **7.37 / 60.56** | **4.69 / 64.38** | **8.97 / 63.46** |
+| **GLoRCQ (ours)** | **2.16** | **7.14 / 62.76** | **4.69 / 64.38** | **8.97 / 63.46** |
 
-On **Qwen3-30B-A3B** GLoRCQ improves PPL by **2.33** over TileQ_s and **1.13** over TileQ_v — the largest win, and the one where cross-layer sharing matters most: at 128 experts per layer, per-layer grouping schedules cannot mix experts from different layers within a single shared factor. Our clusters do (Figure 4a) and this is what the +2.33 PPL captures. On **Qwen1.5-MoE** GLoRCQ improves PPL by 0.19 over TileQ_s. On **Mixtral-8x7B** GLoRCQ improves PPL by 0.29 over TileQ_s at matched bits. MiLo at 3-bit is included as a higher-budget reference; its extra 1 bit over our budget explains its PPL advantage.
+On **Qwen3-30B-A3B** GLoRCQ improves PPL by **2.33** over TileQ_s and **1.13** over TileQ_v — the largest win, and the one where cross-layer sharing matters most: at 128 experts per layer, per-layer grouping schedules cannot mix experts from different layers within a single shared factor. Our clusters do (Figure 4a) and this is what the +2.33 PPL captures. On **Qwen1.5-MoE** GLoRCQ improves PPL by 0.42 over TileQ_s (7.14 vs 7.56). On **Mixtral-8x7B** GLoRCQ improves PPL by 0.29 over TileQ_s at matched bits. MiLo at 3-bit is included as a higher-budget reference; its extra 1 bit over our budget explains its PPL advantage. (Qwen1.5 numbers are all measured on a single A100 with a shared calibration pass so the headline and the §6 ablations are directly comparable.)
 
 ### §5.3 Systems speedup (~0.5 page) — Table 2
 
@@ -226,13 +226,13 @@ Data collected via decode-speed harness (batch=1, prompt_len=128, gen_len=128, m
 ## §6 Ablations (~1.25 pages)
 
 ### §6.1 Rank sweep (~0.2 p)
-**Figure 2**: PPL vs rank r ∈ {16, 32, 64, 128} on Qwen1.5-MoE. **Message**: PPL improves log-shape with rank; knee at r=32.
+**Table (Qwen1.5-MoE, Grassmannian, A100)**: PPL vs LoRA rank r — r=16 → 7.168 (+0.08 bits), r=20 → 7.142 (+0.16, fair-bit base), r=32 → 7.166 (+0.16), r=64 → 7.077 (+0.32). **Message**: rank ≈ 20 already captures most of the benefit at fair budget; PPL is flat from r=16 to r=32 and only improves meaningfully at r=64, which costs 2× the LoRA bits (2.32 total, above budget). We adopt r=20 as the fair-bit operating point.
 
 ### §6.2 Group size G sweep (~0.25 p)
-**Figure 3**: PPL vs G ∈ {64, 128, 256, 512} at matched bit budget. **Key**: G=1 (per-expert LoRA, matching TileQ) is strictly worse than G=128.
+**Table (Qwen1.5-MoE, Grassmannian, A100)**: G=64 (23 clusters) → 7.218; G=128 (12 clusters, base) → 7.142. **Message**: the larger sharing group (G=128) is both cheaper in bits (fewer shared-U matrices) and lower PPL than G=64 — more experts per shared U is better, directly supporting C1. G=1 (per-expert LoRA, = TileQ) is the degenerate lower end. For Qwen1.5, G≥256 yields fewer than 8 clusters and the pipeline auto-falls back to layer-order grouping, so those points are not Grassmannian.
 
 ### §6.3 LoRA on/off (~0.15 p)
-**Table 4**: rank=0 (pure VQ) vs rank=32 (default). **Message**: LoRA compensation contributes roughly half of the accuracy recovery.
+**Table**: rank=0 (pure VQ backbone, no low-rank correction) vs rank=20 (default). LoRA compensation is grouping-agnostic here (no shared U exists at rank 0). **Message**: the low-rank correction contributes a substantial share of the accuracy recovery over the bare 2-bit backbone.
 
 ### §6.5 Cluster validity: do our groups carry structure? (~0.4 p) — **motivating evidence for C1's clustering choice**
 
@@ -246,11 +246,11 @@ We use three diagnostics — two visual, one behavioral — to establish that pr
 
 | Model | PPL (learned clusters) | PPL (random, matched sizes) | ΔPPL |
 |---|---|---|---|
-| Qwen1.5-MoE | 7.37 | 7.44 | +0.07 |
+| Qwen1.5-MoE | 7.14 | 7.44 | +0.30 |
 | **Qwen3-30B-A3B** | **8.97** | **9.83** | **+0.86** |
 | Mixtral-8x7B | 4.69 | (not run — Mixtral uses layer-order) | — |
 
-On Qwen3-30B-A3B the learned clustering beats a same-size random assignment by **0.86 PPL** — decisive evidence that *what* the pipeline groups (which experts share a factor), not merely the group-size histogram, is what recovers accuracy. This composes into a clean three-way ordering on Qwen3 at matched 2.16 bits/param: **Grassmannian 8.97 < traversal 9.42 < random 9.83**. Random cross-layer grouping is actually *worse* than layer-order traversal, so cross-layer sharing only helps when the grouping is subspace-informed — exactly what principal-angle clustering provides. The Qwen1.5-MoE gap (+0.07) is smaller because there the three schemes are all within a narrow band (§5.2).
+On Qwen3-30B-A3B the learned clustering beats a same-size random assignment by **0.86 PPL** — decisive evidence that *what* the pipeline groups (which experts share a factor), not merely the group-size histogram, is what recovers accuracy. This composes into a clean three-way ordering on Qwen3 at matched 2.16 bits/param: **Grassmannian 8.97 < traversal 9.42 < random 9.83**. Random cross-layer grouping is actually *worse* than layer-order traversal, so cross-layer sharing only helps when the grouping is subspace-informed — exactly what principal-angle clustering provides. On Qwen1.5-MoE the learned clustering beats random by 0.30 PPL (7.14 vs 7.44; both measured on the same A100 with a shared calibration pass). The effect is smaller than Qwen3's because Qwen1.5's 60-expert layers give the clusterer far less cross-layer material to exploit than Qwen3's 128-expert layers.
 
 ### §6.9 Systems ablation (~0.2 p) — **motivating evidence for C2**
 With/without shared-U cache, with/without side-stream, with/without same-cluster batching: decode tokens/sec on Qwen1.5-MoE. Feeds directly into Table 2's per-component decomposition.

@@ -186,9 +186,9 @@ Algorithm 1: GLoRCQ quantization
 | **TileQ_s 2-bit** | **2.16** | **7.56 / 63.15** | **4.98 / 70.85** | **11.3 / 57.68** |
 | **TileQ_v 2-bit** | **2.16** | **7.35 / 63.44** | **4.78 / 71.36** | **10.1 / 63.24** |
 | MiLo 3-bit（更宽预算参考） | 3.00 | 7.15 / 62.94 | 4.03 / 70.42 | 8.44 / 66.99 |
-| **GLoRCQ (ours)** | **2.16** | **7.37 / 60.56** | **4.69 / 64.38** | **8.97 / 63.46** |
+| **GLoRCQ (ours)** | **2.16** | **7.14 / 62.76** | **4.69 / 64.38** | **8.97 / 63.46** |
 
-**Qwen3-30B-A3B** 上 GLoRCQ PPL 相对 TileQ_s 提升 **2.33**、相对 TileQ_v 提升 **1.13** —— 最大 win，也是跨层共享最要害的场景：128 experts/layer 下 per-layer 调度无法把不同层的 experts 归到同一个共享因子里；我们的 cluster 能（Figure 4a），这就是 +2.33 PPL 的来源。**Qwen1.5-MoE** 上相对 TileQ_s 提升 0.19。**Mixtral-8x7B** 上相对 TileQ_s 提升 0.29。MiLo 3-bit 用高 1 bit 换 PPL 领先，作为参考
+**Qwen3-30B-A3B** 上 GLoRCQ PPL 相对 TileQ_s 提升 **2.33**、相对 TileQ_v 提升 **1.13** —— 最大 win，也是跨层共享最要害的场景：128 experts/layer 下 per-layer 调度无法把不同层的 experts 归到同一个共享因子里；我们的 cluster 能（Figure 4a），这就是 +2.33 PPL 的来源。**Qwen1.5-MoE** 上相对 TileQ_s 提升 0.42（7.14 vs 7.56）。**Mixtral-8x7B** 上相对 TileQ_s 提升 0.29。MiLo 3-bit 用高 1 bit 换 PPL 领先，作为参考。（Qwen1.5 全部数字在同一台 A100 + 共享 calibration 上测，headline 与 §6 消融直接可比。）
 
 ### §5.3 系统加速（0.5 页 — Table 2）
 
@@ -214,14 +214,13 @@ Algorithm 1: GLoRCQ quantization
 ## §6 消融（1.25 页）
 
 ### §6.1 Rank 扫描（0.2 页）
-**图 2**: PPL vs rank ∈ {16, 32, 64, 128} on Qwen1.5-MoE
+**表（Qwen1.5-MoE, Grassmannian, A100）**: r=16→7.168 (+0.08 bits)、r=20→7.142 (+0.16, fair-bit base)、r=32→7.166 (+0.16)、r=64→7.077 (+0.32)。**结论**: rank≈20 在 fair 预算下已够;r16→r32 PPL 基本平,只有 r=64 明显降(但 2× LoRA bits,超预算)。采用 r=20 作 fair-bit 工作点。
 
 ### §6.2 Group 大小 G 扫描（0.25 页）
-**图 3**: PPL vs G ∈ {64, 128, 256, 512}，同 bit 预算
-- **关键**: G=1（等于 TileQ per-expert）严格劣于 G=128
+**表（Qwen1.5-MoE, Grassmannian, A100）**: G=64 (23 clusters)→7.218;G=128 (12 clusters, base)→7.142。**结论**: 更大共享组 G=128 **又省 bits(更少 shared-U)又低 PPL** —— 每组共享更多 experts 更好,直接支撑 C1。G=1 (per-expert = TileQ) 是退化下界。Qwen1.5 上 G≥256 clusters<8 → pipeline auto-fallback 回层内顺序,不算 Grassmannian 点。
 
 ### §6.3 LoRA on/off（0.15 页）
-**表 4**: rank=0 (纯 VQ) vs rank=32 → LoRA 贡献占 accuracy 恢复约一半
+**表**: rank=0 (纯 VQ backbone,无低秩修正) vs rank=20 (default)。此处 LoRA 与 grouping 无关(rank 0 无 shared U)。**结论**: 低秩修正相对裸 2-bit backbone 贡献可观的精度恢复。
 
 ### §6.5 聚类有效性：我们的分组有 structure 吗？（0.4 页 — **motivating C1 的聚类选择**）
 
@@ -235,11 +234,11 @@ Algorithm 1: GLoRCQ quantization
 
 | 模型 | PPL (学到的 cluster) | PPL (同尺寸随机) | ΔPPL |
 |---|---|---|---|
-| Qwen1.5-MoE | 7.37 | 7.44 | +0.07 |
+| Qwen1.5-MoE | 7.14 | 7.44 | +0.30 |
 | **Qwen3-30B-A3B** | **8.97** | **9.83** | **+0.86** |
 | Mixtral-8x7B | 4.69 | （不跑 — Mixtral 用层内顺序）| — |
 
-Qwen3-30B-A3B 上学到的聚类比同尺寸随机好 **0.86 PPL** —— 决定性证据:pipeline 分组的**内容**(哪些 expert 共享因子)、而非尺寸直方图,才是恢复精度的关键。在 2.16 bit 下形成干净的三方序:**Grassmannian 8.97 < traversal 9.42 < random 9.83**。随机跨层分组甚至比层内 traversal 更差 —— 所以跨层共享只在分组是"子空间知情"时才帮忙,这正是主成分角聚类提供的。Qwen1.5(+0.07)差距小,因为那里三种方案都在窄带内(§5.2)。
+Qwen3-30B-A3B 上学到的聚类比同尺寸随机好 **0.86 PPL** —— 决定性证据:pipeline 分组的**内容**(哪些 expert 共享因子)、而非尺寸直方图,才是恢复精度的关键。在 2.16 bit 下形成干净的三方序:**Grassmannian 8.97 < traversal 9.42 < random 9.83**。随机跨层分组甚至比层内 traversal 更差 —— 所以跨层共享只在分组是"子空间知情"时才帮忙,这正是主成分角聚类提供的。Qwen1.5 上学到的聚类比随机好 0.30 PPL(7.14 vs 7.44,同一台 A100 + 共享 calibration);差距比 Qwen3 小,因为 Qwen1.5 每层 60 experts 给聚类器的跨层素材远少于 Qwen3 的 128。
 
 ### **§6.9 系统消融**（0.2 页 — **motivating evidence for C2**）
 with/without shared-U cache + 侧流 + 同 cluster K-融的 decode tokens/sec on Qwen1.5-MoE，直接支撑 Table 2
