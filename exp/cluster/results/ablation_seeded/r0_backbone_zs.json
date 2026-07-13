@@ -1,0 +1,72 @@
+{
+  "model_path": "/mnt/Data/yqy/resource_dir/glorcq_grassmann/abl_seeded/r0_backbone",
+  "tasks": [
+    "arc_challenge",
+    "arc_easy",
+    "piqa",
+    "winogrande",
+    "hellaswag"
+  ],
+  "num_fewshot": 0,
+  "task_results": {
+    "arc_challenge": {
+      "metric": "acc",
+      "value": 0.35580204778157
+    },
+    "arc_easy": {
+      "metric": "acc",
+      "value": 0.6603535353535354
+    },
+    "piqa": {
+      "metric": "acc",
+      "value": 0.766050054406964
+    },
+    "winogrande": {
+      "metric": "acc",
+      "value": 0.6921862667719021
+    },
+    "hellaswag": {
+      "metric": "acc",
+      "value": 0.502688707428799
+    },
+    "average": {
+      "metric": "acc",
+      "value": 0.5954161223485541
+    }
+  },
+  "full_results": {
+    "arc_challenge": {
+      "alias": "arc_challenge",
+      "acc,none": 0.35580204778157,
+      "acc_stderr,none": 0.01399057113791884,
+      "acc_norm,none": 0.3924914675767918,
+      "acc_norm_stderr,none": 0.014269634635670669
+    },
+    "arc_easy": {
+      "alias": "arc_easy",
+      "acc,none": 0.6603535353535354,
+      "acc_stderr,none": 0.009717845628687407,
+      "acc_norm,none": 0.6035353535353535,
+      "acc_norm_stderr,none": 0.010037412763064506
+    },
+    "hellaswag": {
+      "alias": "hellaswag",
+      "acc,none": 0.502688707428799,
+      "acc_stderr,none": 0.0049897092671913005,
+      "acc_norm,none": 0.6781517625970922,
+      "acc_norm_stderr,none": 0.004662303395239627
+    },
+    "piqa": {
+      "alias": "piqa",
+      "acc,none": 0.766050054406964,
+      "acc_stderr,none": 0.009877236895137361,
+      "acc_norm,none": 0.7676822633297062,
+      "acc_norm_stderr,none": 0.00985320138416832
+    },
+    "winogrande": {
+      "alias": "winogrande",
+      "acc,none": 0.6921862667719021,
+      "acc_stderr,none": 0.01297294666120501
+    }
+  }
+}

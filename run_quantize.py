@@ -568,8 +568,17 @@ def fill_phase2(WR, all_expert_recs, fix_rank, lora_bit, lora_iter, qbit,
             if srank == 0:
                 if int8_lora_v:
                     del big_tensor
+                # LoRA-off ablation (fix_rank=0): no shared U, but still VQ-quantize
+                # the backbone weight (residual = W). 'backbone_only' routes Phase 3
+                # to quantize the raw weight with zero low-rank compensation, unlike
+                # the shim path ({'U': None}) which keeps the expert in fp16.
                 for r in group:
-                    WR[r['layer']][r['name']] = {'U': None}
+                    WR[r['layer']][r['name']] = {'U': None, 'backbone_only': True}
+                    quant_infos['total_size'] += out_d * in_d * 16
+                    quant_infos['quant_size'] += out_d * in_d * qbit
+                    quant_infos['layer_cnt']  += 1
+                    quant_infos['moe_params']    = quant_infos.get('moe_params', 0.0) + out_d * in_d
+                    quant_infos['moe_lora_bits'] = quant_infos.get('moe_lora_bits', 0.0) + 0.0
                 continue
 
             # U_shared: (in_d, srank) — SHARED across all n_g experts

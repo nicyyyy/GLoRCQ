@@ -150,20 +150,27 @@ class GPTVQ_lora:
         ha_bsize=256, 
         id_bsize = 256
     ):
-        if self.lora["U"] == None:
-            return
-        if self.lora["U"].shape[1]<16:
-            return 
+        _backbone_only = bool(self.lora.get("backbone_only", False))
+        if not _backbone_only:
+            if self.lora["U"] == None:
+                return
+            if self.lora["U"].shape[1]<16:
+                return
         W = self.layer.weight.data.clone()
         if isinstance(self.layer, nn.Conv2d):
             W = W.flatten(1)
         if isinstance(self.layer, transformers.Conv1D):
             W = W.t()
-        lora = (self.lora["U"].to(W.dtype) @ torch.diag(self.lora["Si"])@ self.lora["V"].to(W.dtype))
-        lora = (torch.diag(self.lora["Sa"]) @ lora).T
-
-        W = W.float()
-        lora = lora.float().to(W.device)
+        if _backbone_only:
+            # LoRA-off ablation (fix_rank=0): no low-rank compensation, VQ the raw
+            # weight directly. residual = W - 0.
+            W = W.float()
+            lora = torch.zeros_like(W)
+        else:
+            lora = (self.lora["U"].to(W.dtype) @ torch.diag(self.lora["Si"])@ self.lora["V"].to(W.dtype))
+            lora = (torch.diag(self.lora["Sa"]) @ lora).T
+            W = W.float()
+            lora = lora.float().to(W.device)
 
         res = W - lora
 
