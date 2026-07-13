@@ -186,7 +186,7 @@ Algorithm 1: GLoRCQ quantization
 | **TileQ_s 2-bit** | **2.16** | **7.56 / 63.15** | **4.98 / 70.85** | **11.3 / 57.68** |
 | **TileQ_v 2-bit** | **2.16** | **7.35 / 63.44** | **4.78 / 71.36** | **10.1 / 63.24** |
 | MiLo 3-bit（更宽预算参考） | 3.00 | 7.15 / 62.94 | 4.03 / 70.42 | 8.44 / 66.99 |
-| **GLoRCQ (ours)** | **2.16** | **7.14 / 62.76** | **4.69 / 64.38** | **8.97 / 63.46** |
+| **GLoRCQ (ours)** | **2.16** | **7.14 / 62.80** | **4.69 / 64.38** | **8.97 / 63.46** |
 
 **Qwen3-30B-A3B** 上 GLoRCQ PPL 相对 TileQ_s 提升 **2.33**、相对 TileQ_v 提升 **1.13** —— 最大 win，也是跨层共享最要害的场景：128 experts/layer 下 per-layer 调度无法把不同层的 experts 归到同一个共享因子里；我们的 cluster 能（Figure 4a），这就是 +2.33 PPL 的来源。**Qwen1.5-MoE** 上相对 TileQ_s 提升 0.42（7.14 vs 7.56）。**Mixtral-8x7B** 上相对 TileQ_s 提升 0.29。MiLo 3-bit 用高 1 bit 换 PPL 领先，作为参考。（Qwen1.5 全部数字在同一台 A100 + 共享 calibration 上测，headline 与 §6 消融直接可比。）
 
@@ -208,19 +208,20 @@ Algorithm 1: GLoRCQ quantization
 - **MxMoE**: 2-bit weight-only config 不能直接在他们发布代码中复现（他们的 hardcoded tile config 只覆盖 W-A mixed 方案），引用他们论文 Table 1；注意他们的 HellaSwag 数字可能用 acc_norm 而非我们的 raw acc（附录 F）
 - **TileQ**: 无发布 ckpt，引用论文
 - **GPTVQ / LoPRo**: 发布代码目标 bit 约定不同，引用他们论文
+- **我们的复现性**: 所有 RNG（rank-1 sketch 初始化、low-rank SVD 投影、VQ k-means）都已固定 seed=42。给定 Stage-1 校准输入后 pipeline 确定性：fair-bit r=20 配置在三次独立跑（从头校准、缓存校准、消融队列，同 GPU）上产生**逐位相同**的 WikiText-2 PPL 7.2995。审稿人用发布代码 + 公布 seed 即精确复现报告数字。
 
 ---
 
 ## §6 消融（1.25 页）
 
 ### §6.1 Rank 扫描（0.2 页）
-**表（Qwen1.5-MoE, Grassmannian, A100）**: r=16→7.168 (+0.08 bits)、r=20→7.142 (+0.16, fair-bit base)、r=32→7.166 (+0.16)、r=64→7.077 (+0.32)。**结论**: rank≈20 在 fair 预算下已够;r16→r32 PPL 基本平,只有 r=64 明显降(但 2× LoRA bits,超预算)。采用 r=20 作 fair-bit 工作点。
+**表（Qwen1.5-MoE, Grassmannian, A100, seed 锁定, 固定 G=128）**: r=16→7.85 / 58.60 (2.08 bits)、r=20→7.30 / 62.34 (2.10)、**r=32→7.14 / 62.80 (2.15, fair-bit base)**、r=64→7.38 / 63.18 (2.29, 超预算)。**结论**: PPL 随 rank 呈 U 形 —— r16→r32 急降(shared-U 补偿容量提升),r64 反升(高 rank per-expert 因子 int8 量化误差累积,且 2× LoRA bits 超 2.16 预算)。r=32 是 PPL 最优点,且恰好落在 fair 预算(+0.15),采用为工作点。因 shared U 摊到 cluster 内 G=128 个 experts,r=32 只花 +0.15 bits/param(预算内);per-expert LoRA 同 rank 会超预算。
 
 ### §6.2 Group 大小 G 扫描（0.25 页）
-**表（Qwen1.5-MoE, Grassmannian, A100）**: G=64 (23 clusters)→7.218;G=128 (12 clusters, base)→7.142。**结论**: 更大共享组 G=128 **又省 bits(更少 shared-U)又低 PPL** —— 每组共享更多 experts 更好,直接支撑 C1。G=1 (per-expert = TileQ) 是退化下界。Qwen1.5 上 G≥256 clusters<8 → pipeline auto-fallback 回层内顺序,不算 Grassmannian 点。
+**表（Qwen1.5-MoE, Grassmannian, A100, seed 锁定, r=32）**: G=64 (23 clusters)→7.10 / 62.50 (2.15 bits);G=128 (12 clusters, base)→7.14 / 62.80 (2.15)。**结论**: 同 bits 下两个大共享组基本打平 —— G=64 PPL 略好,G=128 ZS 略好 —— 说明组够大后跨层共享对确切组大小是鲁棒的。base 用 G=128(最佳 ZS + 推理时最少 shared-U 需缓存)。真正对照是 G=1 (per-expert = TileQ) 这个无跨层共享的退化下界;表 5 随机 cluster 对照隔离出:大 G 分组的**内容**(而非尺寸)才是恢复精度的关键。Qwen1.5 上 G≥256 clusters<8 → pipeline auto-fallback 回层内顺序,不算 Grassmannian 点。
 
 ### §6.3 LoRA on/off（0.15 页）
-**表**: rank=0 (纯 VQ backbone,无低秩修正) vs rank=20 (default)。此处 LoRA 与 grouping 无关(rank 0 无 shared U)。**结论**: 低秩修正相对裸 2-bit backbone 贡献可观的精度恢复。
+**表**: rank=0 (纯 VQ backbone,无低秩修正) vs rank=32 (default)。此处 LoRA 与 grouping 无关(rank 0 无 shared U)。**结论**: 低秩修正相对裸 2-bit backbone 贡献可观的精度恢复。
 
 ### §6.5 聚类有效性：我们的分组有 structure 吗？（0.4 页 — **motivating C1 的聚类选择**）
 

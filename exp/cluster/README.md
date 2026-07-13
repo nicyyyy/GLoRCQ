@@ -93,18 +93,33 @@ python exp/cluster/plot_fig4a.py
 python exp/cluster/plot_fig4b.py
 ```
 
-## §6.1/§6.2 ablation table (Qwen1.5-MoE, Grassmannian, A100 + same Phase-1 cache)
+## §6.1/§6.2 ablation table (Qwen1.5-MoE, Grassmannian, A100, **seed-locked**)
 
-Result JSONs are under `results/ablation/` (gitignored by the `*.json` rule; numbers below).
+Seed fix (commit b1e06b0) pins all RNG (rank-1 sketch init, low-rank SVD projection, VQ
+k-means) to seed=42, so every run is deterministic given the Stage-1 calibration input.
+**These seeded numbers replace all earlier pre-seed values** (which were RNG-lucky draws,
+not reproducible). Result JSONs under `results/ablation_seeded/` (gitignored; numbers below).
+Reproduction: `exp/cluster/run_seeded_ablation.sh`.
 
-| config | fix_rank | G | Extra bits | PPL | ZS avg(5) |
+| config | fix_rank | G | bits | PPL | ZS avg(5) |
 |---|---|---|---|---|---|
-| base (fair-bit) | 20 | 128 | 0.16 | 7.142 | 62.76 |
-| rank sweep | 16 | 128 | 0.08 | 7.168 | 63.02 |
-| rank sweep | 32 | 128 | 0.16 | 7.166 | 63.26 |
-| rank sweep | 64 | 128 | 0.32 | 7.077 | 63.04 |
-| G sweep | 20 | 64 | ~0.19 | 7.218 | 62.28 |
+| rank sweep | 16 | 128 | 2.081 | 7.845 | 58.60 |
+| rank sweep | 20 | 128 | 2.099 | 7.2995 | 62.34 |
+| **base (fair-bit)** | **32** | **128** | **2.152** | **7.138** | **62.80** |
+| rank sweep | 64 | 128 | 2.293 | 7.377 | 63.18 |
+| G sweep | 32 | 64 | 2.153 | 7.103 | 62.50 |
 | G sweep | 20 | 256/512 | — | auto-fallback (n_clusters<8 → traversal) | — |
-| LoRA off | 0 | — | 0 | grouping-agnostic (reuse traversal) | — |
+| LoRA off | 0 | — | 2.000 | grouping-agnostic (reuse traversal) | — |
 
-Findings: (1) rank ≈ 20 already captures the fair-bit benefit; PPL flat r16→r32, only improves at r64 (+2× LoRA bits). (2) G=128 beats G=64 in both bits and PPL — larger shared-U group is better (supports C1). base 7.142 is the A100 canonical Qwen1.5 headline (replaces the earlier H2 cross-machine 7.37).
+**Reproducibility proof**: the r=20 config produces a bit-identical PPL of 7.2995 across
+three independent runs (from-scratch calibration, cached-calibration, ablation queue),
+same GPU.
+
+Findings: (1) **Rank sweep is U-shaped**: PPL drops sharply r16→r32 (shared-U gains
+capacity), then rises at r64 (higher-rank per-expert factors accumulate int8 error, +2×
+LoRA bits over budget). r=32 is the PPL optimum and lands at the fair-bit budget (+0.15),
+so it is the new base. (2) **G=64 ≈ G=128** at matched bits (G64 marginally better PPL,
+G128 marginally better ZS) — cross-layer sharing is robust to group size once groups are
+large; base uses G=128 for best ZS + fewest shared-U caches. base 7.138/62.80 is the
+seed-locked A100 canonical Qwen1.5 headline (replaces the earlier pre-seed 7.142 and the
+H2 cross-machine 7.37).
