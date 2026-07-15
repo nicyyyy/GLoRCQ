@@ -276,7 +276,11 @@ def load_glorcq_model(model_path, device="cuda:0"):
     # be reused unchanged.
     is_e11 = False
     if os.path.exists(cross_layer_path):
-        _cli_probe = torch.load(cross_layer_path, map_location="cpu", weights_only=False)
+        # mmap=True memory-maps the tensor storages instead of reading the whole
+        # (up to ~16 GB for Mixtral) pickle into RAM up front — cuts load time from
+        # ~20 min to a few min and slashes peak RSS.
+        _cli_probe = torch.load(cross_layer_path, map_location="cpu",
+                                weights_only=False, mmap=True)
         if _cli_probe.get("config", {}).get("method") == "tileq_glorcq_e11":
             is_e11 = True
             cross_layer_info = _cli_probe
@@ -374,13 +378,15 @@ def load_glorcq_model(model_path, device="cuda:0"):
     else:
         # 2. Load packed quantized weights
         print("[GLoRCQ] Loading glorcq_model.pt ...")
-        model_data = torch.load(glorcq_model_path, map_location="cpu", weights_only=False)
+        model_data = torch.load(glorcq_model_path, map_location="cpu",
+                                weights_only=False, mmap=True)
         model_config = model_data["model_config"]
         layers_data = model_data["layers"]
 
         # 3. Load cross-layer info
         print("[GLoRCQ] Loading cross_layer_info.pt ...")
-        cross_layer_info = torch.load(cross_layer_path, map_location="cpu", weights_only=False)
+        cross_layer_info = torch.load(cross_layer_path, map_location="cpu",
+                                      weights_only=False, mmap=True)
         shared_matrices = cross_layer_info["shared_matrices"]
         per_expert_V    = cross_layer_info["per_expert_V"]
         assignments     = cross_layer_info["assignments"]

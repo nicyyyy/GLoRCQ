@@ -143,8 +143,11 @@ def _derive_vq4_codes(Q_rotated, centroids, vdim, in_d):
     assert _v == vdim, f"centroid vdim {_v} != {vdim}"
     codes_per_cb = n_vecs // n_cb
 
-    Qf = Q_rotated.float()
-    cf = centroids.float()  # (n_cb, K, vdim)
+    # Run the nearest-centroid assignment on GPU when available: on CPU this is
+    # the dominant load-time cost (~15-20 min for Mixtral's 768 large experts).
+    dev = "cuda" if torch.cuda.is_available() else "cpu"
+    Qf = Q_rotated.float().to(dev)
+    cf = centroids.float().to(dev)  # (n_cb, K, vdim)
     codes = torch.empty(out_d, n_vecs, dtype=torch.uint8)
 
     # For each codebook block, assign vectors to nearest centroid.
@@ -157,8 +160,10 @@ def _derive_vq4_codes(Q_rotated, centroids, vdim, in_d):
         # ||Q - c||^2 = ||Q||^2 + ||c||^2 - 2 Q·c
         # (out_d, codes_per_cb, K)
         d = (Q_block.unsqueeze(2) - cb.unsqueeze(0).unsqueeze(0)).pow(2).sum(-1)
-        codes[:, v_lo:v_hi] = d.argmin(-1).to(torch.uint8)
+        codes[:, v_lo:v_hi] = d.argmin(-1).to(torch.uint8).cpu()
+        del Q_block, d
 
+    del Qf, cf
     return codes
 
 
@@ -479,9 +484,11 @@ class GLoRCQLinear(nn.Module):
         If codes+centroids are loaded, Q is rebuilt by codebook lookup. Otherwise
         fall back to the saved fp16 Q_rotated.
         """
-        # Gather + block-Walsh rotation (replaces dense (in_d, in_d) matmul)
-        x_permuted = x.half()[..., self.vq_perm_sigma]
-        x_rot = x_permuted @ self.vq_diagI
+        # Gather + block-Walsh rotation (replaces dense (in_d, in_d) matmul).
+        # Accumulate the reduction in fp32: this fallback fires only for large-in_d
+        # projections (e.g. Mixtral w2, in_d=14336) where an fp16-accumulated matmul
+        # overflows fp16 range → inf → NaN. fp16 in/out but fp32 accumulation.
+        x_rot = (x[..., self.vq_perm_sigma].float() @ self.vq_diagI.float())
         if self.vq_codes is not None and self.vq_centroids is not None:
             # Rebuild Q from codes + centroids
             out_d, codes_per_row = self.vq_codes.shape
@@ -496,8 +503,8 @@ class GLoRCQLinear(nn.Module):
                 codes_blk = self.vq_codes[:, c0:c1].long()              # (out_d, codes_per_cb)
                 looked = cb[codes_blk]                                   # (out_d, codes_per_cb, vdim)
                 Q[:, c0*vdim:c1*vdim] = looked.reshape(out_d, codes_per_cb * vdim)
-            return x_rot @ Q.T
-        return x_rot @ self.vq_Q_rotated.T
+            return x_rot @ Q.float().T          # fp32 (caller casts at the very end)
+        return x_rot @ self.vq_Q_rotated.float().T   # fp32
 
 
     def forward(self, x, precomputed_xU=None, precomputed_x_rot=None):
@@ -588,22 +595,28 @@ class GLoRCQLinear(nn.Module):
         # match the training-time formula lora^T = diag(Sa) @ U @ diag(Si) @ V.
         # NOTE: When Sa is set, we MUST recompute x @ U because Sa is per-expert
         # while precomputed_xU shares x @ U across a cluster of experts.
+        a = None
         if self.SV is not None:
             if precomputed_xU is not None and self.Sa is None:
                 a = precomputed_xU      # reuse cluster-parallel x @ U (no Sa)
             else:
-                # Cast Sa/U/SV to x's dtype on the fly so bf16 models (Mixtral)
-                # don't hit "invalid argument" from fp16↔bf16 broadcast.
+                # fp32 throughout: Mixtral's large activation scale Sa makes
+                # x*Sa overflow fp16 (>65504) → inf → NaN. Do the Sa multiply AND
+                # the in_d reduction in fp32.
                 if self.Sa is not None:
-                    x_for_lora = x * self.Sa.to(x.dtype)
+                    x_for_lora = x.float() * self.Sa.float()
                 else:
-                    x_for_lora = x
-                a = x_for_lora @ self.U.to(x.dtype)          # (..., rank)
-            y = y + a @ self.SV.T.to(y.dtype)
+                    x_for_lora = x.float()
+                a = x_for_lora @ self.U.float()          # (..., rank)
+            y = y.float() + a.float() @ self.SV.float().T        # fp32 accumulate
 
-        # 3. Bias
+        # 3. Bias (keep fp32 accumulation)
         if self.bias_param is not None:
-            y = y + self.bias_param
+            y = y.float() + self.bias_param.float()
+
+        # Cast back to the input dtype only at the very end — avoids intermediate
+        # fp16 overflow (inf→NaN) in the large-in_d VQ4 matmul + LoRA reductions.
+        y = y.to(x.dtype)
 
         # Restore original shape
         if len(orig_shape) > 2:
