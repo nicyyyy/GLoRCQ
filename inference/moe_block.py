@@ -326,52 +326,111 @@ class GraphCompatibleMoeBlock(nn.Module):
           _vq4_SV_gate: (E, out_d, rank) fp16
         """
         E = self.num_experts
-        _dev = self.experts[0].gate_proj.vq_codes.device
+        # Derive device from any available expert parameter — expert-0's
+        # gate_proj may be an fp16 shim (no vq_codes) in Mixtral/Qwen3.
+        _dev = None
+        for _ei in range(E):
+            for _pn in ('gate_proj', 'up_proj', 'down_proj'):
+                _pp = getattr(self.experts[_ei], _pn, None)
+                if _pp is None:
+                    continue
+                for _attr in ('vq_codes', 'weight', 'vq_diagI'):
+                    _t = getattr(_pp, _attr, None)
+                    if _t is not None:
+                        _dev = _t.device
+                        break
+                if _dev is not None:
+                    break
+            if _dev is not None:
+                break
+        if _dev is None:
+            _dev = torch.device('cuda')
 
         for proj_attr, prefix in [("gate_proj", "gate"), ("up_proj", "up"), ("down_proj", "down")]:
             projs = [getattr(self.experts[ei], proj_attr) for ei in range(E)]
-            # Find a reference expert with valid vq_codes to derive shapes
+            # Find a reference expert with valid vq_codes to derive shapes.
             ref_p = None
             for p in projs:
                 if getattr(p, 'vq_codes', None) is not None:
                     ref_p = p
                     break
-            if ref_p is None:
-                # No valid experts in this layer — very rare; disable graph fallback
+            # Find a reference fp16-shim expert (quant-skipped) as a shape
+            # fallback when EVERY expert of this wtype is a shim.
+            ref_shim = None
+            for p in projs:
+                if (getattr(p, 'vq_codes', None) is None
+                        and getattr(p, 'weight', None) is not None):
+                    ref_shim = p
+                    break
+
+            all_shim = ref_p is None
+            if all_shim and ref_shim is None:
+                # Genuinely empty block (no vq4, no shim) — cannot build a graph
+                # cache for this wtype; disable graph as a last resort.
                 self.graph_mode = False
                 self._graph_cache_built = False
                 return
 
-            # For experts missing vq_codes (Phase 2 max_err skip), pad with zero
-            # codes/centroids so their output is 0 and they contribute nothing.
-            def _get_codes(p):
-                if getattr(p, 'vq_codes', None) is not None:
-                    return p.vq_codes
-                return torch.zeros_like(ref_p.vq_codes)
-            def _get_centroids(p):
-                if getattr(p, 'vq_centroids', None) is not None:
-                    return p.vq_centroids
-                return torch.zeros_like(ref_p.vq_centroids)
-            def _get_sigma(p):
-                if getattr(p, 'vq_perm_sigma', None) is not None:
-                    return p.vq_perm_sigma.int()
-                return torch.arange(ref_p.in_features,
-                                     dtype=torch.int32,
-                                     device=ref_p.vq_codes.device)
-            def _get_diagI(p):
-                if getattr(p, 'vq_diagI', None) is not None:
-                    return p.vq_diagI
-                return ref_p.vq_diagI
-            def _get_infeat(p):
-                return p.in_features if hasattr(p, 'in_features') else ref_p.in_features
-            def _get_outfeat(p):
-                return p.out_features if hasattr(p, 'out_features') else ref_p.out_features
-            p0 = ref_p
+            # Resolve in/out feature dims from whichever reference exists.
+            if ref_p is not None:
+                in_d = int(ref_p.in_features)
+                out_d = int(ref_p.out_features)
+            else:
+                in_d = int(ref_shim.in_features)
+                out_d = int(ref_shim.out_features)
 
-            codes_cat = torch.cat([_get_codes(p) for p in projs], dim=0).contiguous()
-            centroids_cat = torch.cat([_get_centroids(p) for p in projs], dim=0).contiguous()
-            # sigma stack (E, in_d)
-            sigma_stack = torch.stack([_get_sigma(p) for p in projs], dim=0).contiguous()
+            if all_shim:
+                # ---- Every expert of this wtype is an fp16 shim ----
+                # Synthesize a ZERO vq4 base (n_cb=1, K_cb=256, vdim=4) so the
+                # existing vq4 grouped-GEMV path runs and produces zeros; the
+                # _apply_fp16_shim_override below overwrites EVERY expert
+                # position (its idx covers all E experts) with the real fp16
+                # matmul output. All shapes/indices are static → graph-safe.
+                VDIM = 4
+                if in_d % VDIM != 0:
+                    # Cannot synthesize a valid vq4 base — last-resort disable.
+                    self.graph_mode = False
+                    self._graph_cache_built = False
+                    return
+                n_cb = 1
+                K_cb = 256
+                codes_per_row = in_d // VDIM
+                vdim = VDIM
+                codes_cat = torch.zeros(E * out_d, codes_per_row,
+                                        dtype=torch.uint8, device=_dev).contiguous()
+                centroids_cat = torch.zeros(E * n_cb, K_cb, VDIM,
+                                            dtype=torch.float16, device=_dev).contiguous()
+                # Identity permutation per expert (the rotated input is discarded
+                # since all codes are 0 → kernel output is 0 for every expert).
+                sigma_row = torch.arange(in_d, dtype=torch.int32, device=_dev)
+                sigma_stack = sigma_row.unsqueeze(0).repeat(E, 1).contiguous()
+                from inference.quantized_linear import GLoRCQLinear as _GLoRCQLinear
+                diagI_w = _GLoRCQLinear._get_diagI(in_d, 256, 256, _dev)
+            else:
+                # For experts missing vq_codes (Phase 2 max_err skip), pad with
+                # zero codes/centroids so their output is 0 and they contribute
+                # nothing (the fp16-shim override supplies their real output).
+                def _get_codes(p):
+                    if getattr(p, 'vq_codes', None) is not None:
+                        return p.vq_codes
+                    return torch.zeros_like(ref_p.vq_codes)
+                def _get_centroids(p):
+                    if getattr(p, 'vq_centroids', None) is not None:
+                        return p.vq_centroids
+                    return torch.zeros_like(ref_p.vq_centroids)
+                def _get_sigma(p):
+                    if getattr(p, 'vq_perm_sigma', None) is not None:
+                        return p.vq_perm_sigma.int()
+                    return torch.arange(ref_p.in_features,
+                                         dtype=torch.int32,
+                                         device=ref_p.vq_codes.device)
+                codes_cat = torch.cat([_get_codes(p) for p in projs], dim=0).contiguous()
+                centroids_cat = torch.cat([_get_centroids(p) for p in projs], dim=0).contiguous()
+                # sigma stack (E, in_d)
+                sigma_stack = torch.stack([_get_sigma(p) for p in projs], dim=0).contiguous()
+                diagI_w = ref_p.vq_diagI
+                n_cb, K_cb, vdim = ref_p.vq_centroids.shape
+                codes_per_row = ref_p.vq_codes.shape[1]
 
             setattr(self, f'_vq4_codes_{prefix}_all', codes_cat)
             setattr(self, f'_vq4_centroids_{prefix}_all', centroids_cat)
@@ -381,24 +440,20 @@ class GraphCompatibleMoeBlock(nn.Module):
             # For gate/up: applied to (N, hidden) → (N, E*in_d). Flat index is just
             # sigma_stack.view(-1). For down: applied to (N, E*inter_d) — need
             # per-expert offset added to the index.
-            _p0 = ref_p
-            _in_d = _get_infeat(_p0)
             sigma_int64 = sigma_stack.long()                              # (E, in_d)
             if prefix == 'down':
                 # h_all flattened to (N, E*inter_d); index needs offset e*inter_d
                 offsets = torch.arange(E, device=sigma_int64.device,
-                                        dtype=torch.int64).unsqueeze(1) * _in_d
+                                        dtype=torch.int64).unsqueeze(1) * in_d
                 sigma_flat = (sigma_int64 + offsets).view(-1).contiguous()
             else:
                 # x_h.view(-1) flattens (N, hidden) — but only valid for N=1.
                 # For N>1 use index_select on dim=1 with sigma_stack.view(-1).
                 sigma_flat = sigma_int64.view(-1).contiguous()             # (E*in_d,)
             setattr(self, f'_vq4_sigma_flat_{prefix}', sigma_flat)
-            setattr(self, f'_vq4_diagI_{prefix}', p0.vq_diagI)   # shared
-            setattr(self, f'_vq4_{prefix}_out_d', p0.out_features)
-            setattr(self, f'_vq4_{prefix}_in_d',  p0.in_features)
-            n_cb, K_cb, vdim = p0.vq_centroids.shape
-            codes_per_row = p0.vq_codes.shape[1]
+            setattr(self, f'_vq4_diagI_{prefix}', diagI_w)   # shared
+            setattr(self, f'_vq4_{prefix}_out_d', out_d)
+            setattr(self, f'_vq4_{prefix}_in_d',  in_d)
             setattr(self, f'_vq4_{prefix}_ncb', n_cb)
             setattr(self, f'_vq4_{prefix}_cpcb', codes_per_row // n_cb)
             setattr(self, f'_vq4_{prefix}_vdim', vdim)
@@ -440,8 +495,6 @@ class GraphCompatibleMoeBlock(nn.Module):
                 if getattr(p, 'U', None) is not None:
                     rank = p.U.shape[1]
                     break
-            in_d = _get_infeat(p0)
-            out_d = _get_outfeat(p0)
             _R = rank or 32
             # Use the projection's own fp dtype (bf16 for Mixtral, fp16 for Qwen).
             # Sa/U/SV are typically stored at the same fp width, chosen from
@@ -1572,14 +1625,20 @@ class GraphCompatibleMoeBlock(nn.Module):
         same input hidden_states).  Down now also uses a single grouped-GEMV
         kernel call (E experts each with their own input row and weight block).
         """
-        # VQ4 experts (possibly mixed with fp16-shim from quant-skipped
-        # experts): dispatch to vq4-specific graph forward. Its fp16-shim
-        # override path handles the mixed case in a graph-safe way.
-        any_vq4 = any(
-            getattr(getattr(e, 'gate_proj', None), 'quant_type', None) == 'vq4'
+        # Route to the VQ4 graph path for any block that is not purely
+        # TurboQuant. vq4 experts AND fp16-shim experts (quant_type
+        # 'fp16_passthrough' from Fp16LinearShim, or None) are handled by the
+        # VQ4 path's zero-padded codes + fp16-shim overlay — including the case
+        # where EVERY expert of a wtype is a shim. Only genuine all-turbo
+        # blocks use the legacy _build_graph_cache (which needs packed_indices;
+        # a shim expert there would crash on the missing attribute).
+        gate_quant_types = [
+            getattr(getattr(e, 'gate_proj', None), 'quant_type', None)
             for e in self.experts
-        )
-        if any_vq4:
+        ]
+        all_turbo = (len(gate_quant_types) > 0
+                     and all(qt == 'turbo' for qt in gate_quant_types))
+        if not all_turbo:
             return self._forward_graph_vq4(
                 hidden_states, routing_weights, selected_experts,
                 hidden_dim, xU_cache, rot_cache)
