@@ -287,7 +287,22 @@ class GLoRCQLinear(nn.Module):
     def load_gptq(self, packed_data, device="cuda"):
         """Load GPTQ quantized weights from packed data dict."""
         self.quant_type = "gptq"
-        self.qweight_int = packed_data["qweight_int"].to(device)
+        # Store qweight as int8 (not int32). 4-bit GPTQ codes live in a small
+        # signed-safe range (e.g. [0,15] unsigned nibbles), which int8 holds
+        # losslessly. BOTH consumers already reduce to int8/float on entry —
+        # the fused CUDA kernel takes qweight_i8 and gptq_dequant_matmul_fused
+        # (kernels/__init__.py) casts int32->int8 EVERY decode token, while the
+        # python fallback _dequant_gptq()/_gptq_pytorch_fallback() cast to
+        # half/float. So storing int8 is bit-identical to the previous behaviour
+        # while (a) cutting the attn qweight footprint 4x and (b) eliminating
+        # that per-token full-matrix cast. Guard: only narrow when values fit
+        # signed int8, so any higher-bit GPTQ is left untouched.
+        _qw = packed_data["qweight_int"]
+        if _qw.dtype != torch.int8:
+            _lo, _hi = int(_qw.min()), int(_qw.max())
+            if -128 <= _lo and _hi <= 127:
+                _qw = _qw.to(torch.int8)
+        self.qweight_int = _qw.to(device)
         self.scales = packed_data["scales"].to(device)
         self.zeros = packed_data["zeros"].to(device)
         self.gptq_bits = packed_data["bits"]

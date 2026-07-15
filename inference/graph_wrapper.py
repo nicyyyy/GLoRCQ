@@ -109,6 +109,24 @@ class GLoRCQGraphWrapper:
           Step 1: Warmup (3 rounds to stabilize kernel selection)
           Step 2: Record graph
         """
+        # Mixtral auto-disable: the graph decode path runs a STATIC all-experts
+        # MoE (moe_block._forward_graph forces E == num_experts). With Mixtral's
+        # top_k=2 of 8 experts that is 4x the expert-matmul work of the standard
+        # top_k decode loop -> net-negative (measured Mixtral: graph 6.0 tok/s <
+        # standard 7.9 tok/s). Skip capture and leave self.graph = None so
+        # replay() transparently falls back to the standard forward, and let the
+        # caller keep graph_mode = False so that fallback uses the sparse top_k
+        # decode path (not the all-experts graph path). Qwen MoE (many small
+        # experts, graph is a real speedup) is unaffected.
+        _cfg = getattr(self.model, "config", None)
+        _arch = list(getattr(_cfg, "architectures", None) or [])
+        if "MixtralForCausalLM" in _arch or getattr(_cfg, "model_type", "") == "mixtral":
+            print("[GLoRCQ Graph] Mixtral detected -> CUDA Graph disabled "
+                  "(static all-experts path is net-negative); "
+                  "using standard decode.")
+            self.graph = None
+            return
+
         # Fp16-shim experts are now handled by _forward_graph_vq4 via a
         # graph-safe overlay path (see _apply_fp16_shim_override in moe_block).
         # No need to skip capture — batched bmm on static indices is compatible
@@ -246,9 +264,14 @@ class GLoRCQGraphWrapper:
         prefill_end = time.time()
 
         # Phase 2: Decode (CUDA Graph)
-        self._set_moe_graph_mode(True)
         if self.graph is None:
             self.capture_graph()
+        # Enable the static all-experts graph path ONLY if a graph was actually
+        # captured. When capture was skipped (self.graph is None — e.g. Mixtral
+        # auto-disable or fp16-shim experts) keep graph_mode False so the replay
+        # fallback runs the standard sparse top_k decode, not the net-negative
+        # all-experts path.
+        self._set_moe_graph_mode(self.graph is not None)
 
         for i in range(max_new_tokens - 1):
             current_pos = seq_len + i
