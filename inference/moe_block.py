@@ -1043,20 +1043,17 @@ class GraphCompatibleMoeBlock(nn.Module):
         same_shape = all(out_dims[k] == out_dims[0] for k in range(K_exp))
 
         if same_shape:
-            # Pre-cache concatenated codes+centroids per (proj_name, tuple(expert_indices))
-            # so we don't torch.cat() every forward.
-            cache_key = (proj_name, tuple(expert_indices))
-            cached = getattr(self, '_vq4_cat_cache', {}).get(cache_key)
-            if cached is None:
-                codes_cat = torch.cat(
-                    [experts_data[k].vq_codes for k in range(K_exp)], dim=0).contiguous()
-                centroids_cat = torch.cat(
-                    [experts_data[k].vq_centroids for k in range(K_exp)], dim=0).contiguous()
-                if not hasattr(self, '_vq4_cat_cache'):
-                    self._vq4_cat_cache = {}
-                self._vq4_cat_cache[cache_key] = (codes_cat, centroids_cat)
-            else:
-                codes_cat, centroids_cat = cached
+            # Concatenate codes+centroids for this active-expert group. We
+            # deliberately do NOT cache by (proj_name, expert_indices): during a
+            # long decode the number of distinct active-expert tuples explodes
+            # (Mixtral: up to 56 ordered pairs x 32 layers x 3 projs) and each
+            # cached copy duplicates ~15-30 MB of codes, so the cache grew
+            # unboundedly to ~77 GB and OOM'd (#197). A fresh concat is a cheap
+            # transient (freed after the forward) → decode memory stays bounded.
+            codes_cat = torch.cat(
+                [experts_data[k].vq_codes for k in range(K_exp)], dim=0).contiguous()
+            centroids_cat = torch.cat(
+                [experts_data[k].vq_centroids for k in range(K_exp)], dim=0).contiguous()
 
             # Build x_grouped from per-expert rotations
             if all_same_pd and x_rot_shared is not None:
@@ -1282,18 +1279,12 @@ class GraphCompatibleMoeBlock(nn.Module):
         same_shape = all(out_dims[k] == out_dims[0] for k in range(K_exp))
 
         if same_shape:
-            cache_key = ('down_proj', tuple(expert_indices))
-            cached = getattr(self, '_vq4_cat_cache', {}).get(cache_key)
-            if cached is None:
-                codes_cat = torch.cat(
-                    [experts_data[k].vq_codes for k in range(K_exp)], dim=0).contiguous()
-                centroids_cat = torch.cat(
-                    [experts_data[k].vq_centroids for k in range(K_exp)], dim=0).contiguous()
-                if not hasattr(self, '_vq4_cat_cache'):
-                    self._vq4_cat_cache = {}
-                self._vq4_cat_cache[cache_key] = (codes_cat, centroids_cat)
-            else:
-                codes_cat, centroids_cat = cached
+            # Fresh concat per call (no unbounded per-tuple cache) — see the
+            # matching note in _batched_proj_forward_vq4 (#197).
+            codes_cat = torch.cat(
+                [experts_data[k].vq_codes for k in range(K_exp)], dim=0).contiguous()
+            centroids_cat = torch.cat(
+                [experts_data[k].vq_centroids for k in range(K_exp)], dim=0).contiguous()
 
             n_cb, K_cb, vdim = p0.vq_centroids.shape
             codes_per_row = p0.vq_codes.shape[1]
