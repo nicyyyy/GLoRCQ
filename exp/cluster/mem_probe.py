@@ -41,6 +41,15 @@ def _smi():
         return f"nvidia-smi err: {e}"
 
 
+def _rss():
+    """Host resident set size of THIS process (GB), via psutil."""
+    try:
+        import psutil
+        return f"{psutil.Process().memory_info().rss / 1024**3:.2f} GB"
+    except Exception as e:
+        return f"psutil err: {e}"
+
+
 def mark(label, device):
     res = torch.cuda.memory_allocated(device) / 1024**3
     peak = torch.cuda.max_memory_allocated(device) / 1024**3
@@ -48,7 +57,75 @@ def mark(label, device):
     print(f"\n===[MEMPROBE] {label}===")
     print(f"    torch alloc = {res:6.2f} GB | reserved = {resv:6.2f} GB | "
           f"peak alloc = {peak:6.2f} GB")
-    print(f"    nvidia-smi  = {_smi()}", flush=True)
+    print(f"    nvidia-smi  = {_smi()}")
+    print(f"    host RSS    = {_rss()}", flush=True)
+
+
+def report_u_pool(model):
+    """Measure the dequantized shared-U pool + per-expert SV sizes (task #199).
+
+    Counts each shared tensor ONCE (dedupe by untyped_storage data_ptr) —
+    the whole point of the cross-layer shared pool. Reports:
+      - global concatenated pools installed on MoE blocks
+        (moe._global_pool_gate / _global_pool_up; one tensor per wtype,
+        shared by ALL layers)
+      - unique per-cluster U tensors referenced by GLoRCQLinear.U
+        (covers gate/up/down; gate+up duplicate the pool contents,
+        down_proj has no concatenated pool)
+      - per-expert SV tensors (GLoRCQLinear.SV, NOT shared)
+    """
+    from inference.moe_block import GraphCompatibleMoeBlock
+    from inference.quantized_linear import GLoRCQLinear
+
+    def _key(t):
+        return (t.untyped_storage().data_ptr(), t.data_ptr(),
+                t.numel(), t.element_size())
+
+    pool_seen, pool_bytes, n_pool = set(), 0, 0
+    u_seen, u_bytes, n_u_refs = set(), 0, 0
+    sv_seen, sv_bytes, n_sv_refs = set(), 0, 0
+    n_moe = 0
+    for m in model.modules():
+        if isinstance(m, GraphCompatibleMoeBlock):
+            n_moe += 1
+            for attr in ("_global_pool_gate", "_global_pool_up",
+                         "_global_pool_down"):
+                t = getattr(m, attr, None)
+                if t is None:
+                    continue
+                k = _key(t)
+                if k not in pool_seen:
+                    pool_seen.add(k)
+                    pool_bytes += t.numel() * t.element_size()
+                    n_pool += 1
+                    print(f"    [u-pool] unique pool tensor {attr}: "
+                          f"shape={tuple(t.shape)} dtype={t.dtype} "
+                          f"{t.numel()*t.element_size()/1024**2:.2f} MiB")
+        if isinstance(m, GLoRCQLinear):
+            if m.U is not None:
+                n_u_refs += 1
+                k = _key(m.U)
+                if k not in u_seen:
+                    u_seen.add(k)
+                    u_bytes += m.U.numel() * m.U.element_size()
+            if m.SV is not None:
+                n_sv_refs += 1
+                k = _key(m.SV)
+                if k not in sv_seen:
+                    sv_seen.add(k)
+                    sv_bytes += m.SV.numel() * m.SV.element_size()
+
+    print(f"\n===[MEMPROBE] shared-U pool accounting (deduped by data_ptr)===")
+    print(f"    MoE blocks scanned            = {n_moe}")
+    print(f"    global concat pools (gate/up) = {n_pool} tensors, "
+          f"{pool_bytes/1024**2:.2f} MiB")
+    print(f"    unique cluster U tensors      = {len(u_seen)} "
+          f"(from {n_u_refs} GLoRCQLinear refs), {u_bytes/1024**2:.2f} MiB")
+    print(f"    per-expert SV tensors         = {len(sv_seen)} unique "
+          f"(from {n_sv_refs} refs), {sv_bytes/1024**2:.2f} MiB")
+    print(f"    NOTE: concat pools are COPIES of the per-cluster U tensors "
+          f"(gate/up only); both live on GPU → dequantized-U total = "
+          f"{(pool_bytes+u_bytes)/1024**2:.2f} MiB", flush=True)
 
 
 def main():
@@ -66,6 +143,7 @@ def main():
     # load_glorcq_model's _lap now prints per-phase GPU memory internally.
     model = load_glorcq_model(args.model_path, device=dev)
     mark("after load_glorcq_model (RESIDENT model)", dev)
+    report_u_pool(model)
 
     # Tokenizer-free single decode step via a tiny random prompt.
     import torch as _t
