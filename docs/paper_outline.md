@@ -198,7 +198,7 @@ The pairwise-distance step is O(N²) per weight type on GPU (chunk-batched to st
 | **TileQ_s 2-bit** | **2.16** | **7.56 / 63.15** | **4.98 / 70.85** | **11.3 / 57.68** |
 | **TileQ_v 2-bit** | **2.16** | **7.35 / 63.44** | **4.78 / 71.36** | **10.1 / 63.24** |
 | MiLo (3-bit, higher-budget ref) | 3.00 | 7.15 / 62.94 | 4.03 / 70.42 | 8.44 / 66.99 |
-| **GLoRCQ (ours)** | **2.16** | **7.14 / 62.80** | **4.69 / 64.38** | **8.97 / 63.46** |
+| **GLoRCQ (ours)** | **2.16** | **7.14 / 62.80** | **4.69 / 64.48** | **8.97 / 63.46** |
 
 On **Qwen3-30B-A3B** GLoRCQ improves PPL by **2.33** over TileQ_s and **1.13** over TileQ_v — the largest win, and the one where cross-layer sharing matters most: at 128 experts per layer, per-layer grouping schedules cannot mix experts from different layers within a single shared factor. Our clusters do (Figure 4a) and this is what the +2.33 PPL captures. On **Qwen1.5-MoE** GLoRCQ improves PPL by 0.42 over TileQ_s (7.14 vs 7.56). On **Mixtral-8x7B** GLoRCQ improves PPL by 0.29 over TileQ_s at matched bits. MiLo at 3-bit is included as a higher-budget reference; its extra 1 bit over our budget explains its PPL advantage. (Qwen1.5 numbers are all measured on a single A100 with a shared calibration pass so the headline and the §6 ablations are directly comparable.)
 
@@ -276,7 +276,7 @@ MMLU is not part of the Table 1 headline comparison because several 2-bit baseli
 The fp16-retention threshold τ is empirical (weight-space L∞). A principled τ derived from activation-Hessian eigenvalues would remove a hyperparameter.
 
 ### §7.4 Real-quant Qwen3 inference bug
-On Qwen3-30B-A3B, the stripped real-quant checkpoint produces NaN PPL through our current inference path; the fake-quant checkpoint runs correctly, so the accuracy comparison in Table 1 is unaffected. We flag this as an open bug; it likely lives in the shim-expert dispatch when the fp16 approximation is stripped and the packed-code path is exercised for 128 experts × top-8 routing.
+*(Resolved 2026-07-15, commit 6cea816.)* The earlier NaN through the stripped real-quant path was a numerical bug — the LoRA input scaling `x·S_a` was computed in fp16, overflowing on models with large activation scales (Mixtral bf16-native; Qwen3) — fixed by computing the scale multiply and LoRA reduction in fp32. All three real-quant checkpoints now pass inference sanity, and Qwen3's real-quant decode speed is measured (Table 2). Remaining honest limitation: long greedy generations (≫128 tokens) can degrade into repetition on the 2-bit real-quant path; the speed harness uses gen_len=128.
 
 ---
 
@@ -307,8 +307,9 @@ On Qwen3-30B-A3B, the stripped real-quant checkpoint produces NaN PPL through ou
 5. **Anonymization** — HF repository handles and GitHub repository name need anonymization for double-blind review.
 6. **AW-SVD attribution**: LQER (Zhang et al., 2024) cited as prior art; only the cross-layer pooling structure is claimed novel.
 7. **No alternating optimization claim**: pipeline is one-shot (verified in code audit 2026-07-08).
-8. **§6.9 systems ablation data uncollected**: need to run the decode-speed harness with the various C2 components disabled to produce Table 2.
-9. **Qwen3 real-quant NaN bug** (§7.4): fake-quant accuracy uses baked-in fp16 approximation and is correct; the speed benchmark needs the real-quant path fixed before we can report throughput on Qwen3.
+8. **§6.9 systems ablation data uncollected**: need to run the decode-speed harness with the various C2 components disabled to produce Table 2. *(Update 2026-07-16: recommended re-scope — fill Table 2 with the measured Standard-vs-CUDA-graph decode numbers, which exist for all 3 models; the per-component-flag ablation requires disable-flags that were never implemented.)*
+9. ~~**Qwen3 real-quant NaN bug** (§7.4)~~ **RESOLVED 2026-07-15** (commit 6cea816: `x·Sa` fp16 overflow → fp32; all 3 real-quant models pass inference sanity; Qwen3 speed measured — Standard 2.8 / Graph 6.4 tok/s). §7.4 text needs updating accordingly.
+10. **Mixtral Table 1 vs released artifact (residual, accepted 2026-07-16)**: Table 1's Mixtral row (4.69 / 64.48) is the fair-bit **v2** run (r32, G=64, fp16-LoRA, 2.1611 bits; PPL `logs/h200_fair_evals/ppl_mixtral_fair.json`, compliant ZS `logs/h200_run_v2/results/mixtral_fair_zs_2026-07-06T15-15-59.json`). The released HF real-quant artifact is **v3b** (same recipe with int8-LoRA, ≈2.11 bits) and has no fake-quant eval of its own (weights stripped pre-eval). If a reviewer demands artifact-exact numbers: hydrate fake weights from v3b's `cross_layer_info.pt` (local, 16.5 GB) and eval — needs 2× A100-80G (Mixtral fp16 ≈93 GB), est. ~5-6 h.
 
 ---
 

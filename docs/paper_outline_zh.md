@@ -186,7 +186,7 @@ Algorithm 1: GLoRCQ quantization
 | **TileQ_s 2-bit** | **2.16** | **7.56 / 63.15** | **4.98 / 70.85** | **11.3 / 57.68** |
 | **TileQ_v 2-bit** | **2.16** | **7.35 / 63.44** | **4.78 / 71.36** | **10.1 / 63.24** |
 | MiLo 3-bit（更宽预算参考） | 3.00 | 7.15 / 62.94 | 4.03 / 70.42 | 8.44 / 66.99 |
-| **GLoRCQ (ours)** | **2.16** | **7.14 / 62.80** | **4.69 / 64.38** | **8.97 / 63.46** |
+| **GLoRCQ (ours)** | **2.16** | **7.14 / 62.80** | **4.69 / 64.48** | **8.97 / 63.46** |
 
 **Qwen3-30B-A3B** 上 GLoRCQ PPL 相对 TileQ_s 提升 **2.33**、相对 TileQ_v 提升 **1.13** —— 最大 win，也是跨层共享最要害的场景：128 experts/layer 下 per-layer 调度无法把不同层的 experts 归到同一个共享因子里；我们的 cluster 能（Figure 4a），这就是 +2.33 PPL 的来源。**Qwen1.5-MoE** 上相对 TileQ_s 提升 0.42（7.14 vs 7.56）。**Mixtral-8x7B** 上相对 TileQ_s 提升 0.29。MiLo 3-bit 用高 1 bit 换 PPL 领先，作为参考。（Qwen1.5 全部数字在同一台 A100 + 共享 calibration 上测，headline 与 §6 消融直接可比。）
 
@@ -263,8 +263,8 @@ Table 1 headline 不放 MMLU：多个 2-bit baseline (TileQ, LoPRo, GPTVQ) 未�
 ### §7.3 τ 是启发式
 τ = 60 empirical（weight-space L∞）。未来可用 activation-Hessian 谱做原则化选择，去掉一个超参。
 
-### §7.4 Qwen3 real-quant NaN bug
-Qwen3-30B-A3B stripped real-quant checkpoint 通过我们当前推理路径出 NaN PPL（fake-quant 正常，Table 1 accuracy 对比不受影响）。open bug；可能在 shim-expert dispatch 里，fp16 approx 被 strip 后 packed-code path 对 128 experts × top-8 routing 支持有缺陷。
+### §7.4 Qwen3 real-quant NaN bug（已解决 2026-07-15, commit 6cea816）
+根因是数值 bug：LoRA 输入缩放 `x·S_a` 在 fp16 计算，大激活 scale 模型（Mixtral bf16-native、Qwen3）溢出 → inf → NaN；修复 = 该乘法与 LoRA 归约改 fp32。三个 real-quant checkpoint 推理 sanity 全过，Qwen3 real-quant 速度已测入 Table 2。残余诚实局限：2-bit real-quant 路径长贪心生成（≫128 tokens）会退化为重复；速度 harness 用 gen_len=128。
 
 ---
 
@@ -298,7 +298,8 @@ Qwen3-30B-A3B stripped real-quant checkpoint 通过我们当前推理路径出 N
 | 6 | **AW-SVD 归属声明** | §2 / §3.1 | 引 LQER (Zhang et al., 2024)；只声称跨层 pooling 结构为新 |
 | 7 | **不声称 alternating** | §3.2 | Pipeline 为 one-shot（代码已确认） |
 | 8 | **§6.9 系统消融数据未跑** | Table 2 | 用 decode-speed harness 跑 with/without variants |
-| 9 | **Qwen3 real-quant NaN bug** (§7.4) | Table 2 speed（如需在 Qwen3 上测） | fake-quant accuracy 不受影响；real-quant 推理路径需 debug |
+| 9 | ~~Qwen3 real-quant NaN bug~~ **已解决**（6cea816，§7.4 已更新；Qwen3 速度 Standard 2.8 / Graph 6.4 tok/s） | — | — |
+| 10 | **Mixtral Table 1 与发布 artifact 的残余差异**（2026-07-16 接受）：Table 1 = v2 fair run（fp16-LoRA, 2.1611 bits；PPL/ZS 均可追溯且 ZS 合规）；HF 发布的是 v3b（int8-LoRA, ≈2.11 bits），自身无 fake eval | abstract 的 checkpoint-release 声明 | 若 reviewer 要 artifact-exact 数：从本地 v3b cross_layer_info.pt hydrate fake 权重再评（需 2×A100，~5-6h） |
 
 ---
 
