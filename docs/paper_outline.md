@@ -256,7 +256,7 @@ Data collected via decode-speed harness (batch=1, prompt_len=128, gen_len=128, m
 
 ### §5.4 Baseline reproducibility (~0.4 page)
 
-- **MiLo 3-bit reference**: publicly released; rerun on our H200. Numbers reported in Table 1.
+- **MiLo 3-bit**: publicly released; rerun on our H200 (Qwen1.5 7.15 / Mixtral 4.03 / Qwen3 8.44). Dropped from the Table-1 row set in the 2026-07-16 sheet merge (GPTQ-3bit and MOEQ-3bit serve as the higher-budget references); numbers kept here in case a reviewer asks.
 - **MxMoE**: 2-bit weight-only config is not directly reproducible in their released code (their hardcoded tile configurations cover mixed W-A schemes only); we cite paper Table 1 numbers and flag the caveat that their evaluation may use a different HellaSwag metric than ours (Appendix F).
 - **TileQ**: no released checkpoints; cite paper numbers directly.
 - **GPTVQ / LoPRo**: cite paper numbers, since released code targets a different bit convention.
@@ -267,7 +267,7 @@ Data collected via decode-speed harness (batch=1, prompt_len=128, gen_len=128, m
 ## §6 Ablations (~1.25 pages)
 
 ### §6.1 Rank sweep (~0.2 p)
-**Table (Qwen1.5-MoE, Grassmannian, A100, seed-locked, fixed G=128)**: PPL / 0-shot avg vs LoRA rank r — r=16 → 7.85 / 58.60 (2.08 bits), r=20 → 7.30 / 62.34 (2.10), **r=32 → 7.14 / 62.80 (2.15, fair-bit base)**, r=64 → 7.38 / 63.18 (2.29, over budget). **Message**: perplexity is U-shaped in rank — it drops sharply from r=16 to r=32 as the shared-U compensation gains capacity, then rises at r=64 where higher-rank per-expert factors accumulate more int8 quantization error while costing 2× the LoRA bits (2.29 total, above the 2.16 budget). r=32 is the perplexity optimum and lands almost exactly at the fair-bit budget (+0.15), so we adopt it as the operating point. Because the shared U is amortized over the G=128 experts in a cluster, r=32 costs only +0.15 bits/param — within budget — whereas per-expert LoRA at the same rank would exceed it.
+**Table (Qwen1.5-MoE, Grassmannian, A100, seed-locked, fixed G=128)**: PPL / 0-shot avg vs LoRA rank r — r=16 → 7.85 / 58.60 (2.08 bits), r=20 → 7.30 / 62.34 (2.10), **r=32 → 7.14 / 62.80 (2.15, fair-bit base)**, r=64 → 7.38 / 63.18 (2.29, over budget). *(Table 1's headline quotes 62.76 — the 2026-07-06 sheet eval of the same r32/G128 operating point; the Δ0.04 Avg is run-to-run eval noise, PPL identical at 7.14. Pick one number at writing time and use it in both places.)* **Message**: perplexity is U-shaped in rank — it drops sharply from r=16 to r=32 as the shared-U compensation gains capacity, then rises at r=64 where higher-rank per-expert factors accumulate more int8 quantization error while costing 2× the LoRA bits (2.29 total, above the 2.16 budget). r=32 is the perplexity optimum and lands almost exactly at the fair-bit budget (+0.15), so we adopt it as the operating point. Because the shared U is amortized over the G=128 experts in a cluster, r=32 costs only +0.15 bits/param — within budget — whereas per-expert LoRA at the same rank would exceed it.
 
 ### §6.2 Group size G sweep (~0.25 p)
 **Table (Qwen1.5-MoE, Grassmannian, A100, seed-locked, r=32)**: G=64 (23 clusters) → 7.10 / 62.50 (2.15 bits); G=128 (12 clusters, base) → 7.14 / 62.80 (2.15). **Message**: at matched bits the two large-sharing settings are essentially tied — G=64 marginally better on perplexity, G=128 marginally better on 0-shot accuracy — showing cross-layer sharing is robust to the exact group size once groups are large. We use G=128 for the base (best 0-shot, fewest shared-U matrices to cache at inference). The meaningful contrast is against G=1 (per-expert LoRA, = TileQ), the degenerate lower end with no cross-layer sharing; Table 5's random-cluster control isolates that the *content* of the large-G grouping, not merely its size, recovers accuracy. For Qwen1.5, G≥256 yields fewer than 8 clusters and the pipeline auto-falls back to layer-order grouping, so those points are not Grassmannian.
@@ -310,7 +310,7 @@ With/without shared-U cache, with/without side-stream, with/without same-cluster
 GLoRCQ's decode speedup is measured against a naive same-model per-expert-LoRA-on-main-stream baseline. We do not claim raw-throughput parity with fp16 kernels such as vLLM's. Optimized 2-bit-backbone-plus-shared-LoRA kernels (Marlin-style) are a separate systems paper.
 
 ### §7.2 MMLU (moved from headline)
-MMLU is not part of the Table 1 headline comparison because several 2-bit baselines (TileQ, LoPRo, GPTVQ) do not report MMLU, and MiLo's MMLU differs by tokenizer / prompt template. Full MMLU numbers are in Appendix C; the paper's headline metric is 5-task 0-shot average.
+MMLU is not part of the Table 1 headline comparison because several Table-1 baselines (TileQ, LoPRo, MxMoE, MOEQ) do not report MMLU under a comparable setup. Full MMLU numbers are in Appendix C; the paper's headline metric is 5-task 0-shot average.
 
 ### §7.3 τ selection is heuristic
 The fp16-retention threshold τ is empirical (weight-space L∞). A principled τ derived from activation-Hessian eigenvalues would remove a hyperparameter.

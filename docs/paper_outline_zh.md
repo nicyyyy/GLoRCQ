@@ -49,7 +49,7 @@
 
 ### 实验 payoff（不编号）
 
-- **主结果** (§5.2 Table 1): 2.16 bits/param 下 PPL + 5-task 0-shot vs TileQ / LoPRo / GPTVQ / MiLo (3-bit 参考) / MxMoE
+- **主结果** (§5.2 Table 1): 2-bit fair 预算下 PPL + 5-task 0-shot vs GPTQ (2/3-bit) / MOEQ (3-bit) / LoPRo / MxMoE / TileQ_s；FP16 参考取 TileQ 论文
 - **系统加速** (§5.3 Table 2): decode tokens/sec, with/without C2 优化
 - **聚类有效性** (§6.5): 每 cluster 跨层组成图 (Fig 4a) + 主成分角距离 heatmap sorted by cluster (Fig 4b) + 同尺寸随机对照 (Table 5)
 
@@ -168,7 +168,7 @@ Algorithm 1: GLoRCQ quantization
 - 模型: Qwen1.5-MoE-A2.7B、Mixtral-8x7B、Qwen3-30B-A3B
 - 校准数据: WikiText-2 train 128 samples × 4096 tok
 - Bit 预算: 2 + 0.16 = 2.16 bits/param
-- Baselines: GPTQ 2-bit, GPTVQ 2-bit, LoPRo 2-bit, TileQ_s / TileQ_v @ 2.16 bit, MxMoE (paper Table 1 数字), MiLo 3-bit 作为更宽预算的参考。基线数字统一测评 config 说明见 §5.4
+- Baselines: GPTQ 2-bit 与 3-bit, MOEQ 3-bit, LoPRo 2-bit, TileQ_s (fair +0.16), MxMoE (其论文发表数，未报 Qwen3)；FP16 参考取 TileQ 论文。基线数字统一测评 config 说明见 §5.4
 - Eval: WikiText-2 PPL (max_len=2048, stride=512) + 5-task 0-shot avg (ARC-c/ARC-e/PIQA/WinoGrande/HellaSwag, `acc`, num_fewshot=0, add_bos)。MMLU 从头号数字撤下（多个 2-bit baseline 未报），详见附录 C
 - 硬件: 8× H200 (量化) + 1× H200 (eval)
 - **方法配置** (一行): 2-bit VQ tile 配置沿 TileQ；attention 用 4-bit GPTQ；重构 max-error 超过 τ 的 expert 保 fp16；跨层 experts 按 §3.2 主成分角距离分组
@@ -217,7 +217,7 @@ Algorithm 1: GLoRCQ quantization
 ## §6 消融（1.25 页）
 
 ### §6.1 Rank 扫描（0.2 页）
-**表（Qwen1.5-MoE, Grassmannian, A100, seed 锁定, 固定 G=128）**: r=16→7.85 / 58.60 (2.08 bits)、r=20→7.30 / 62.34 (2.10)、**r=32→7.14 / 62.80 (2.15, fair-bit base)**、r=64→7.38 / 63.18 (2.29, 超预算)。**结论**: PPL 随 rank 呈 U 形 —— r16→r32 急降(shared-U 补偿容量提升),r64 反升(高 rank per-expert 因子 int8 量化误差累积,且 2× LoRA bits 超 2.16 预算)。r=32 是 PPL 最优点,且恰好落在 fair 预算(+0.15),采用为工作点。因 shared U 摊到 cluster 内 G=128 个 experts,r=32 只花 +0.15 bits/param(预算内);per-expert LoRA 同 rank 会超预算。
+**表（Qwen1.5-MoE, Grassmannian, A100, seed 锁定, 固定 G=128）**: r=16→7.85 / 58.60 (2.08 bits)、r=20→7.30 / 62.34 (2.10)、**r=32→7.14 / 62.80 (2.15, fair-bit base)**、r=64→7.38 / 63.18 (2.29, 超预算)。*（Table 1 headline 用的是 62.76 —— 同一 r32/G128 工作点 2026-07-06 那次 sheet eval；Δ0.04 属 run-to-run 噪声，PPL 同为 7.14。成稿时二选一并两处统一。）***结论**: PPL 随 rank 呈 U 形 —— r16→r32 急降(shared-U 补偿容量提升),r64 反升(高 rank per-expert 因子 int8 量化误差累积,且 2× LoRA bits 超 2.16 预算)。r=32 是 PPL 最优点,且恰好落在 fair 预算(+0.15),采用为工作点。因 shared U 摊到 cluster 内 G=128 个 experts,r=32 只花 +0.15 bits/param(预算内);per-expert LoRA 同 rank 会超预算。
 
 ### §6.2 Group 大小 G 扫描（0.25 页）
 **表（Qwen1.5-MoE, Grassmannian, A100, seed 锁定, r=32）**: G=64 (23 clusters)→7.10 / 62.50 (2.15 bits);G=128 (12 clusters, base)→7.14 / 62.80 (2.15)。**结论**: 同 bits 下两个大共享组基本打平 —— G=64 PPL 略好,G=128 ZS 略好 —— 说明组够大后跨层共享对确切组大小是鲁棒的。base 用 G=128(最佳 ZS + 推理时最少 shared-U 需缓存)。真正对照是 G=1 (per-expert = TileQ) 这个无跨层共享的退化下界;表 5 随机 cluster 对照隔离出:大 G 分组的**内容**(而非尺寸)才是恢复精度的关键。Qwen1.5 上 G≥256 clusters<8 → pipeline auto-fallback 回层内顺序,不算 Grassmannian 点。
@@ -260,7 +260,7 @@ with/without shared-U cache + 侧流 + 同 cluster K-融的 decode tokens/sec on
 GLoRCQ 加速比是**同模型 naive per-expert-LoRA-on-main-stream** baseline 的对比。**不与 vLLM fp16 raw throughput 打平**（那是独立的 kernel 优化系统论文）。
 
 ### §7.2 MMLU（从头号数字撤下）
-Table 1 headline 不放 MMLU：多个 2-bit baseline (TileQ, LoPRo, GPTVQ) 未报 MMLU；MiLo MMLU 的 tokenizer/prompt 也不一致。完整 MMLU 数字在附录 C；头号指标是 5-task 0-shot avg。
+Table 1 headline 不放 MMLU：多个 Table-1 baseline (TileQ, LoPRo, MxMoE, MOEQ) 无可比口径的 MMLU 数。完整 MMLU 数字在附录 C；头号指标是 5-task 0-shot avg。
 
 ### §7.3 τ 是启发式
 τ = 60 empirical（weight-space L∞）。未来可用 activation-Hessian 谱做原则化选择，去掉一个超参。
