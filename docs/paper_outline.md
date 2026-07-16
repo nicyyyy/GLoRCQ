@@ -198,7 +198,7 @@ The pairwise-distance step is O(N²) per weight type on GPU (chunk-batched to st
 | LoPRo | 2 | 0.43 / 0.21 / 0.58 | 7.52 / 62.36 | 5.01 / 70.72 | 11.1 / 55.02 |
 | MxMoE | 2 | 0.25 | 8.79 / 56.06 | 5.63 / 68.87 | — |
 | **TileQ_s** | **2** | **0.16** | **7.56 / 62.86** | **4.98 / 70.92** | **11.3 / 55.24** |
-| **GLoRCQ (ours)** | **2** | **0.1621 / 0.11 / 0.1647** | **7.14 / 62.76** | **4.69 / 64.48** | **8.97 / 63.46** |
+| **GLoRCQ (ours)** | **2** | **0.152 / 0.1611 / 0.1647** | **7.14 / 62.76** | **4.69 / 64.48** | **8.97 / 63.46** |
 
 On **Qwen3-30B-A3B** GLoRCQ improves PPL by **2.33** over TileQ_s — the largest win, and the one where cross-layer sharing matters most: at 128 experts per layer, per-layer grouping schedules cannot mix experts from different layers within a single shared factor. Our clusters do (Figure 4a) and this is what the +2.33 PPL captures. On **Qwen1.5-MoE** GLoRCQ improves PPL by 0.42 over TileQ_s (7.14 vs 7.56). On **Mixtral-8x7B** GLoRCQ improves PPL by 0.29 over TileQ_s at matched bits. GPTQ 3-bit and MOEQ 3-bit are included as higher-budget references; their extra ~1 bit over our budget explains any PPL advantage (and note MOEQ collapses on Qwen3, 28.1). MxMoE numbers are the paper-published ones (Qwen3 not reported there). (Qwen1.5 numbers are all measured on a single A100 with a shared calibration pass so the headline and the §6 ablations are directly comparable.)
 
@@ -215,7 +215,7 @@ On **Qwen3-30B-A3B** GLoRCQ improves PPL by **2.33** over TileQ_s — the larges
 | LoPRo | 2 | 0.43 | 7.52 | 39.9 | 72.7 | 77.6 | 68.2 | 53.4 | 62.36 |
 | MxMoE | 2 | 0.25 | 8.79 | 31.66 | 53.28 | 71.33 | 61.25 | 62.8 | 56.06 |
 | TileQ | 2 | 0.16 | 7.56 | 39.6 | 72.5 | 77.8 | 68.9 | 55.5 | 62.86 |
-| **GLoRCQ** | 2 | 0.1621 | **7.14** | 39.68 | 72.73 | 78.02 | 69.14 | 54.24 | **62.76** |
+| **GLoRCQ** | 2 | 0.152 | **7.14** | 39.68 | 72.73 | 78.02 | 69.14 | 54.24 | **62.76** |
 
 *Mixtral-8x7B-v0.1*:
 
@@ -228,7 +228,7 @@ On **Qwen3-30B-A3B** GLoRCQ improves PPL by **2.33** over TileQ_s — the larges
 | LoPRo | 2 | 0.21 | 5.01 | 55.3 | 82.5 | 80.6 | 74.9 | 60.3 | 70.72 |
 | MxMoE | 2 | 0.25 | 5.63 | 48.98 | 72.77 | 76.28 | 68.9 | 77.44 | 68.87 |
 | TileQ_s | 2 | 0.16 | 4.98 | 55.5 | 82.8 | 80.9 | 75.1 | 60.3 | 70.92 |
-| **GLoRCQ** | 2 | 0.11 | **4.69** | 46.16 | 76.14 | 75.08 | 71.82 | 53.19 | **64.48** |
+| **GLoRCQ** | 2 | 0.1611 | **4.69** | 46.16 | 76.14 | 75.08 | 71.82 | 53.19 | **64.48** |
 
 *Qwen3-30B-A3B*:
 
@@ -349,7 +349,7 @@ The fp16-retention threshold τ is empirical (weight-space L∞). A principled �
 7. **No alternating optimization claim**: pipeline is one-shot (verified in code audit 2026-07-08).
 8. **§6.9 systems ablation data uncollected**: need to run the decode-speed harness with the various C2 components disabled to produce Table 2. *(Update 2026-07-16: recommended re-scope — fill Table 2 with the measured Standard-vs-CUDA-graph decode numbers, which exist for all 3 models; the per-component-flag ablation requires disable-flags that were never implemented.)*
 9. ~~**Qwen3 real-quant NaN bug** (§7.4)~~ **RESOLVED 2026-07-15** (commit 6cea816: `x·Sa` fp16 overflow → fp32; all 3 real-quant models pass inference sanity; Qwen3 speed measured — Standard 2.8 / Graph 6.4 tok/s). §7.4 text needs updating accordingly.
-10. **Table 1 Extra-bits cells to double-check (from the 2026-07-16 sheet merge)**: (a) GLoRCQ Qwen1.5 Extra=0.1621, but the seeded r32 canonical quant log prints TOTAL=2.1518 bits (→ Extra 0.152) — reconcile which accounting the 0.1621 uses (possibly the attn-undercount-corrected Appendix-A formula); (b) GLoRCQ Mixtral Extra=0.11 matches the **int8-LoRA v3b accounting (+0.1143)** while the row's PPL/ZS (4.69/64.48) come from the **fp16-LoRA v2 run (+0.1611)** — for defensibility the Extra should match the eval'd run (0.16) unless the numbers are re-based to v3b via hydrate-eval (see issue 11); (c) MxMoE HellaSwag cells look anomalous (Qwen1.5 62.8 and Mixtral 77.44 both *above* their FP16 references) — likely acc_norm from the MxMoE paper or a column transposition; verify against MxMoE Table 1 before camera-ready.
+10. **Table 1 Extra-bits cells (2026-07-16 sheet merge — (a)(b) RESOLVED, (c) deferred)**: (a) ~~Qwen1.5 Extra 0.1621~~ → **0.152** (matches the seeded r32 canonical quant log TOTAL=2.1518); (b) ~~Mixtral Extra 0.11~~ → **0.1611** (matches the eval'd fp16-LoRA v2 run; 0.11 was the int8-LoRA v3b accounting whose run has no evals — see issue 11); user's sheet should mirror both. (c) OPEN: MxMoE HellaSwag cells look anomalous (Qwen1.5 62.8 and Mixtral 77.44 both *above* their FP16 references) — likely acc_norm from the MxMoE paper or a column transposition; user chose to keep as-is for now; verify against MxMoE Table 1 before camera-ready.
 11. **Mixtral Table 1 vs released artifact (residual, accepted 2026-07-16)**: Table 1's Mixtral row (4.69 / 64.48) is the fair-bit **v2** run (r32, G=64, fp16-LoRA, 2.1611 bits; PPL `logs/h200_fair_evals/ppl_mixtral_fair.json`, compliant ZS `logs/h200_run_v2/results/mixtral_fair_zs_2026-07-06T15-15-59.json`). The released HF real-quant artifact is **v3b** (same recipe with int8-LoRA, ≈2.11 bits) and has no fake-quant eval of its own (weights stripped pre-eval). If a reviewer demands artifact-exact numbers: hydrate fake weights from v3b's `cross_layer_info.pt` (local, 16.5 GB) and eval — needs 2× A100-80G (Mixtral fp16 ≈93 GB), est. ~5-6 h.
 
 ---
