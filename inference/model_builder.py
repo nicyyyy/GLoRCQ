@@ -274,6 +274,22 @@ def load_glorcq_model(model_path, device="cuda:0"):
     # cross_layer_info.pt rather than a separate glorcq_model.pt. Detect this
     # and build a synthetic layers_data dict so _replace_linear_layers can
     # be reused unchanged.
+    import time as _time
+    _tmark = _time.time()
+    def _lap(label):
+        nonlocal _tmark
+        import time as __t
+        # Also log GPU memory (resident allocated + peak) at each load phase so
+        # a single run reveals which stage inflates HBM. Cheap; safe to keep.
+        _memstr = ""
+        if torch.cuda.is_available():
+            _res = torch.cuda.memory_allocated(device) / 1024**3
+            _peak = torch.cuda.max_memory_allocated(device) / 1024**3
+            _memstr = f"  [gpu_alloc={_res:.2f}GB peak={_peak:.2f}GB]"
+        print(f"[GLoRCQ-timing] {label}: {__t.time()-_tmark:.1f}s{_memstr}",
+              flush=True)
+        _tmark = __t.time()
+
     is_e11 = False
     if os.path.exists(cross_layer_path):
         # mmap=True memory-maps the tensor storages instead of reading the whole
@@ -281,6 +297,7 @@ def load_glorcq_model(model_path, device="cuda:0"):
         # ~20 min to a few min and slashes peak RSS.
         _cli_probe = torch.load(cross_layer_path, map_location="cpu",
                                 weights_only=False, mmap=True)
+        _lap("torch.load(cross_layer_info, mmap)")
         if _cli_probe.get("config", {}).get("method") == "tileq_glorcq_e11":
             is_e11 = True
             cross_layer_info = _cli_probe
@@ -319,6 +336,7 @@ def load_glorcq_model(model_path, device="cuda:0"):
             torch_dtype=torch.float16, low_cpu_mem_usage=True,
             device_map='cpu',
         )
+        _lap("from_pretrained(base skeleton)")
     else:
         with torch.device("meta"):
             model = AutoModelForCausalLM.from_config(
@@ -408,11 +426,13 @@ def load_glorcq_model(model_path, device="cuda:0"):
 
     # 6. Replace nn.Linear with GLoRCQLinear
     print("[GLoRCQ] Replacing linear layers ...")
+    _lap("build layers_data + setup (pre-replace)")
     _replace_linear_layers(
         model, layers_data, assignments, per_expert_V,
         u_cache, uv_bits, rotation_cache, device,
         sv_bits=sv_bits,
     )
+    _lap("_replace_linear_layers (per-expert GLoRCQLinear build)")
 
     # 6a. Load RHT signs for Hadamard rotation mode
     rotation_type = model_config.get("rotation_type", "qr")
@@ -431,6 +451,7 @@ def load_glorcq_model(model_path, device="cuda:0"):
     # 6c. Install global U pool: all MoE layers share one copy per unique cluster
     #     → GPU L2 cache reuse across layers during decode (Belady-OPT: all hot)
     _install_global_u_pool(model, u_cache)
+    _lap("_replace_moe_blocks + global_u_pool")
 
     # 7. Move non-linear components to device
     m = getattr(model, "model", model)
