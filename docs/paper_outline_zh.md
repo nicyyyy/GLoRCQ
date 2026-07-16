@@ -62,7 +62,7 @@
 1. **背景**: MoE 量化的当前 SOTA 配方（TileQ、MiLo）= 权重激进量化 + per-expert 低秩补偿
 2. **缺口**: per-expert 低秩因子各自独立，但不同层的 expert 补偿因子子空间高度重叠 → rank 预算浪费
 3. **方法**: GLoRCQ 用 top-r 奇异子空间之间的主成分角距离在层间聚类 experts，cluster 内堆叠激活加权权重做一次 SVD，top-r 向量作为 cluster 级共享 U。同样的 cluster 结构使推理端可以做共享 U 缓存 + 侧流 cluster-batched LoRA
-4. **结果**: 2.16 bits/param 下，相对 TileQ_s 在 Qwen1.5-MoE / Mixtral / Qwen3-30B-A3B 上 PPL 分别提升 **0.19 / 0.29 / 2.33**；最大 win 在 Qwen3 上，来自跨越全部 48 层的 cluster 组成（Figure 4a 印证）。推理端 decode 相比 naive baseline 加速 R×。Fake-quant 与 stripped real-quant checkpoint 已发布到 HuggingFace
+4. **结果**: 2-bit + ≤0.165 extra bits/param 下，相对 TileQ_s 在 Qwen1.5-MoE / Mixtral / Qwen3-30B-A3B 上 PPL 分别提升 **0.42 / 0.29 / 2.33**；最大 win 在 Qwen3 上，来自跨越全部 48 层的 cluster 组成（Figure 4a 印证）。推理端 decode 相比 naive baseline 加速 R×。Fake-quant 与 stripped real-quant checkpoint 已发布到 HuggingFace
 
 **关键词**: mixture-of-experts, post-training quantization, low-rank compensation, vector quantization, subspace clustering
 
@@ -76,7 +76,7 @@
 
 **¶3 — 我们的修复**: 用 top-r 奇异子空间之间的主成分角距离在层间聚类 experts；同 cluster 的 experts 子空间真的重叠 → cluster 内堆叠激活加权权重 → 一次 SVD → 共享 U，per-expert Σ 和 V 私有。同 bit 预算下 per-expert 有效 rank ×G。为让方法可部署，顺势设计推理路径利用 shared-U cluster 结构: x·U 每 active cluster 每 token 只算一次；同 cluster active experts 的 per-expert 因子 concat 成一次宽 GEMM；LoRA 侧流并行 2-bit backbone 主流。
 
-**¶4 — Contributions + 头号数字**: 两个编号 contribution（**C1** 跨层子空间 pooling + 共享 U，**C2** 共享 U 缓存 + 侧流 cluster-batched LoRA）+ 一句头号: 2.16 bits/param 下 Qwen1.5/Mixtral/Qwen3 相对 TileQ_s PPL 提升 0.19/0.29/2.33，最大 win 来自 Qwen3 上跨越全部 48 层的 cluster（Figure 4a 支撑），decode 相比 naive baseline 加速 R×。**不吹** memory saving。
+**¶4 — Contributions + 头号数字**: 两个编号 contribution（**C1** 跨层子空间 pooling + 共享 U，**C2** 共享 U 缓存 + 侧流 cluster-batched LoRA）+ 一句头号: 2-bit + ≤0.165 extra bits/param 下 Qwen1.5/Mixtral/Qwen3 相对 TileQ_s PPL 提升 0.42/0.29/2.33，最大 win 来自 Qwen3 上跨越全部 48 层的 cluster（Figure 4a 支撑），decode 相比 naive baseline 加速 R×。**不吹** memory saving。
 
 ---
 
@@ -175,20 +175,22 @@ Algorithm 1: GLoRCQ quantization
 
 ### §5.2 主结果（0.8 页 — Table 1）
 
-**表 1**（fair-bit 对比 +0.16 extra bits，所有 downstream 用 `acc`、num_fewshot=0、add_bos）
+**表 1**（合并主表，来自 2026-07-16 整理的 results sheet；所有 downstream 用 `acc`、num_fewshot=0、add_bos、batch=1，对齐 TileQ Table-1 口径；ours 评测于 2026-07-06）
 
-| 方法 | bits | Qwen1.5 PPL / Avg(5) | Mixtral PPL / Avg(5) | Qwen3 PPL / Avg(5) |
-|---|---|---|---|---|
-| fp16 | 16.0 | 6.51 / 64.26 | 3.42 / 72.55 | 7.75 / 68.10 |
-| GPTQ 2-bit | 2.13 | 12.5 / 43.15 | 15.3 / 38.48 | 14.6 / 51.65 |
-| GPTVQ 2-bit | 2.13 | 8.12 / 57.24 | 5.28 / 62.09 | 11.8 / 55.99 |
-| LoPRo 2-bit | 2.43 | 7.52 / 62.20 | 5.01 / 70.62 | 11.1 / 57.02 |
-| **TileQ_s 2-bit** | **2.16** | **7.56 / 63.15** | **4.98 / 70.85** | **11.3 / 57.68** |
-| **TileQ_v 2-bit** | **2.16** | **7.35 / 63.44** | **4.78 / 71.36** | **10.1 / 63.24** |
-| MiLo 3-bit（更宽预算参考） | 3.00 | 7.15 / 62.94 | 4.03 / 70.42 | 8.44 / 66.99 |
-| **GLoRCQ (ours)** | **2.16** | **7.14 / 62.80** | **4.69 / 64.48** | **8.97 / 63.46** |
+| 方法 | Bits | Extra bits (Q1.5 / Mixtral / Q3) | Qwen1.5 PPL / Avg(5) | Mixtral PPL / Avg(5) | Qwen3 PPL / Avg(5) |
+|---|---|---|---|---|---|
+| FP16 (TileQ paper) | 16 | — | 6.79 / 64.50 | 3.87 / 75.46 | 8.07 / 68.12 |
+| GPTQ | 2 | 0.13 | 12.5 / 41.12 | 15.3 / 38.52 | 14.6 / 50.96 |
+| GPTQ（3-bit 参考） | 3 | 0.13 | 7.98 / 58.30 | 4.72 / 64.00 | 9.42 / 60.58 |
+| MOEQ（3-bit 参考） | 3 | 0 | 8.21 / 57.32 | 5.45 / 69.70 | 28.1 / 45.26 |
+| LoPRo | 2 | 0.43 / 0.21 / 0.58 | 7.52 / 62.36 | 5.01 / 70.72 | 11.1 / 55.02 |
+| MxMoE | 2 | 0.25 | 8.79 / 56.06 | 5.63 / 68.87 | — |
+| **TileQ_s** | **2** | **0.16** | **7.56 / 62.86** | **4.98 / 70.92** | **11.3 / 55.24** |
+| **GLoRCQ (ours)** | **2** | **0.1621 / 0.11 / 0.1647** | **7.14 / 62.76** | **4.69 / 64.48** | **8.97 / 63.46** |
 
-**Qwen3-30B-A3B** 上 GLoRCQ PPL 相对 TileQ_s 提升 **2.33**、相对 TileQ_v 提升 **1.13** —— 最大 win，也是跨层共享最要害的场景：128 experts/layer 下 per-layer 调度无法把不同层的 experts 归到同一个共享因子里；我们的 cluster 能（Figure 4a），这就是 +2.33 PPL 的来源。**Qwen1.5-MoE** 上相对 TileQ_s 提升 0.42（7.14 vs 7.56）。**Mixtral-8x7B** 上相对 TileQ_s 提升 0.29。MiLo 3-bit 用高 1 bit 换 PPL 领先，作为参考。（Qwen1.5 全部数字在同一台 A100 + 共享 calibration 上测，headline 与 §6 消融直接可比。）
+（每模型完整 per-task 明细表 → 附录，与 en 版 §5.2 一致，逐字来自 results sheet）
+
+**Qwen3-30B-A3B** 上 GLoRCQ PPL 相对 TileQ_s 提升 **2.33** —— 最大 win，也是跨层共享最要害的场景：128 experts/layer 下 per-layer 调度无法把不同层的 experts 归到同一个共享因子里；我们的 cluster 能（Figure 4a），这就是 +2.33 PPL 的来源。**Qwen1.5-MoE** 上相对 TileQ_s 提升 0.42（7.14 vs 7.56）。**Mixtral-8x7B** 上相对 TileQ_s 提升 0.29。GPTQ 3-bit / MOEQ 3-bit 作为更宽预算参考（MOEQ 在 Qwen3 上崩溃 28.1）；MxMoE 用其论文发表数（未报 Qwen3）。（Qwen1.5 全部数字在同一台 A100 + 共享 calibration 上测，headline 与 §6 消融直接可比。）
 
 ### §5.3 系统加速（0.5 页 — Table 2）
 

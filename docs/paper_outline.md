@@ -55,7 +55,7 @@ Because clusters are learned globally, the top-k active experts activated for a 
 
 ### Experimental payoff (not numbered)
 
-- **Main table** (§5.2 Table 1): at 2.16 bits/param, PPL + 5-task 0-shot vs TileQ, LoPRo, GPTVQ, MiLo (3-bit reference), MxMoE.
+- **Main table** (§5.2 Table 1): 2-bit fair-budget PPL + 5-task 0-shot vs GPTQ (2/3-bit), MOEQ (3-bit), LoPRo, MxMoE, TileQ_s; FP16 reference from the TileQ paper.
 - **Systems speedup** (§5.3 Table 2): decode tokens/sec with vs without each C2 component.
 - **Cluster validity** (§6.5): cross-layer composition per cluster (Figure 4a), principal-angle distance heatmap sorted by cluster (Figure 4b), and same-size random-cluster control (Table 5).
 
@@ -70,7 +70,7 @@ Structure:
 1. **Context**: SOTA MoE weight quantization has converged on "aggressive quantization + per-expert low-rank compensation" (TileQ, MiLo).
 2. **Gap**: per-expert low-rank factors are allocated layer-locally, but different Transformer layers' expert compensators empirically occupy heavily overlapping subspaces, so per-expert allocation wastes rank budget on redundant basis vectors.
 3. **Method**: GLoRCQ groups experts across layers by the principal-angle distance between their top-r singular subspaces, stacks the activation-scaled weights within each group, and takes one SVD whose top-r vectors form a shared U across the group. The same cluster structure enables a shared-U cache and side-stream cluster-batched LoRA at inference time.
-4. **Results**: at 2.16 bits/param, GLoRCQ improves WikiText-2 PPL over TileQ_s by **0.19 / 0.29 / 2.33** on Qwen1.5-MoE / Mixtral-8x7B / Qwen3-30B-A3B; the largest gain (Qwen3) is driven by clusters that span the entire 48-layer stack, confirmed by our cluster-composition analysis (Figure 4a). The cluster-batched LoRA + side-stream co-design delivers **R×** decode speedup over a naive per-expert baseline. Fake-quant and real-quant checkpoints released on HuggingFace.
+4. **Results**: at 2-bit + ≤0.165 extra bits/param, GLoRCQ improves WikiText-2 PPL over TileQ_s by **0.42 / 0.29 / 2.33** on Qwen1.5-MoE / Mixtral-8x7B / Qwen3-30B-A3B; the largest gain (Qwen3) is driven by clusters that span the entire 48-layer stack, confirmed by our cluster-composition analysis (Figure 4a). The cluster-batched LoRA + side-stream co-design delivers **R×** decode speedup over a naive per-expert baseline. Fake-quant and real-quant checkpoints released on HuggingFace.
 
 **Keywords**: mixture-of-experts, post-training quantization, low-rank compensation, vector quantization, subspace clustering.
 
@@ -84,7 +84,7 @@ Structure:
 
 **¶3 — Our fix.** We group experts across layers by the principal-angle distance on their top-r singular subspaces, so that group members genuinely share the subspace we are about to compress. Within each group we stack the activation-scaled weights and take a single SVD; the top-r vectors become a shared U, per-expert Σ and V remain private. Under matched bit budget the effective per-expert rank grows by G× compared to per-expert LoRA. To make this deployable we co-design an inference path that exploits the cluster structure: x·U is computed once per active cluster per token; the per-expert factors of same-cluster active experts are issued in a single wide GEMM; and the whole LoRA path runs on a side CUDA stream overlapping the 2-bit backbone on the main stream.
 
-**¶4 — Contributions and headline numbers.** Two numbered contributions — **C1** cross-layer subspace pooling with a shared U-factor, **C2** shared-U cache and side-stream cluster-batched LoRA. Headline: on Qwen1.5-MoE / Mixtral-8x7B / Qwen3-30B-A3B at 2.16 bits/param, GLoRCQ improves PPL over TileQ_s by 0.19 / 0.29 / 2.33, with the largest gain on Qwen3 supported by clusters that span its entire 48-layer stack (Figure 4a); the systems co-design delivers **R×** decode speedup. We do not claim memory savings as a headline: the LoRA overhead adds bits on top of a pure 2-bit baseline; the paper's value is quality-at-budget plus inference-time compute reuse, not raw memory reduction.
+**¶4 — Contributions and headline numbers.** Two numbered contributions — **C1** cross-layer subspace pooling with a shared U-factor, **C2** shared-U cache and side-stream cluster-batched LoRA. Headline: on Qwen1.5-MoE / Mixtral-8x7B / Qwen3-30B-A3B at 2-bit + ≤0.165 extra bits/param, GLoRCQ improves PPL over TileQ_s by 0.42 / 0.29 / 2.33, with the largest gain on Qwen3 supported by clusters that span its entire 48-layer stack (Figure 4a); the systems co-design delivers **R×** decode speedup. We do not claim memory savings as a headline: the LoRA overhead adds bits on top of a pure 2-bit baseline; the paper's value is quality-at-budget plus inference-time compute reuse, not raw memory reduction.
 
 ---
 
@@ -180,27 +180,67 @@ The pairwise-distance step is O(N²) per weight type on GPU (chunk-batched to st
 - **Models**: Qwen1.5-MoE-A2.7B (60 experts × top-4, 24 layers); Mixtral-8x7B (8 × top-2, 32 layers); Qwen3-30B-A3B (128 × top-8, 48 layers).
 - **Calibration data**: 128 samples × 4096 tokens from WikiText-2 train split.
 - **Bit budget target**: 2 + 0.16 = 2.16 bits/param (matching TileQ paper).
-- **Baselines**: GPTQ 2-bit, GPTVQ 2-bit, LoPRo 2-bit, TileQ_s / TileQ_v at 2.16 bit, MxMoE (paper's Table 1 numbers), MiLo 3-bit as a higher-budget reference. Baseline numbers under identical evaluation config are described in §5.4.
+- **Baselines**: GPTQ 2-bit and 3-bit, MOEQ 3-bit, LoPRo 2-bit, TileQ_s (fair +0.16), MxMoE (paper's published Table-1 numbers; Qwen3 not reported there); FP16 reference from the TileQ paper. Baseline numbers under identical evaluation config are described in §5.4.
 - **Evaluation**: WikiText-2 PPL (sliding window, max_len=2048, stride=512); 5-task 0-shot average of ARC-c / ARC-e / PIQA / WinoGrande / HellaSwag (accuracy, batch=1, add_bos=True). MMLU dropped from headline (also absent from several 2-bit baselines; discussed in Appendix C).
 - **Hardware**: 8× H200 (calibration), 1× H200 (evaluation).
 - **Method configuration** (single sentence): 2-bit VQ tile config inherited from TileQ; attention uses 4-bit GPTQ; experts with reconstruction max-error above τ retained in fp16 (τ ablation in Appendix C); cross-layer experts are grouped by the principal-angle distance introduced in §3.2.
 
 ### §5.2 Main results (~0.8 page) — Table 1
 
-**Table 1** (fair-bit comparison at +0.16 extra bits above 2-bit base; all downstream tasks use `acc` metric, num_fewshot=0, add_bos=True):
+**Table 1** (merged main table, from the curated results sheet 2026-07-16; all downstream tasks use `acc` metric matching the TileQ Table-1 convention, num_fewshot=0, add_bos=True, batch=1; ours evaluated 2026-07-06):
 
-| Method | bits/param | Qwen1.5-MoE PPL / Avg(5) | Mixtral PPL / Avg(5) | Qwen3-30B-A3B PPL / Avg(5) |
-|---|---|---|---|---|
-| fp16 baseline | 16.0 | 6.51 / 64.26 | 3.42 / 72.55 | 7.75 / 68.10 |
-| GPTQ 2-bit | 2.13 | 12.5 / 43.15 | 15.3 / 38.48 | 14.6 / 51.65 |
-| GPTVQ 2-bit | 2.13 | 8.12 / 57.24 | 5.28 / 62.09 | 11.8 / 55.99 |
-| LoPRo 2-bit | 2.43 | 7.52 / 62.20 | 5.01 / 70.62 | 11.1 / 57.02 |
-| **TileQ_s 2-bit** | **2.16** | **7.56 / 63.15** | **4.98 / 70.85** | **11.3 / 57.68** |
-| **TileQ_v 2-bit** | **2.16** | **7.35 / 63.44** | **4.78 / 71.36** | **10.1 / 63.24** |
-| MiLo (3-bit, higher-budget ref) | 3.00 | 7.15 / 62.94 | 4.03 / 70.42 | 8.44 / 66.99 |
-| **GLoRCQ (ours)** | **2.16** | **7.14 / 62.80** | **4.69 / 64.48** | **8.97 / 63.46** |
+| Method | Bits | Extra bits (Q1.5 / Mixtral / Q3) | Qwen1.5-MoE PPL / Avg(5) | Mixtral-8x7B PPL / Avg(5) | Qwen3-30B-A3B PPL / Avg(5) |
+|---|---|---|---|---|---|
+| FP16 (TileQ paper) | 16 | — | 6.79 / 64.50 | 3.87 / 75.46 | 8.07 / 68.12 |
+| GPTQ | 2 | 0.13 | 12.5 / 41.12 | 15.3 / 38.52 | 14.6 / 50.96 |
+| GPTQ (3-bit ref) | 3 | 0.13 | 7.98 / 58.30 | 4.72 / 64.00 | 9.42 / 60.58 |
+| MOEQ (3-bit ref) | 3 | 0 | 8.21 / 57.32 | 5.45 / 69.70 | 28.1 / 45.26 |
+| LoPRo | 2 | 0.43 / 0.21 / 0.58 | 7.52 / 62.36 | 5.01 / 70.72 | 11.1 / 55.02 |
+| MxMoE | 2 | 0.25 | 8.79 / 56.06 | 5.63 / 68.87 | — |
+| **TileQ_s** | **2** | **0.16** | **7.56 / 62.86** | **4.98 / 70.92** | **11.3 / 55.24** |
+| **GLoRCQ (ours)** | **2** | **0.1621 / 0.11 / 0.1647** | **7.14 / 62.76** | **4.69 / 64.48** | **8.97 / 63.46** |
 
-On **Qwen3-30B-A3B** GLoRCQ improves PPL by **2.33** over TileQ_s and **1.13** over TileQ_v — the largest win, and the one where cross-layer sharing matters most: at 128 experts per layer, per-layer grouping schedules cannot mix experts from different layers within a single shared factor. Our clusters do (Figure 4a) and this is what the +2.33 PPL captures. On **Qwen1.5-MoE** GLoRCQ improves PPL by 0.42 over TileQ_s (7.14 vs 7.56). On **Mixtral-8x7B** GLoRCQ improves PPL by 0.29 over TileQ_s at matched bits. MiLo at 3-bit is included as a higher-budget reference; its extra 1 bit over our budget explains its PPL advantage. (Qwen1.5 numbers are all measured on a single A100 with a shared calibration pass so the headline and the §6 ablations are directly comparable.)
+On **Qwen3-30B-A3B** GLoRCQ improves PPL by **2.33** over TileQ_s — the largest win, and the one where cross-layer sharing matters most: at 128 experts per layer, per-layer grouping schedules cannot mix experts from different layers within a single shared factor. Our clusters do (Figure 4a) and this is what the +2.33 PPL captures. On **Qwen1.5-MoE** GLoRCQ improves PPL by 0.42 over TileQ_s (7.14 vs 7.56). On **Mixtral-8x7B** GLoRCQ improves PPL by 0.29 over TileQ_s at matched bits. GPTQ 3-bit and MOEQ 3-bit are included as higher-budget references; their extra ~1 bit over our budget explains any PPL advantage (and note MOEQ collapses on Qwen3, 28.1). MxMoE numbers are the paper-published ones (Qwen3 not reported there). (Qwen1.5 numbers are all measured on a single A100 with a shared calibration pass so the headline and the §6 ablations are directly comparable.)
+
+**Full per-task tables (→ Appendix, reproduced verbatim from the results sheet):**
+
+*Qwen1.5-MoE-A2.7B* (WikiText-2 PPL ↓; acc ↑):
+
+| Method | Bits | Extra | PPL | ARC-C | ARC-E | PIQA | WinoG | HellaS | Avg(5) |
+|---|---|---|---|---|---|---|---|---|---|
+| FP16 (TileQ paper) | 16 | — | 6.79 | 41.6 | 72.9 | 79.6 | 69.1 | 59.3 | 64.50 |
+| GPTQ | 2 | 0.13 | 12.5 | 29.4 | 42.7 | 50.2 | 53.2 | 30.1 | 41.12 |
+| GPTQ | 3 | 0.13 | 7.98 | 33.4 | 64.3 | 77.1 | 64.5 | 52.2 | 58.30 |
+| MOEQ | 3 | 0 | 8.21 | 32.6 | 63.6 | 76.2 | 63.8 | 50.4 | 57.32 |
+| LoPRo | 2 | 0.43 | 7.52 | 39.9 | 72.7 | 77.6 | 68.2 | 53.4 | 62.36 |
+| MxMoE | 2 | 0.25 | 8.79 | 31.66 | 53.28 | 71.33 | 61.25 | 62.8 | 56.06 |
+| TileQ | 2 | 0.16 | 7.56 | 39.6 | 72.5 | 77.8 | 68.9 | 55.5 | 62.86 |
+| **GLoRCQ** | 2 | 0.1621 | **7.14** | 39.68 | 72.73 | 78.02 | 69.14 | 54.24 | **62.76** |
+
+*Mixtral-8x7B-v0.1*:
+
+| Method | Bits | Extra | PPL | ARC-C | ARC-E | PIQA | WinoG | HellaS | Avg(5) |
+|---|---|---|---|---|---|---|---|---|---|
+| FP16 (TileQ paper) | 16 | — | 3.87 | 61.9 | 87.3 | 83.7 | 77.1 | 67.3 | 75.46 |
+| GPTQ | 2 | 0.13 | 15.3 | 26.5 | 35.6 | 53.0 | 49.3 | 28.2 | 38.52 |
+| GPTQ | 3 | 0.13 | 4.72 | 52.4 | 69.3 | 79.1 | 74.4 | 44.8 | 64.00 |
+| MOEQ | 3 | 0 | 5.45 | 57.4 | 80.2 | 78.9 | 71.9 | 60.1 | 69.70 |
+| LoPRo | 2 | 0.21 | 5.01 | 55.3 | 82.5 | 80.6 | 74.9 | 60.3 | 70.72 |
+| MxMoE | 2 | 0.25 | 5.63 | 48.98 | 72.77 | 76.28 | 68.9 | 77.44 | 68.87 |
+| TileQ_s | 2 | 0.16 | 4.98 | 55.5 | 82.8 | 80.9 | 75.1 | 60.3 | 70.92 |
+| **GLoRCQ** | 2 | 0.11 | **4.69** | 46.16 | 76.14 | 75.08 | 71.82 | 53.19 | **64.48** |
+
+*Qwen3-30B-A3B*:
+
+| Method | Bits | Extra | PPL | ARC-C | ARC-E | PIQA | WinoG | HellaS | Avg(5) |
+|---|---|---|---|---|---|---|---|---|---|
+| FP16 (TileQ paper) | 16 | — | 8.07 | 52.6 | 79.2 | 79.7 | 70.3 | 58.8 | 68.12 |
+| GPTQ | 2 | 0.13 | 14.6 | 31.1 | 54.4 | 68.9 | 57.2 | 43.2 | 50.96 |
+| GPTQ | 3 | 0.13 | 9.42 | 44.0 | 70.3 | 75.1 | 63.4 | 50.1 | 60.58 |
+| MOEQ | 3 | 0 | 28.1 | 37.8 | 30.6 | 59.4 | 55.3 | 43.2 | 45.26 |
+| LoPRo | 2 | 0.58 | 11.1 | 34.4 | 58.3 | 71.5 | 62.9 | 48.0 | 55.02 |
+| TileQ_s | 2 | 0.16 | 11.3 | 34.6 | 58.4 | 71.8 | 63.1 | 48.3 | 55.24 |
+| **GLoRCQ** | 2 | 0.1647 | **8.97** | 45.65 | 74.41 | 76.33 | 67.56 | 53.36 | **63.46** |
 
 ### §5.3 Systems speedup (~0.5 page) — Table 2
 
@@ -309,7 +349,8 @@ The fp16-retention threshold τ is empirical (weight-space L∞). A principled �
 7. **No alternating optimization claim**: pipeline is one-shot (verified in code audit 2026-07-08).
 8. **§6.9 systems ablation data uncollected**: need to run the decode-speed harness with the various C2 components disabled to produce Table 2. *(Update 2026-07-16: recommended re-scope — fill Table 2 with the measured Standard-vs-CUDA-graph decode numbers, which exist for all 3 models; the per-component-flag ablation requires disable-flags that were never implemented.)*
 9. ~~**Qwen3 real-quant NaN bug** (§7.4)~~ **RESOLVED 2026-07-15** (commit 6cea816: `x·Sa` fp16 overflow → fp32; all 3 real-quant models pass inference sanity; Qwen3 speed measured — Standard 2.8 / Graph 6.4 tok/s). §7.4 text needs updating accordingly.
-10. **Mixtral Table 1 vs released artifact (residual, accepted 2026-07-16)**: Table 1's Mixtral row (4.69 / 64.48) is the fair-bit **v2** run (r32, G=64, fp16-LoRA, 2.1611 bits; PPL `logs/h200_fair_evals/ppl_mixtral_fair.json`, compliant ZS `logs/h200_run_v2/results/mixtral_fair_zs_2026-07-06T15-15-59.json`). The released HF real-quant artifact is **v3b** (same recipe with int8-LoRA, ≈2.11 bits) and has no fake-quant eval of its own (weights stripped pre-eval). If a reviewer demands artifact-exact numbers: hydrate fake weights from v3b's `cross_layer_info.pt` (local, 16.5 GB) and eval — needs 2× A100-80G (Mixtral fp16 ≈93 GB), est. ~5-6 h.
+10. **Table 1 Extra-bits cells to double-check (from the 2026-07-16 sheet merge)**: (a) GLoRCQ Qwen1.5 Extra=0.1621, but the seeded r32 canonical quant log prints TOTAL=2.1518 bits (→ Extra 0.152) — reconcile which accounting the 0.1621 uses (possibly the attn-undercount-corrected Appendix-A formula); (b) GLoRCQ Mixtral Extra=0.11 matches the **int8-LoRA v3b accounting (+0.1143)** while the row's PPL/ZS (4.69/64.48) come from the **fp16-LoRA v2 run (+0.1611)** — for defensibility the Extra should match the eval'd run (0.16) unless the numbers are re-based to v3b via hydrate-eval (see issue 11); (c) MxMoE HellaSwag cells look anomalous (Qwen1.5 62.8 and Mixtral 77.44 both *above* their FP16 references) — likely acc_norm from the MxMoE paper or a column transposition; verify against MxMoE Table 1 before camera-ready.
+11. **Mixtral Table 1 vs released artifact (residual, accepted 2026-07-16)**: Table 1's Mixtral row (4.69 / 64.48) is the fair-bit **v2** run (r32, G=64, fp16-LoRA, 2.1611 bits; PPL `logs/h200_fair_evals/ppl_mixtral_fair.json`, compliant ZS `logs/h200_run_v2/results/mixtral_fair_zs_2026-07-06T15-15-59.json`). The released HF real-quant artifact is **v3b** (same recipe with int8-LoRA, ≈2.11 bits) and has no fake-quant eval of its own (weights stripped pre-eval). If a reviewer demands artifact-exact numbers: hydrate fake weights from v3b's `cross_layer_info.pt` (local, 16.5 GB) and eval — needs 2× A100-80G (Mixtral fp16 ≈93 GB), est. ~5-6 h.
 
 ---
 
