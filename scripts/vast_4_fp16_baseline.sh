@@ -70,27 +70,29 @@ for m in "${MODELS[@]}"; do
         if [ "$m" = "mixtral-8x7b" ] && [ "$b" -gt 1 ] && [ "$b" -le 4 ]; then continue; fi
         _bs_list="$_bs_list $b"
     done
-    for bs in $_bs_list; do
-        echo ""
-        echo "========== fp16 baseline: $m  (batch_size=$bs) =========="
-        # fp16 model may OOM at big batch (esp. Mixtral 87GB weights + KV);
-        # the probe catches OOM and records it, sweep continues.
-        CUDA_VISIBLE_DEVICES=$GPU $PY "$GLORCQ_ROOT/scripts/fp16_speed_probe.py" \
-            --model_path "$dst" --prompt_len 128 --gen_len 128 --batch_size "$bs" \
-            --device cuda:0 --output_json "fp16_results/${m}_bs${bs}.json" \
-            2>&1 | tee "fp16_results/${m}_bs${bs}.log"
-    done
+    echo ""
+    echo "========== fp16 baseline: $m  (batches:$_bs_list) =========="
+    # Load the fp16 model ONCE and sweep all batch sizes in-process (fp16 has no
+    # fast loader — reloading 27-87 GB per batch is the slow part). The probe
+    # catches per-batch OOM and continues.
+    CUDA_VISIBLE_DEVICES=$GPU $PY "$GLORCQ_ROOT/scripts/fp16_speed_probe.py" \
+        --model_path "$dst" --batch_sizes "$_bs_list" --prompt_len 128 --gen_len 128 \
+        --device cuda:0 --output_prefix "fp16_results/${m}" \
+        2>&1 | tee "fp16_results/${m}.log"
 done
 
 echo ""
 echo "===== [$(date)] SPEEDUP vs fp16 (HF eager, same framework) ====="
 printf "%-20s %5s %10s %10s %10s %10s\n" model bs fp16_tot ourStd_tot ourGraph_tot "graph/fp16"
 for m in "${MODELS[@]}"; do
-    _bs_list="$BATCH_SIZES"
-    [ "$m" = "mixtral-8x7b" ] && _bs_list="1"
+    _bs_list=""
+    for b in $BATCH_SIZES; do
+        if [ "$m" = "mixtral-8x7b" ] && [ "$b" -gt 1 ] && [ "$b" -le 4 ]; then continue; fi
+        _bs_list="$_bs_list $b"
+    done
     for bs in $_bs_list; do
-        # fp16 total tok/s (per-seq x batch); our real-quant std/graph total from vast_3
-        fp16=$(grep -oP "total \K[0-9.]+" "fp16_results/${m}_bs${bs}.log" 2>/dev/null | tail -1)
+        # fp16 total tok/s read from the per-batch json (oom -> empty -> OOM shown)
+        fp16=$($PY -c "import json;d=json.load(open('fp16_results/${m}_bs${bs}.json'));print('' if d.get('oom') else round(d['fp16_tok_s_total'],1))" 2>/dev/null)
         ostd=$(grep -oP "Standard:\s*\K[0-9.]+" "speed_results/${m}_bs${bs}.log" 2>/dev/null | tail -1)
         ogra=$(grep -oP "Graph:\s*\K[0-9.]+" "speed_results/${m}_bs${bs}.log" 2>/dev/null | tail -1)
         # eval_speed prints per-seq tok/s; convert our numbers to total (x bs)
