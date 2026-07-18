@@ -49,7 +49,15 @@ for m in "${MODELS[@]}"; do
         echo "SKIP $m (no ckpt at $CKPT_DIR/$m). Run vast_2_download.sh first."
         continue
     fi
-    for bs in $BATCH_SIZES; do
+    # Mixtral's standard-decode path (with fp16-shim experts) is batch=1-only;
+    # batch>1 hits a shape bug in _batched_down_forward. Mixtral's systems story
+    # is memory (its graph is disabled anyway), so restrict it to bs=1 here.
+    _bs_list="$BATCH_SIZES"
+    if [ "$m" = "mixtral-8x7b" ]; then
+        _bs_list="1"
+        echo "  [note] mixtral-8x7b: batch>1 not supported on the decode path — bs=1 only"
+    fi
+    for bs in $_bs_list; do
         echo ""
         echo "========== $m  (batch_size=$bs) =========="
         # bs=1 reference (A100-80G): qwen1.5 ~10.4/22.2, mixtral ~8.3/8.7

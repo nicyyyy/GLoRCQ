@@ -62,7 +62,12 @@ for m in "${MODELS[@]}"; do
     else
         echo "  already have fp16 $m ($(du -sh "$dst" | cut -f1))"
     fi
-    for bs in $BATCH_SIZES; do
+    # Match vast_3: Mixtral real-quant decode is bs=1-only, so only its bs=1
+    # fp16 baseline is comparable. (fp16 itself could run larger batch, but we
+    # only have a real-quant counterpart at bs=1 for Mixtral.)
+    _bs_list="$BATCH_SIZES"
+    [ "$m" = "mixtral-8x7b" ] && _bs_list="1"
+    for bs in $_bs_list; do
         echo ""
         echo "========== fp16 baseline: $m  (batch_size=$bs) =========="
         # fp16 model may OOM at big batch (esp. Mixtral 87GB weights + KV);
@@ -78,7 +83,9 @@ echo ""
 echo "===== [$(date)] SPEEDUP vs fp16 (HF eager, same framework) ====="
 printf "%-20s %5s %10s %10s %10s %10s\n" model bs fp16_tot ourStd_tot ourGraph_tot "graph/fp16"
 for m in "${MODELS[@]}"; do
-    for bs in $BATCH_SIZES; do
+    _bs_list="$BATCH_SIZES"
+    [ "$m" = "mixtral-8x7b" ] && _bs_list="1"
+    for bs in $_bs_list; do
         # fp16 total tok/s (per-seq x batch); our real-quant std/graph total from vast_3
         fp16=$(grep -oP "total \K[0-9.]+" "fp16_results/${m}_bs${bs}.log" 2>/dev/null | tail -1)
         ostd=$(grep -oP "Standard:\s*\K[0-9.]+" "speed_results/${m}_bs${bs}.log" 2>/dev/null | tail -1)
