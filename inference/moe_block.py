@@ -80,6 +80,23 @@ class GraphCompatibleMoeBlock(nn.Module):
         # Batched graph cache (built lazily on first graph-mode forward)
         self._graph_cache_built = False
 
+        # --- Top-k gather graph path (Task #203) ---
+        # For few-large-expert MoE blocks (Mixtral: 8 experts, top_k=2, huge
+        # inter dim), the all-experts graph path computes E experts per token
+        # when only top_k are needed -> net-negative. Instead, gather ONLY the
+        # top_k selected experts' packed data into fixed-size (top_k) buffers
+        # via graph-safe index_select on GPU-tensor indices, and compute top_k
+        # experts inside the captured graph. Shapes stay static (always top_k)
+        # so capture works; compute drops E->top_k.
+        #
+        # GATE: enabled ONLY when num_experts is small. Qwen1.5 (60) and Qwen3
+        # (128) have MANY tiny experts where all-experts wins (extra compute is
+        # cheap, launch-overhead elimination dominates) -> they NEVER take this
+        # path and run the byte-identical all-experts code. Mixtral (8) has few
+        # HUGE experts where gather pays off.
+        self._gather_graph_max_experts = 16
+        self._use_gather_graph = (self.num_experts <= self._gather_graph_max_experts)
+
         # Global U pool (shared across all layers, set by model_builder)
         self._global_pool_gate = None  # (hidden_dim, K_total * rank)
         self._global_pool_up   = None
@@ -451,6 +468,11 @@ class GraphCompatibleMoeBlock(nn.Module):
                 # For N>1 use index_select on dim=1 with sigma_stack.view(-1).
                 sigma_flat = sigma_int64.view(-1).contiguous()             # (E*in_d,)
             setattr(self, f'_vq4_sigma_flat_{prefix}', sigma_flat)
+            # Top-k gather path needs the per-expert (E, in_d) int64 sigma to
+            # torch.gather rows for only the selected experts (torch.gather
+            # requires an int64 index). Only built for gather-eligible blocks.
+            if self._use_gather_graph:
+                setattr(self, f'_vq4_sigma_l_{prefix}', sigma_int64.contiguous())
             setattr(self, f'_vq4_diagI_{prefix}', diagI_w)   # shared
             setattr(self, f'_vq4_{prefix}_out_d', out_d)
             setattr(self, f'_vq4_{prefix}_in_d',  in_d)
@@ -488,6 +510,27 @@ class GraphCompatibleMoeBlock(nn.Module):
                 setattr(self, f'_fp16_weights_{prefix}',  None)
                 setattr(self, f'_fp16_biases_{prefix}',   None)
                 setattr(self, f'_fp16_num_{prefix}', 0)
+
+            # --- Gather-path fp16-shim support (Task #203, option b) ---
+            # In the gather graph a top_k slot may land on an fp16-shim expert,
+            # and WHICH of the top_k slots is a shim is data-dependent (varies
+            # per token) -> the all-experts index_copy override is not usable.
+            # Instead give EVERY expert a uniform branch-free representation:
+            #   * vq4 grouped-GEMV already yields 0 for shim experts (their
+            #     stacked codes are zero-padded above), so shims add nothing there.
+            #   * a small gathered dense fp16 matmul supplies the shim output,
+            #     multiplied by a per-slot 0/1 mask so non-shim slots contribute 0.
+            # Both use the EXISTING _fp16_weights_{prefix} buffer (no extra big
+            # tensor): rowmap maps expert->row (non-shim->row 0, masked out),
+            # mask is 1.0 only for shim experts. All static -> graph-safe.
+            if self._use_gather_graph and fp16_idx_list:
+                _rowmap = torch.zeros(E, dtype=torch.long, device=_dev)
+                _mask = torch.zeros(E, 1, dtype=torch.float16, device=_dev)
+                for _j, _ei in enumerate(fp16_idx_list):
+                    _rowmap[_ei] = _j
+                    _mask[_ei, 0] = 1.0
+                setattr(self, f'_fp16_rowmap_{prefix}', _rowmap)
+                setattr(self, f'_fp16_mask_{prefix}', _mask)
 
             # LoRA tensors (per-expert): Sa (in_d), U (in_d, rank), SV (out_d, rank)
             rank = None
@@ -1358,6 +1401,107 @@ class GraphCompatibleMoeBlock(nn.Module):
         y_all.index_copy_(1, idx, fp16_out.to(y_dt))
         return y_all
 
+    def _forward_graph_vq4_gather(self, hidden_states, routing_weights,
+                                   selected_experts, hidden_dim,
+                                   xU_cache, rot_cache):
+        """Top-k GATHER graph path (Task #203) — compute ONLY top_k experts.
+
+        Assumes N == 1 (decode / CUDA-Graph capture shape). Instead of running
+        all E experts and masking, gather the packed data for the top_k selected
+        experts into fixed (top_k, ...) buffers with graph-safe torch.index_select
+        on the GPU-tensor expert index, then run top_k grouped-GEMV + LoRA.
+
+        Graph-safety:
+          * selected_experts flows as a GPU tensor from topk (no host sync).
+          * index_select / torch.gather with GPU indices produce STATIC (top_k)
+            shapes -> capturable, no .item()/.tolist().
+          * fp16-shim experts handled by a gathered dense fp16 matmul masked by
+            a per-slot 0/1 mask (option b); vq4 output is already 0 for shims.
+
+        Correctness: for a vq4 slot, output = vq4 + LoRA (shim term masked 0);
+        for a shim slot, vq4=0, LoRA=0, output = dense fp16 matmul (+bias) — the
+        same math the standard decode path runs per expert.
+        """
+        from inference.kernels import vq4_dequant_grouped_gemv, silu_and_mul
+
+        G = self.top_k
+        sel = selected_experts[0].to(torch.long)          # (G,) GPU index
+        x_h = hidden_states.half()                         # (1, hidden)
+
+        def _proj_gather(prefix, x_in):
+            """x_in: (G, in_d) fp16 per-slot input (rows equal for gate/up).
+            Returns (G, out_d) = vq4 + LoRA + masked fp16-shim."""
+            E = self.num_experts
+            in_d  = getattr(self, f'_vq4_{prefix}_in_d')
+            out_d = getattr(self, f'_vq4_{prefix}_out_d')
+            n_cb  = getattr(self, f'_vq4_{prefix}_ncb')
+            cpcb  = getattr(self, f'_vq4_{prefix}_cpcb')
+            vdim  = getattr(self, f'_vq4_{prefix}_vdim')
+            codes_all = getattr(self, f'_vq4_codes_{prefix}_all')      # (E*out_d, cpr)
+            cents_all = getattr(self, f'_vq4_centroids_{prefix}_all')  # (E*n_cb, K_cb, vdim)
+            cpr = codes_all.shape[1]
+            K_cb = cents_all.shape[1]
+
+            # Gather per-expert blocks for the top_k selected experts.
+            codes_g = codes_all.view(E, out_d, cpr).index_select(0, sel) \
+                               .reshape(G * out_d, cpr).contiguous()
+            cents_g = cents_all.view(E, n_cb, K_cb, vdim).index_select(0, sel) \
+                               .reshape(G * n_cb, K_cb, vdim).contiguous()
+            sigma_g = getattr(self, f'_vq4_sigma_l_{prefix}').index_select(0, sel)  # (G, in_d)
+
+            # Rotation: per-slot permute (gather) + shared diagI matmul.
+            x_perm = torch.gather(x_in, 1, sigma_g)                    # (G, in_d)
+            x_rot = x_perm @ getattr(self, f'_vq4_diagI_{prefix}')      # (G, in_d)
+
+            y = vq4_dequant_grouped_gemv(
+                x_rot, codes_g, cents_g, G, out_d, n_cb, cpcb).view(G, out_d)
+
+            # LoRA (Sa pre-fused into U_sa): a = x_in @ U_sa[e]; y += a @ SV.T
+            U_sa_g = getattr(self, f'_vq4_U_sa_{prefix}').index_select(0, sel)  # (G, in_d, r)
+            SV_T_g = getattr(self, f'_vq4_SV_T_{prefix}').index_select(0, sel)  # (G, r, out_d)
+            a = torch.bmm(x_in.unsqueeze(1), U_sa_g)                    # (G, 1, r)
+            lora = torch.bmm(a, SV_T_g).squeeze(1)                      # (G, out_d)
+            y = y + lora
+
+            # fp16-shim: gathered dense matmul masked by per-slot 0/1.
+            if getattr(self, f'_fp16_num_{prefix}', 0) > 0:
+                W = getattr(self, f'_fp16_weights_{prefix}')           # (num, out_d, in_d)
+                rowmap = getattr(self, f'_fp16_rowmap_{prefix}')        # (E,) long
+                mask = getattr(self, f'_fp16_mask_{prefix}')            # (E, 1) fp16
+                rows = rowmap.index_select(0, sel)                     # (G,)
+                W_g = W.index_select(0, rows)                          # (G, out_d, in_d)
+                # fp32 accumulation for the dense reduction (in_d up to 14336):
+                # fp16 bmm here diverges from the canonical F.linear by ~5% on
+                # the largest reductions and risks overflow. fp32 matches the
+                # project's x*Sa fp32 fix and keeps the shim output accurate.
+                shim = torch.bmm(
+                    x_in.unsqueeze(1).float(),
+                    W_g.transpose(1, 2).float()
+                ).squeeze(1)                                            # (G, out_d) fp32
+                b = getattr(self, f'_fp16_biases_{prefix}')
+                if b is not None:
+                    shim = shim + b.index_select(0, rows).float()
+                mask_g = mask.index_select(0, sel).float()             # (G, 1)
+                y = y + (shim * mask_g).to(y.dtype)
+            return y
+
+        # Gate / Up share input x_h (broadcast to G slots).
+        x_gate_in = x_h.expand(G, self._vq4_gate_in_d).contiguous()
+        y_gate = _proj_gather('gate', x_gate_in)                       # (G, out_gate)
+        x_up_in = x_h.expand(G, self._vq4_up_in_d).contiguous()
+        y_up = _proj_gather('up', x_up_in)                             # (G, out_up)
+
+        # Activation
+        h = silu_and_mul(y_gate, y_up)                                 # (G, inter_d)
+
+        # Down proj: per-slot input h.
+        y_down = _proj_gather('down', h.contiguous())                 # (G, hidden)
+
+        # Weighted sum over the top_k slots (order matches sel).
+        w = routing_weights[0].to(y_down.dtype).unsqueeze(1)          # (G, 1)
+        final = (w * y_down).sum(0, keepdim=True)                     # (1, hidden)
+        return final
+
     def _forward_graph_vq4(self, hidden_states, routing_weights,
                             selected_experts, hidden_dim, xU_cache, rot_cache):
         """Graph-mode forward for VQ4 experts. All E experts execute on
@@ -1370,6 +1514,15 @@ class GraphCompatibleMoeBlock(nn.Module):
         """
         if not self._graph_cache_built:
             self._build_graph_cache_vq4()
+
+        # Top-k gather path for few-large-expert blocks (Mixtral). Computes only
+        # the top_k selected experts (static shape) instead of all E. Qwen never
+        # reaches here (_use_gather_graph gated on num_experts <= 16) so it runs
+        # the byte-identical all-experts code below.
+        if self._use_gather_graph and hidden_states.shape[0] == 1:
+            return self._forward_graph_vq4_gather(
+                hidden_states, routing_weights, selected_experts,
+                hidden_dim, xU_cache, rot_cache)
 
         from inference.kernels import (
             vq4_dequant_grouped_gemv, lora_grouped_gemv, lora_u_grouped_gemv,

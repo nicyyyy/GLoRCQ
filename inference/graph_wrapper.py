@@ -12,6 +12,7 @@ as required by CUDA Graph, while still capturing expert matmul kernels.
 """
 
 import gc
+import os
 import time
 import torch
 import torch.nn as nn
@@ -89,6 +90,22 @@ class GLoRCQGraphWrapper:
         self.graph = None
         self.graph_stream = torch.cuda.Stream()
 
+    def _mixtral_gather_available(self):
+        """True iff the model's MoE blocks are GraphCompatibleMoeBlock with the
+        top-k gather graph path enabled (num_experts <= gather threshold). If a
+        different block type is installed (e.g. MixtralFastMoeBlock) or the
+        gather gate is off, the all-experts graph would run -> report False so
+        capture stays disabled and standard decode is used instead.
+        """
+        from .moe_block import GraphCompatibleMoeBlock
+        found = False
+        for module in self.model.modules():
+            if isinstance(module, GraphCompatibleMoeBlock):
+                if not getattr(module, "_use_gather_graph", False):
+                    return False
+                found = True
+        return found
+
     def _set_moe_graph_mode(self, mode: bool):
         """Toggle graph_mode on all GraphCompatibleMoeBlock modules.
 
@@ -118,14 +135,33 @@ class GLoRCQGraphWrapper:
         # caller keep graph_mode = False so that fallback uses the sparse top_k
         # decode path (not the all-experts graph path). Qwen MoE (many small
         # experts, graph is a real speedup) is unaffected.
+        # Task #203: a top-k GATHER graph path exists for Mixtral (moe_block
+        # _forward_graph_vq4_gather) that computes only top_k experts. It is
+        # CORRECT and net-positive, but only marginally (~1.02x) — Mixtral
+        # decode is memory-bound on the huge (inter=14336) expert GEMVs, so
+        # eliminating launch overhead (all a CUDA graph buys) has almost no
+        # headroom. It also shifts the shim-layer down_proj to the fp16 grouped
+        # kernel (vs the standard path's fp32-python fallback). So it is left
+        # OFF BY DEFAULT: Mixtral runs standard decode (today's numbers) unless
+        # explicitly opted in with GLORCQ_MIXTRAL_GRAPH=1. ("0" or unset -> the
+        # legacy disabled behavior.) When enabled it still requires the gather
+        # path to actually be installed, else the net-negative all-experts
+        # graph would run.
         _cfg = getattr(self.model, "config", None)
         _arch = list(getattr(_cfg, "architectures", None) or [])
-        if "MixtralForCausalLM" in _arch or getattr(_cfg, "model_type", "") == "mixtral":
-            print("[GLoRCQ Graph] Mixtral detected -> CUDA Graph disabled "
-                  "(static all-experts path is net-negative); "
-                  "using standard decode.")
-            self.graph = None
-            return
+        _is_mixtral = ("MixtralForCausalLM" in _arch
+                       or getattr(_cfg, "model_type", "") == "mixtral")
+        if _is_mixtral:
+            _env = os.environ.get("GLORCQ_MIXTRAL_GRAPH", "")
+            _enable = (_env == "1") and self._mixtral_gather_available()
+            if not _enable:
+                print("[GLoRCQ Graph] Mixtral detected -> CUDA Graph disabled "
+                      "(default; set GLORCQ_MIXTRAL_GRAPH=1 to opt into the "
+                      "top-k gather graph path); using standard decode.")
+                self.graph = None
+                return
+            print("[GLoRCQ Graph] Mixtral top-k gather graph path enabled "
+                  "(GLORCQ_MIXTRAL_GRAPH=1).")
 
         # Fp16-shim experts are now handled by _forward_graph_vq4 via a
         # graph-safe overlay path (see _apply_fp16_shim_override in moe_block).
