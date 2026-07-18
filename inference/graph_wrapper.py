@@ -354,10 +354,18 @@ def run_speed_benchmark(model, tokenizer, max_batch_size=1, max_seq_len=2048,
     prompt = ''.join(random.choice(alphabet) for _ in range(prompt_len))
     inputs = tokenizer(prompt, return_tensors="pt", max_length=prompt_len,
                        truncation=True).to(device)
+    # Replicate the prompt across the batch so both the standard and the graph
+    # path actually run at max_batch_size (the graph wrapper asserts the input
+    # batch == max_batch_size). tok/s below is PER-SEQUENCE (gen_len / time);
+    # total throughput = per-seq * batch.
+    input_ids = inputs.input_ids
+    if max_batch_size > 1:
+        input_ids = input_ids.repeat(max_batch_size, 1)
+    attn_mask = torch.ones_like(input_ids)
 
     print(f"\n{'='*50}")
     print(f"  GLoRCQ Speed Benchmark")
-    print(f"  Prompt tokens: {inputs.input_ids.shape[1]}")
+    print(f"  Prompt tokens: {input_ids.shape[1]}")
     print(f"  Generate: {gen_len} tokens")
     print(f"  Batch size: {max_batch_size}")
     print(f"{'='*50}")
@@ -368,7 +376,8 @@ def run_speed_benchmark(model, tokenizer, max_batch_size=1, max_seq_len=2048,
     t0 = time.time()
     with torch.no_grad():
         std_out = model.generate(
-            inputs.input_ids,
+            input_ids,
+            attention_mask=attn_mask,
             max_new_tokens=gen_len,
             do_sample=False,
         )
@@ -376,7 +385,8 @@ def run_speed_benchmark(model, tokenizer, max_batch_size=1, max_seq_len=2048,
     t_std = time.time() - t0
     std_tps = gen_len / t_std
 
-    print(f"  Time: {t_std:.3f}s, Speed: {std_tps:.1f} tok/s")
+    print(f"  Time: {t_std:.3f}s, Speed: {std_tps:.1f} tok/s (per-seq; "
+          f"total {std_tps*max_batch_size:.1f})")
 
     # CUDA Graph generation
     print("\n[2/2] CUDA Graph generation ...")
@@ -385,11 +395,12 @@ def run_speed_benchmark(model, tokenizer, max_batch_size=1, max_seq_len=2048,
     wrapper.capture_graph()
 
     torch.cuda.synchronize()
-    graph_out, t_graph = wrapper.generate(inputs.input_ids,
+    graph_out, t_graph = wrapper.generate(input_ids,
                                            max_new_tokens=gen_len)
     graph_tps = gen_len / t_graph
 
-    print(f"  Time: {t_graph:.3f}s, Speed: {graph_tps:.1f} tok/s")
+    print(f"  Time: {t_graph:.3f}s, Speed: {graph_tps:.1f} tok/s (per-seq; "
+          f"total {graph_tps*max_batch_size:.1f})")
 
     # Summary
     speedup = graph_tps / std_tps if std_tps > 0 else 0
