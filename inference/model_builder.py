@@ -246,6 +246,63 @@ def _replace_moe_blocks(model):
 # ---------------------------------------------------------------------------
 # Model loading
 # ---------------------------------------------------------------------------
+def _fast_meta_load(model_path, config):
+    """Fast loader for stripped real-quant checkpoints.
+
+    Avoids the slow ``from_pretrained`` path, which default-initializes the
+    thousands of *stripped* quantized-expert weights at full fp16 size on CPU
+    (Qwen1.5 ~30 GB / ~6.5 min, Mixtral ~130 GB / ~25 min) only for them to be
+    thrown away and replaced by GLoRCQLinear.
+
+    Recipe (ported from LUT_GEMM_FluxBin/utils/saveutils.py:load_quantized_model):
+      1. Build the module tree on the *meta* device — zero alloc, zero init.
+         include_buffers=False keeps buffers (e.g. rotary inv_freq) real and
+         correctly computed by each module's __init__.
+      2. Load ONLY the checkpoint's own safetensors (the non-quantized
+         survivors: embeddings, norms, router gates, lm_head, fp16 attention
+         when attn_bits=16, and fp16-shim experts) and assign them in — this is
+         small and fast. Stripped quantized weights are simply absent
+         (missing_keys) and stay on meta.
+      3. Return the model. Downstream ``_replace_linear_layers`` then swaps the
+         still-meta quantized nn.Linear modules for GLoRCQLinear (it reads only
+         shape, never .weight) — the survivors, already materialized here, take
+         its non-meta branch (moved to device, NOT zero-initialized).
+
+    Raises on any failure so the caller can fall back to ``from_pretrained``.
+    """
+    import glob
+    from accelerate import init_empty_weights
+    import safetensors.torch as st
+
+    with init_empty_weights(include_buffers=False):
+        model = AutoModelForCausalLM.from_config(
+            config, trust_remote_code=True, torch_dtype=torch.float16,
+        )
+
+    shards = sorted(glob.glob(os.path.join(model_path, "model-*.safetensors")))
+    if not shards:
+        single = os.path.join(model_path, "model.safetensors")
+        if os.path.exists(single):
+            shards = [single]
+    if not shards:
+        raise FileNotFoundError(f"no safetensors shards in {model_path}")
+
+    state = {}
+    for shp in shards:
+        state.update(st.load_file(shp, device="cpu"))
+
+    # assign=True moves the loaded tensors straight into the (meta) params —
+    # no full-model materialization, no zero-fill. strict=False tolerates the
+    # stripped quantized keys (they stay meta, to be replaced downstream).
+    missing, unexpected = model.load_state_dict(state, strict=False, assign=True)
+    model.tie_weights()  # re-establish lm_head<->embed tie if the model ties them
+    n_meta = sum(1 for p in model.parameters() if p.device.type == "meta")
+    print(f"[GLoRCQ] fast meta-load: {len(state)} tensors assigned, "
+          f"{len(missing)} stripped/missing keys, {n_meta} params still on meta "
+          f"(to be replaced by GLoRCQLinear)")
+    return model
+
+
 def load_glorcq_model(model_path, device="cuda:0"):
     """
     Load a GLoRCQ real-quantized model for inference.
@@ -331,12 +388,26 @@ def load_glorcq_model(model_path, device="cuda:0"):
         if is_stripped:
             print(f"[GLoRCQ] Detected stripped real-quant checkpoint: fp16 weights for "
                   f"quantized layers missing (will be reconstructed from cross_layer_info.pt)")
-        model = AutoModelForCausalLM.from_pretrained(
-            model_path, config=config, trust_remote_code=True,
-            torch_dtype=torch.float16, low_cpu_mem_usage=True,
-            device_map='cpu',
-        )
-        _lap("from_pretrained(base skeleton)")
+        # Fast path: meta-init skeleton + assign only the surviving fp16 weights,
+        # instead of from_pretrained default-initializing all stripped quantized
+        # weights at full fp16 size on CPU (minutes + tens/hundreds of GB RSS).
+        # Set GLORCQ_LEGACY_LOAD=1 to force the old path (used by the parity probe).
+        model = None
+        if is_stripped and os.environ.get("GLORCQ_LEGACY_LOAD", "0") != "1":
+            try:
+                model = _fast_meta_load(model_path, config)
+                _lap("fast meta-init + safetensors assign")
+            except Exception as e:
+                print(f"[GLoRCQ] fast meta-load failed ({type(e).__name__}: {e}); "
+                      f"falling back to from_pretrained")
+                model = None
+        if model is None:
+            model = AutoModelForCausalLM.from_pretrained(
+                model_path, config=config, trust_remote_code=True,
+                torch_dtype=torch.float16, low_cpu_mem_usage=True,
+                device_map='cpu',
+            )
+            _lap("from_pretrained(base skeleton)")
     else:
         with torch.device("meta"):
             model = AutoModelForCausalLM.from_config(
