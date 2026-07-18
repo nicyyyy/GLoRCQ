@@ -1,17 +1,22 @@
 #!/bin/bash
-# Step 1/3: install env + build kernels on a fresh vast.ai H200 container.
+# Step 1/3: install env + build CUDA kernels on a fresh GPU machine
+# (vast.ai container, lab server, cloud VM — anything with nvcc + a GPU).
 #
 # Usage:
-#   cd /workspace
 #   git clone -b exp/e11-tileq-cross-layer https://github.com/nicyyyy/GLoRCQ.git
 #   bash GLoRCQ/scripts/vast_1_install.sh
 #
-# Verify success at end: torch importable + 3 .so files built.
+# Optional: WORK=/path/to/workdir bash ... (default: /workspace/glorcq_speed
+# on vast.ai, else $HOME/glorcq_speed). Needs ~50 GB free disk at $WORK.
+# Verify success at end: torch importable + 3 .so kernel files built.
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 GLORCQ_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-WORK=${WORK:-/workspace/glorcq_speed}
+if [ -z "${WORK:-}" ]; then
+    if [ -d /workspace ] && [ -w /workspace ]; then WORK=/workspace/glorcq_speed
+    else WORK=$HOME/glorcq_speed; fi
+fi
 mkdir -p "$WORK"
 cd "$WORK"
 
@@ -19,7 +24,7 @@ echo "===== [$(date)] Machine check ====="
 nvidia-smi --query-gpu=index,name,memory.total --format=csv | head -5
 nvcc --version 2>&1 | tail -1
 g++ --version | head -1
-df -h /workspace | tail -1
+df -h "$WORK" | tail -1
 free -h | head -2
 
 echo ""
@@ -56,10 +61,11 @@ echo ""
 echo "===== [$(date)] Install rest of deps ====="
 uv pip install "transformers==4.51.3" datasets accelerate peft huggingface_hub wheel packaging ninja sentencepiece protobuf
 
-# fast-hadamard-transform stub (VQ4 doesn't need it)
+# fast-hadamard-transform stub (VQ4 doesn't need it; real wheel is slow to build)
 $PY -c "import fast_hadamard_transform" 2>/dev/null || {
     echo "  installing fast-hadamard-transform stub"
-    cat > $VIRTUAL_ENV/lib/python3.12/site-packages/fast_hadamard_transform.py <<'STUB'
+    SITE_PKGS=$($PY -c "import sysconfig; print(sysconfig.get_paths()['purelib'])")
+    cat > "$SITE_PKGS/fast_hadamard_transform.py" <<'STUB'
 def hadamard_transform(*a, **k):
     raise NotImplementedError("stub — VQ4 doesn't use this")
 STUB
@@ -72,9 +78,11 @@ uv pip install -e . --no-build-isolation --no-deps
 cd "$WORK"
 
 echo ""
-echo "===== [$(date)] Build CUDA kernels (H200 sm_90) ====="
+echo "===== [$(date)] Build CUDA kernels ====="
+# setup.py bakes -gencode for sm_80/86/89/90 (A100/A6000/4090/H100/H200).
+# NOTE: TORCH_CUDA_ARCH_LIST is ignored (explicit gencodes win). For Blackwell
+# (sm_100/120) add the arch to the gencode list in inference/kernels/setup.py.
 cd "$GLORCQ_ROOT/inference/kernels"
-export TORCH_CUDA_ARCH_LIST=9.0
 $PY setup.py build_ext --inplace 2>&1 | tee /tmp/kernel_build.log | tail -8
 echo "---"
 ls -lh *.so 2>&1

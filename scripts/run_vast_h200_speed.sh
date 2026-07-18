@@ -82,6 +82,8 @@ $PY -c "from inference.kernels import is_vq4_cuda_available; print('vq4 kernel:'
 echo ""
 echo "===== [$(date)] Download 3 real-quant checkpoints from HF ====="
 export HF_HOME=$WORK/hf_cache
+# Public repos: ignore stale cached tokens (expired token => bogus "Repository Not Found")
+export HF_HUB_DISABLE_IMPLICIT_TOKEN=1
 mkdir -p "$HF_HOME" ckpts
 for m in qwen1.5-moe-a2.7b mixtral-8x7b qwen3-30b-a3b; do
     if [ -f "ckpts/$m/config.json" ] && ls ckpts/$m/model-*.safetensors >/dev/null 2>&1; then
@@ -90,7 +92,7 @@ for m in qwen1.5-moe-a2.7b mixtral-8x7b qwen3-30b-a3b; do
     fi
     mkdir -p "ckpts/$m"
     echo "  downloading $m ..."
-    $VIRTUAL_ENV/bin/huggingface-cli download "Tsingyow/GLoRCQ-${m}-real" \
+    $VIRTUAL_ENV/bin/huggingface-cli download "Tsingyow/GLoRCQ-${m}-fair-grassmann-real" \
         --local-dir "ckpts/$m" --max-workers 8 > "/tmp/dl_${m}.log" 2>&1 &
 done
 wait
@@ -110,12 +112,13 @@ echo "===== [$(date)] Run inference speed tests ====="
 mkdir -p speed_results
 # expandable_segments helps if GPU has residual fragmentation from prior runs
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export PYTORCH_ALLOC_CONF=expandable_segments:True
 
 for m in qwen1.5-moe-a2.7b mixtral-8x7b qwen3-30b-a3b; do
     echo ""
     echo "========== $m =========="
     CUDA_VISIBLE_DEVICES=0 $PY "$GLORCQ_ROOT/inference/eval_speed.py" \
-        --model_path "ckpts/$m" --batch_size 1 --prompt_len 128 --gen_len 128 --max_seq_len 512 \
+        --model_path "ckpts/$m" --batch_size 1 --prompt_len 128 --gen_len 128 --max_seq_len 384 \
         2>&1 | tee "speed_results/${m}.log"
 done
 

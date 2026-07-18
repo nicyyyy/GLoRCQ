@@ -16,7 +16,31 @@ layers, plain scalar GPTQ (4-bit, no LoRA) is applied.
 | Qwen3-30B-A3B | +0.1647 | **9.42** | WIN 0.68 vs TileQ_v 10.1 | 63.00% | 65.52% | `bash run_fair_qwen3.sh` |
 | Mixtral-8x7B-v0.1 | +0.1611 | **4.69** | WIN 0.29 vs TileQ_s 4.98 | 69.22% | 49.64% | `bash run_fair_mixtral.sh` |
 
-## Quick Start
+## Quick Start — real-quant decode speed test on a fresh GPU machine
+
+Reproduces the paper's Table-2 decode benchmark (3 MoE models, real bit-packed
+checkpoints) from a bare machine with a GPU + CUDA toolkit. No HF token needed
+(all three checkpoints are public and self-contained — base models NOT required).
+
+```bash
+git clone -b exp/e11-tileq-cross-layer https://github.com/nicyyyy/GLoRCQ.git
+bash GLoRCQ/scripts/vast_1_install.sh    # uv venv + torch matched to your nvcc + transformers 4.51.3 + build CUDA kernels (~10 min)
+bash GLoRCQ/scripts/vast_2_download.sh   # 3 real-quant ckpts from HF, ~40 GiB (qwen1.5 6.7G / mixtral 20G / qwen3 13G)
+bash GLoRCQ/scripts/vast_3_speed.sh      # runs all 3; or pass a subset: ... vast_3_speed.sh qwen1.5-moe-a2.7b
+```
+
+Notes: work dir defaults to `/workspace/glorcq_speed` (vast.ai) or `~/glorcq_speed`
+(override with `WORK=...`). Host RAM matters more than VRAM for loading (Mixtral's
+CPU load phase peaks ~130 GB RSS, ~25 min); GPU side fits in <20 GB resident per
+model with the default `--max_seq_len 384`. GPU arch: kernels build for
+sm_80/86/89/90 (A100/A6000/4090/H100/H200); for other archs edit
+`inference/kernels/setup.py`. Mixtral printing "CUDA Graph disabled" is expected
+(its graph path is auto-disabled as net-negative). A100-80G reference numbers
+(Standard/Graph tok/s): qwen1.5 10.4/22.2, mixtral 8.3/8.7, qwen3 2.8/6.4.
+Do NOT use `scripts/setup_env.sh` for this flow — its pyproject pin
+(transformers 4.45.2) predates Qwen3-MoE support.
+
+## Quantization Quick Start
 
 ```bash
 # 1. Setup environment (creates .venv, installs dependencies, builds CUDA kernels)

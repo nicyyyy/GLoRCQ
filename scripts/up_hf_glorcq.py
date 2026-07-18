@@ -19,11 +19,13 @@ from huggingface_hub import HfApi, HfFolder, upload_folder
 
 HF_USERNAME = "Tsingyow"
 BASE_DIR    = "/home/qyyang/resource_dir/hf_upload_staging"
-HF_TOKEN    = "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"
+# Never hardcode tokens (this file once did — that token is revoked; the repo
+# is public, so anything committed here lives forever in git history).
+HF_TOKEN    = os.environ.get("HF_TOKEN", "")
 if HF_TOKEN:
     HfFolder.save_token(HF_TOKEN)
 elif not HfFolder.get_token():
-    raise SystemExit("No HF_TOKEN found")
+    raise SystemExit("No HF_TOKEN found — export HF_TOKEN=... before running")
 
 api = HfApi()
 
