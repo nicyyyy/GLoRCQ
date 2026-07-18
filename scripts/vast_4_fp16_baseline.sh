@@ -44,6 +44,8 @@ declare -A FP16_REPO=(
 
 MODELS=("$@")
 [ ${#MODELS[@]} -eq 0 ] && MODELS=(qwen1.5-moe-a2.7b mixtral-8x7b qwen3-30b-a3b)
+# Batch sizes to sweep (override: BATCH_SIZES="1 4" bash ...); matches vast_3
+BATCH_SIZES=${BATCH_SIZES:-"1 4 16 64"}
 
 mkdir -p fp16_ckpts fp16_results
 
@@ -60,25 +62,40 @@ for m in "${MODELS[@]}"; do
     else
         echo "  already have fp16 $m ($(du -sh "$dst" | cut -f1))"
     fi
-    echo ""
-    echo "========== fp16 baseline: $m =========="
-    CUDA_VISIBLE_DEVICES=$GPU $PY "$GLORCQ_ROOT/scripts/fp16_speed_probe.py" \
-        --model_path "$dst" --prompt_len 128 --gen_len 128 --batch_size 1 \
-        --device cuda:0 --output_json "fp16_results/${m}.json" \
-        2>&1 | tee "fp16_results/${m}.log"
+    for bs in $BATCH_SIZES; do
+        echo ""
+        echo "========== fp16 baseline: $m  (batch_size=$bs) =========="
+        # fp16 model may OOM at big batch (esp. Mixtral 87GB weights + KV);
+        # the probe catches OOM and records it, sweep continues.
+        CUDA_VISIBLE_DEVICES=$GPU $PY "$GLORCQ_ROOT/scripts/fp16_speed_probe.py" \
+            --model_path "$dst" --prompt_len 128 --gen_len 128 --batch_size "$bs" \
+            --device cuda:0 --output_json "fp16_results/${m}_bs${bs}.json" \
+            2>&1 | tee "fp16_results/${m}_bs${bs}.log"
+    done
 done
 
 echo ""
 echo "===== [$(date)] SPEEDUP vs fp16 (HF eager, same framework) ====="
-printf "%-20s %10s %12s %12s %10s\n" model fp16_std ourStd ourGraph "graph/fp16"
+printf "%-20s %5s %10s %10s %10s %10s\n" model bs fp16_tot ourStd_tot ourGraph_tot "graph/fp16"
 for m in "${MODELS[@]}"; do
-    fp16=$(grep -oP "fp16 Standard: \K[0-9.]+" "fp16_results/${m}.log" 2>/dev/null | tail -1)
-    ostd=$(grep -oP "Standard:\s*\K[0-9.]+" "speed_results/${m}.log" 2>/dev/null | tail -1)
-    ogra=$(grep -oP "Graph:\s*\K[0-9.]+" "speed_results/${m}.log" 2>/dev/null | tail -1)
-    ratio=$($PY -c "
-try: print(f'{$ogra/$fp16:.2f}x')
+    for bs in $BATCH_SIZES; do
+        # fp16 total tok/s (per-seq x batch); our real-quant std/graph total from vast_3
+        fp16=$(grep -oP "total \K[0-9.]+" "fp16_results/${m}_bs${bs}.log" 2>/dev/null | tail -1)
+        ostd=$(grep -oP "Standard:\s*\K[0-9.]+" "speed_results/${m}_bs${bs}.log" 2>/dev/null | tail -1)
+        ogra=$(grep -oP "Graph:\s*\K[0-9.]+" "speed_results/${m}_bs${bs}.log" 2>/dev/null | tail -1)
+        # eval_speed prints per-seq tok/s; convert our numbers to total (x bs)
+        ratio=$($PY -c "
+try: print(f'{($ogra*$bs)/$fp16:.2f}x')
 except Exception: print('n/a')" 2>/dev/null)
-    printf "%-20s %10s %12s %12s %10s\n" "$m" "${fp16:-?}" "${ostd:-?}" "${ogra:-?}" "$ratio"
+        oatot=$($PY -c "
+try: print(f'{$ogra*$bs:.1f}')
+except Exception: print('?')" 2>/dev/null)
+        ostot=$($PY -c "
+try: print(f'{$ostd*$bs:.1f}')
+except Exception: print('?')" 2>/dev/null)
+        printf "%-20s %5s %10s %10s %10s %10s\n" "$m" "$bs" "${fp16:-OOM}" "${ostot:-?}" "${oatot:-?}" "$ratio"
+    done
 done
 echo "Note: fp16 = plain HF generate(), eager, no CUDA graph (isolates the method;"
-echo "      not a serving-system comparison vs vLLM/PagedAttention)."
+echo "      not a serving-system comparison vs vLLM/PagedAttention). Numbers are"
+echo "      TOTAL tok/s (per-seq x batch). fp16_tot=OOM means that batch didn't fit."

@@ -66,10 +66,21 @@ def main():
         torch.cuda.synchronize()
         return time.time() - t0
 
-    for _ in range(args.num_warmup):
-        one_run()
-    torch.cuda.reset_peak_memory_stats(args.device)
-    durs = [one_run() for _ in range(args.num_runs)]
+    try:
+        for _ in range(args.num_warmup):
+            one_run()
+        torch.cuda.reset_peak_memory_stats(args.device)
+        durs = [one_run() for _ in range(args.num_runs)]
+    except torch.cuda.OutOfMemoryError:
+        torch.cuda.empty_cache()
+        print(f"\n  OOM at batch_size={args.batch_size} — this config does not "
+              f"fit; skipping (report as OOM in the table).", flush=True)
+        if args.output_json:
+            import os
+            os.makedirs(os.path.dirname(args.output_json) or ".", exist_ok=True)
+            json.dump({"model": args.model_path, "batch_size": args.batch_size,
+                       "oom": True}, open(args.output_json, "w"), indent=1)
+        return
 
     dur = sum(durs) / len(durs)
     per_seq = args.gen_len / dur

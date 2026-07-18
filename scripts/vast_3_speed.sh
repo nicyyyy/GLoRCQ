@@ -36,6 +36,8 @@ MODELS=("$@")
 if [ ${#MODELS[@]} -eq 0 ]; then
     MODELS=(qwen1.5-moe-a2.7b mixtral-8x7b qwen3-30b-a3b)
 fi
+# Batch sizes to sweep (override: BATCH_SIZES="1 4" bash ...)
+BATCH_SIZES=${BATCH_SIZES:-"1 4 16 64"}
 
 # Prevent OOM from allocator fragmentation (both spellings: torch <=2.7 / >=2.8)
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
@@ -47,15 +49,18 @@ for m in "${MODELS[@]}"; do
         echo "SKIP $m (no ckpt at $CKPT_DIR/$m). Run vast_2_download.sh first."
         continue
     fi
-    echo ""
-    echo "========== $m =========="
-    # Expected (A100-80G reference): qwen1.5 ~10.4/22.2, mixtral ~8.3/8.7
-    # (prints "Mixtral detected -> CUDA Graph disabled" — expected, not a bug),
-    # qwen3 ~2.8/6.4 tok/s. Load is CPU-heavy: ~7min/~15min/~25min per model.
-    CUDA_VISIBLE_DEVICES=$GPU $PY "$GLORCQ_ROOT/inference/eval_speed.py" \
-        --model_path "$CKPT_DIR/$m" --batch_size 1 --prompt_len 128 --gen_len 128 \
-        --max_seq_len "$MAX_SEQ_LEN" \
-        2>&1 | tee "speed_results/${m}.log"
+    for bs in $BATCH_SIZES; do
+        echo ""
+        echo "========== $m  (batch_size=$bs) =========="
+        # bs=1 reference (A100-80G): qwen1.5 ~10.4/22.2, mixtral ~8.3/8.7
+        # (prints "Mixtral detected -> CUDA Graph disabled" — expected),
+        # qwen3 ~2.8/6.4 tok/s. Larger batch raises TOTAL throughput; big
+        # batch may OOM (esp. Mixtral) — set +e above lets the sweep continue.
+        CUDA_VISIBLE_DEVICES=$GPU $PY "$GLORCQ_ROOT/inference/eval_speed.py" \
+            --model_path "$CKPT_DIR/$m" --batch_size "$bs" --prompt_len 128 --gen_len 128 \
+            --max_seq_len "$MAX_SEQ_LEN" \
+            2>&1 | tee "speed_results/${m}_bs${bs}.log"
+    done
 done
 
 echo ""
