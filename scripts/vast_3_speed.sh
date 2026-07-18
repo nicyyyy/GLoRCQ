@@ -49,14 +49,18 @@ for m in "${MODELS[@]}"; do
         echo "SKIP $m (no ckpt at $CKPT_DIR/$m). Run vast_2_download.sh first."
         continue
     fi
-    # Mixtral's standard-decode path (with fp16-shim experts) is batch=1-only;
-    # batch>1 hits a shape bug in _batched_down_forward. Mixtral's systems story
-    # is memory (its graph is disabled anyway), so restrict it to bs=1 here.
-    _bs_list="$BATCH_SIZES"
-    if [ "$m" = "mixtral-8x7b" ]; then
-        _bs_list="1"
-        echo "  [note] mixtral-8x7b: batch>1 not supported on the decode path — bs=1 only"
-    fi
+    # Mixtral only: the launch-optimized decode path (_forward_decode, used when
+    # tokens N <= 4) has a shape bug with fp16-shim experts, so batch sizes in
+    # (1, 4] crash. bs=1 (N=1) and bs>4 (routes to _forward_sparse) are fine.
+    # Skip just the 2..4 range for Mixtral; keep 1 and >4.
+    _bs_list=""
+    for b in $BATCH_SIZES; do
+        if [ "$m" = "mixtral-8x7b" ] && [ "$b" -gt 1 ] && [ "$b" -le 4 ]; then
+            echo "  [note] mixtral-8x7b: skip bs=$b (decode-path bug at 1<bs<=4; 1 and >4 ok)"
+            continue
+        fi
+        _bs_list="$_bs_list $b"
+    done
     for bs in $_bs_list; do
         echo ""
         echo "========== $m  (batch_size=$bs) =========="

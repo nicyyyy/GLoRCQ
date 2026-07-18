@@ -62,11 +62,14 @@ for m in "${MODELS[@]}"; do
     else
         echo "  already have fp16 $m ($(du -sh "$dst" | cut -f1))"
     fi
-    # Match vast_3: Mixtral real-quant decode is bs=1-only, so only its bs=1
-    # fp16 baseline is comparable. (fp16 itself could run larger batch, but we
-    # only have a real-quant counterpart at bs=1 for Mixtral.)
-    _bs_list="$BATCH_SIZES"
-    [ "$m" = "mixtral-8x7b" ] && _bs_list="1"
+    # Match vast_3: Mixtral real-quant has no counterpart at 1<bs<=4 (decode-path
+    # bug), so skip those; run fp16 at the batch sizes Mixtral real-quant can
+    # (1 and >4) for a like-for-like speedup comparison.
+    _bs_list=""
+    for b in $BATCH_SIZES; do
+        if [ "$m" = "mixtral-8x7b" ] && [ "$b" -gt 1 ] && [ "$b" -le 4 ]; then continue; fi
+        _bs_list="$_bs_list $b"
+    done
     for bs in $_bs_list; do
         echo ""
         echo "========== fp16 baseline: $m  (batch_size=$bs) =========="
