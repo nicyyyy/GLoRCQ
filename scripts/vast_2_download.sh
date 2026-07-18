@@ -70,8 +70,10 @@ for m in qwen1.5-moe-a2.7b mixtral-8x7b qwen3-30b-a3b; do
     n=$(ls "ckpts/$m/model-"*.safetensors 2>/dev/null | wc -l)
     printf "    shards=%d\n" $n
     [ "$n" -eq 0 ] && all_ok=0
-    # tokenizer must ship with the ckpt (Mixtral uses sentencepiece tokenizer.model)
-    if [ -f "ckpts/$m/tokenizer.json" ] || [ -f "ckpts/$m/tokenizer.model" ]; then
+    # tokenizer must ship with the ckpt. Valid layouts: fast tokenizer.json,
+    # sentencepiece tokenizer.model (Mixtral), or BPE vocab.json+merges.txt (Qwen).
+    if [ -f "ckpts/$m/tokenizer.json" ] || [ -f "ckpts/$m/tokenizer.model" ] \
+       || { [ -f "ckpts/$m/vocab.json" ] && [ -f "ckpts/$m/merges.txt" ]; }; then
         printf "    tokenizer ✓\n"
     else
         printf "    tokenizer ✗ MISSING\n"; all_ok=0
