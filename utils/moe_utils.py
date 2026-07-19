@@ -104,6 +104,13 @@ _MOE_ARCH_CONFIG = {
         "has_shared_expert": False,
         "expert_container": "block_sparse_moe",
     },
+    "deepseek_v2": {
+        # DeepSeek-V2-Lite: 64 routed + 2 shared experts, top-6, container=`mlp`.
+        # Router `mlp.gate` is a custom MoEGate (not nn.Linear). Layer 0 is a plain
+        # dense DeepseekV2MLP (first_k_dense_replace=1) with no `.experts.`.
+        "has_shared_expert": True,
+        "expert_container": "mlp",
+    },
 }
 _DEFAULT_MOE_CONFIG = {
     "has_shared_expert": False,

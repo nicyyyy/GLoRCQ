@@ -54,6 +54,20 @@ except ImportError:
     Qwen3MoeForCausalLM = None
     _HAS_QWEN3_MOE = False
 
+
+def _is_deepseek(model) -> bool:
+    """DeepSeek-V2/V3 load a custom `DeepseekV2ForCausalLM` via trust_remote_code
+    (not a transformers builtin), so isinstance() can't match. Detect by class
+    name or config.model_type. Container layout is Qwen-like: model.model.layers,
+    `mlp.experts.{j}.{gate,up,down}_proj`, `mlp.shared_experts`, router `mlp.gate`
+    (a custom MoEGate, not nn.Linear → auto-skipped by find_layers). Rotary is
+    per-attention-layer (no top-level model.model.rotary_emb)."""
+    cls = model.__class__.__name__
+    if cls.startswith("Deepseek"):
+        return True
+    mt = getattr(getattr(model, "config", None), "model_type", "") or ""
+    return mt.startswith("deepseek")
+
 from get_scale_quant import get_normal_lora
 from sketch.r1_sketch import get_best_sketch_fp16_ret
 import quantizer as quant_module
@@ -207,6 +221,8 @@ def get_blocks(model):
         return model.model.layers
     elif _HAS_QWEN3_MOE and isinstance(model, Qwen3MoeForCausalLM):
         return model.model.layers
+    elif _is_deepseek(model):
+        return model.model.layers
     else:
         raise NotImplementedError(type(model))
 
@@ -223,6 +239,11 @@ def move_embed(model, device):
         model.model.embed_tokens = model.model.embed_tokens.to(device)
         # Qwen2Moe/Qwen3Moe have a top-level rotary_emb; Mixtral does NOT
         # (rotary is per-attention-layer). Guard the attribute.
+        if hasattr(model.model, 'rotary_emb') and model.model.rotary_emb is not None:
+            model.model.rotary_emb = model.model.rotary_emb.to(device)
+    elif _is_deepseek(model):
+        # DeepSeek-V2: rotary is per-attention-layer (no model.model.rotary_emb).
+        model.model.embed_tokens = model.model.embed_tokens.to(device)
         if hasattr(model.model, 'rotary_emb') and model.model.rotary_emb is not None:
             model.model.rotary_emb = model.model.rotary_emb.to(device)
     else:

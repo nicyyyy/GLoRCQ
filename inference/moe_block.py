@@ -44,17 +44,37 @@ class GraphCompatibleMoeBlock(nn.Module):
 
     def __init__(self, original_block):
         super().__init__()
-        # Transfer all sub-modules by reference (no weight copy)
-        self.num_experts = original_block.num_experts
-        self.top_k = original_block.top_k
-        # Mixtral's MixtralSparseMoeBlock stores `num_experts_per_tok` (top_k
-        # alias) and does not expose `norm_topk_prob`. Qwen has both.
-        self.norm_topk_prob = getattr(original_block, 'norm_topk_prob', True)
+        # DeepSeek-V2 differs from Qwen/Mixtral in router type, routing-config
+        # location, shared-expert layout, and decoder return convention. All of
+        # that lives in inference.deepseek_support; here we only detect it and
+        # delegate behind `if self._deepseek:` guards. Non-deepseek behavior is
+        # byte-identical to the original (the `else`/generic branches).
+        from . import deepseek_support
+        self._deepseek = deepseek_support.is_deepseek_block_obj(original_block)
+
+        # Transfer all sub-modules by reference (no weight copy). getattr-or
+        # fallbacks are benign for Qwen/Mixtral (they expose these attrs) and
+        # cover DeepSeek's `num_experts_per_tok` / no-top-level-num_experts.
+        self.num_experts = getattr(original_block, 'num_experts', None) \
+            or len(original_block.experts)
+        self.top_k = getattr(original_block, 'top_k', None) \
+            or getattr(original_block, 'num_experts_per_tok', None)
         self.gate = original_block.gate
         self.experts = original_block.experts
+        self._routed_scaling_factor = 1.0
+        if self._deepseek:
+            cfg = deepseek_support.routing_config(original_block)
+            self.norm_topk_prob = cfg['norm_topk_prob']
+            self._routed_scaling_factor = cfg['routed_scaling_factor']
+        else:
+            # Mixtral's MixtralSparseMoeBlock stores `num_experts_per_tok` (top_k
+            # alias) and does not expose `norm_topk_prob`. Qwen has both.
+            self.norm_topk_prob = getattr(original_block, 'norm_topk_prob', True)
         # Qwen1.5-MoE has a shared expert with a scalar gate. Mixtral has neither.
+        # DeepSeek-V2 has a plural, ungated `shared_experts` (single wider MLP).
         self.shared_expert = getattr(original_block, 'shared_expert', None)
         self.shared_expert_gate = getattr(original_block, 'shared_expert_gate', None)
+        self.shared_experts = getattr(original_block, 'shared_experts', None)
         # Alias Mixtral's w1/w3/w2 → gate_proj/up_proj/down_proj so the rest of
         # this module can address experts uniformly. Attribute assignment on
         # nn.Module shares submodule identity (state_dict / .parameters() /
@@ -772,13 +792,18 @@ class GraphCompatibleMoeBlock(nn.Module):
         hidden_states = hidden_states.view(-1, hidden_dim)
 
         # Router computation (fixed shape, graph-safe)
-        router_logits = self.gate(hidden_states)
-        routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
-        routing_weights, selected_experts = torch.topk(
-            routing_weights, self.top_k, dim=-1)
-        if self.norm_topk_prob:
-            routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
-        routing_weights = routing_weights.to(hidden_states.dtype)
+        if self._deepseek:
+            from . import deepseek_support
+            router_logits, routing_weights, selected_experts = \
+                deepseek_support.compute_routing(self, hidden_states)
+        else:
+            router_logits = self.gate(hidden_states)
+            routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
+            routing_weights, selected_experts = torch.topk(
+                routing_weights, self.top_k, dim=-1)
+            if self.norm_topk_prob:
+                routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
+            routing_weights = routing_weights.to(hidden_states.dtype)
 
         # In graph_mode, _forward_graph_vq4 recomputes rotations as batched
         # (E, in_d) @ (in_d, in_d) — the per-expert precompute at line ~508 is
@@ -831,8 +856,14 @@ class GraphCompatibleMoeBlock(nn.Module):
                 hidden_states, routing_weights, selected_experts, hidden_dim,
                 xU_cache, rot_cache)
 
-        # Shared expert (Qwen only). Mixtral has no shared_expert → skip.
-        if self.shared_expert is not None:
+        # Shared expert(s).
+        #  - Qwen1.5: singular `shared_expert` with a sigmoid scalar gate.
+        #  - DeepSeek-V2: plural `shared_experts` (single wider MLP), ungated.
+        #  - Mixtral/Qwen3: none → skip.
+        if self._deepseek:
+            from . import deepseek_support
+            final = deepseek_support.add_shared_experts(self, final, hidden_states)
+        elif self.shared_expert is not None:
             shared_out = self.shared_expert(hidden_states)
             if self.shared_expert_gate is not None:
                 shared_out = (
@@ -841,6 +872,11 @@ class GraphCompatibleMoeBlock(nn.Module):
             final = final + shared_out
 
         final = final.reshape(batch_size, sequence_length, hidden_dim)
+        # DeepSeek's DeepseekV2DecoderLayer expects `mlp(x)` to return a bare
+        # tensor (it does `hidden_states = self.mlp(...)`), whereas Qwen/Mixtral
+        # decoders unpack `(hidden_states, router_logits)`. Match the arch.
+        if self._deepseek:
+            return final
         return final, router_logits
 
     def _forward_decode(self, hidden_states, routing_weights,

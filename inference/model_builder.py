@@ -237,8 +237,15 @@ def _replace_moe_blocks(model):
             # defaults, w1/w3/w2 aliasing, dtype-aware LoRA). Routing Mixtral
             # through it inherits all decode-speed opts (CUDA Graph, grouped-GEMV,
             # dual-stream, precompute-share, silu fuse).
+            # DeepSeek-V2 loads a custom DeepseekV2MoE via trust_remote_code
+            # (not a builtin type). Detect by class name (its dense layer-0
+            # DeepseekV2MLP has no `.experts`/`.gate` → NOT wrapped). Detection
+            # + all DeepSeek runtime behavior live in inference.deepseek_support.
+            from . import deepseek_support
+            is_deepseek_moe = deepseek_support.is_deepseek_moe_block(mod)
             if (qwen_tuple and isinstance(mod, qwen_tuple)) or \
-               (mixtral_tuple and isinstance(mod, mixtral_tuple)):
+               (mixtral_tuple and isinstance(mod, mixtral_tuple)) or \
+               is_deepseek_moe:
                 setattr(layer, attr, GraphCompatibleMoeBlock(mod))
                 break
 
@@ -322,6 +329,12 @@ def load_glorcq_model(model_path, device="cuda:0"):
     # 1. Load HF config and create model structure
     config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
     config.use_cache = True
+
+    # DeepSeek-V2 remote modeling (tf ~4.36) uses a cache API removed in tf 4.51;
+    # apply the compat shim so generate() works. No-op for other architectures.
+    if str(getattr(config, "model_type", "")).startswith("deepseek"):
+        from . import deepseek_support
+        deepseek_support.patch_cache_compat()
 
     # Check if glorcq_model.pt exists (real quant mode)
     glorcq_model_path = os.path.join(model_path, "glorcq_model.pt")
