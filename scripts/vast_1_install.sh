@@ -40,13 +40,24 @@ $PY --version
 echo ""
 echo "===== [$(date)] Install torch matching nvcc ====="
 NVCC_VER=$(nvcc --version 2>&1 | grep -oP 'release \K[0-9]+\.[0-9]+' | head -1)
-case "$NVCC_VER" in
-    12.6*) TORCH_IDX=cu126; TORCH_VER=2.7.1 ;;
-    12.8*|12.9*) TORCH_IDX=cu128; TORCH_VER=2.8.0 ;;
-    13.*)  TORCH_IDX=cu130; TORCH_VER=2.9.1 ;;
-    *)     TORCH_IDX=cu124; TORCH_VER=2.6.0 ;;
-esac
-echo "nvcc $NVCC_VER -> torch $TORCH_VER $TORCH_IDX"
+# Explicit pin: to keep ALL speed numbers on ONE CUDA version (fair speedup
+# ratios — a version-wide speed factor cancels in the ratio, but MIXING
+# versions within one table does not), set both, e.g. for CUDA 12.8:
+#   TORCH_IDX=cu128 TORCH_VER=2.8.0 bash vast_1_install.sh
+# A CUDA-13-driver machine runs a cu128 torch fine (driver is backward-compat);
+# to also BUILD the kernels against 12.8, install a 12.8 toolkit and put its
+# nvcc first (CUDA_HOME=/usr/local/cuda-12.8 or conda cuda-toolkit=12.8).
+if [ -n "${TORCH_IDX:-}" ] && [ -n "${TORCH_VER:-}" ]; then
+    echo "using pinned torch $TORCH_VER $TORCH_IDX (nvcc reports $NVCC_VER)"
+else
+    case "$NVCC_VER" in
+        12.6*) TORCH_IDX=cu126; TORCH_VER=2.7.1 ;;
+        12.8*|12.9*) TORCH_IDX=cu128; TORCH_VER=2.8.0 ;;
+        13.*)  TORCH_IDX=cu130; TORCH_VER=2.9.1 ;;
+        *)     TORCH_IDX=cu124; TORCH_VER=2.6.0 ;;
+    esac
+    echo "nvcc $NVCC_VER -> torch $TORCH_VER $TORCH_IDX"
+fi
 
 # Torch is big — increase timeout, retry once if fails
 export UV_HTTP_TIMEOUT=300
