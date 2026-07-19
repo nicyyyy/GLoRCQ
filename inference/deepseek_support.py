@@ -79,3 +79,84 @@ def patch_cache_compat():
     from transformers.cache_utils import DynamicCache
     if not hasattr(DynamicCache, "get_max_length"):
         DynamicCache.get_max_length = lambda self: None
+
+
+# ---------------------------------------------------------------------------
+# bs=1 decode acceleration for DeepSeek-V2-Lite (per-MoE-block CUDA graphs)
+# ---------------------------------------------------------------------------
+# The shared graph_wrapper captures the WHOLE model as one CUDA graph, but that
+# needs a StaticCache + cache_position. DeepSeek-V2's MLA attention decompresses
+# and caches asymmetric multi-head K/V (key head_dim=192, value head_dim=128),
+# which transformers' StaticCache (single head_dim) cannot hold, and its remote
+# modeling uses the legacy DynamicCache API — so full-model capture is not
+# available without touching shared code.
+#
+# Instead we capture ONLY the per-layer MoE block compute (the launch-bound part:
+# 64 routed experts + shared expert, dispatched every decode token) into a
+# per-block CUDA graph, and leave MLA attention running eager (it is fp16 and
+# uses its own DynamicCache). This eliminates the MoE kernel-launch overhead
+# while keeping attention correct. Fully DeepSeek-isolated: nothing here runs
+# for Qwen/Mixtral, and the shared graph_wrapper is untouched.
+
+
+class _MoEBlockGraph:
+    """Wraps one GraphCompatibleMoeBlock: replays a captured fixed-shape (bs=1,
+    seq=1) all-experts graph on decode; falls back to eager for prefill /
+    other shapes."""
+
+    def __init__(self, block, hidden_size, device, dtype):
+        import torch
+        self.block = block
+        self.orig_forward = block.forward   # bound method (arch-aware, bare-tensor return)
+        self.static_in = torch.zeros((1, 1, hidden_size), device=device, dtype=dtype)
+        self.graph = None
+        self.static_out = None
+        block.graph_mode = True             # fixed-shape all-experts path
+        # Warm up on a side stream: builds the lazy vq4 graph cache + cuBLAS/kernel
+        # plans so nothing allocates during capture.
+        s = torch.cuda.Stream()
+        s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            for _ in range(3):
+                out = self.orig_forward(self.static_in)
+        torch.cuda.current_stream().wait_stream(s)
+        torch.cuda.synchronize()
+        self.graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(self.graph):
+            self.static_out = self.orig_forward(self.static_in)
+
+    def __call__(self, hidden_states, *args, **kwargs):
+        # Decode step: (1, 1, hidden) → replay. Anything else (prefill) → eager.
+        if (hidden_states.dim() == 3 and hidden_states.shape[0] == 1
+                and hidden_states.shape[1] == 1 and not args and not kwargs):
+            self.static_in.copy_(hidden_states)
+            self.graph.replay()
+            return self.static_out
+        self.block.graph_mode = False
+        out = self.orig_forward(hidden_states, *args, **kwargs)
+        self.block.graph_mode = True
+        return out
+
+
+def install_moe_block_graphs(model, device="cuda:0"):
+    """Capture a per-block CUDA graph for every DeepSeek MoE block so bs=1 decode
+    replays the expert dispatch instead of launching it. Returns the list of
+    runners (keep the reference alive; the graphs own their captured buffers).
+
+    No-op-safe: only wraps GraphCompatibleMoeBlock instances (the routed MoE
+    blocks). Dense layer-0 and attention are left untouched.
+    """
+    import torch
+    from .moe_block import GraphCompatibleMoeBlock
+    hidden = model.config.hidden_size
+    dtype = next(model.parameters()).dtype
+    runners = []
+    n = 0
+    for module in model.modules():
+        if isinstance(module, GraphCompatibleMoeBlock):
+            runner = _MoEBlockGraph(module, hidden, device, dtype)
+            module.forward = runner          # nn.Module.__call__ dispatches to instance attr
+            runners.append(runner)
+            n += 1
+    print(f"[deepseek] captured {n} per-MoE-block CUDA graphs (bs=1 decode)", flush=True)
+    return runners

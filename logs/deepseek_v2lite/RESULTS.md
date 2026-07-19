@@ -20,27 +20,34 @@ VQ4 + cross-layer Grassmann-shared LoRA (the paper contribution).
 - FP16 baseline     : 5.65
 - gap: +0.79 PPL
 
-## Zero-shot (lm-eval-harness, num_fewshot 0, batch 16; acc_norm where applicable)
-| task           | metric   | acc    |
-|----------------|----------|--------|
-| ARC-Challenge  | acc_norm | 0.4369 |
-| ARC-Easy       | acc_norm | 0.7302 |
-| WinoGrande     | acc      | 0.6882 |
-| HellaSwag      | acc_norm | 0.7145 |
-| PIQA           | acc_norm | 0.7709 |
-| **Average (5)**|          | **0.6682 (66.82%)** |
+## Zero-shot — CANONICAL Table-1 protocol (metric=acc, add_bos=True, 0-shot)
+Same harness applied to BOTH CLASP (quant) and fp16 for a directly-comparable row.
+(batch 16; lm-eval loglikelihood acc is batch-invariant == batch 1.)
 
-Note: lm-eval loglikelihood accuracy is batch-invariant; batch 16 used to save wall time
-(identical scores to batch 1). Same eval_zeroshot.py/eval_ppl.py used for the other 3 models
-(no --add_bos flag exists in the repo harness → matches Qwen/Mixtral/Qwen3 methodology).
+| task           | CLASP acc | fp16 acc |
+|----------------|-----------|----------|
+| ARC-Challenge  | 0.4317    | 0.4386   |
+| ARC-Easy       | 0.7471    | 0.7753   |
+| WinoGrande     | 0.6882    | 0.7072   |
+| HellaSwag      | 0.5314    | 0.5854   |
+| PIQA           | 0.7595    | 0.8036   |
+| **Average (5)**| **0.6316**| **0.6620** |
+
+CLASP 63.16% vs fp16 66.20% → −3.04 pts (2-bit expert quant).
+(Earlier acc_norm/no-add_bos run, for reference: CLASP avg 0.6682.)
 
 ## bs=1 decode speed (prompt 128, gen 128, GPU A100)
-- real-quant eager : **6.68 tok/s** (0.40× fp16)
-- fp16 eager       : **16.70 tok/s**
-- CUDA-graph path: **does NOT engage** — the graph wrapper uses StaticCache +
-  cache_position, which DeepSeek-V2's MLA remote modeling (legacy DynamicCache API)
-  does not support (analogous to Mixtral's graph limitation). So the bs=1 win the
-  graph path gives Qwen (~4-5×) is unavailable here; real-quant is a MEMORY win.
+- real-quant eager             : ~6.4-6.7 tok/s
+- **real-quant + MoE-block CUDA graph : 17.70 tok/s  (2.78× over eager; BEATS fp16)**
+- fp16 eager                   : 16.70 tok/s  → real-quant graphed ratio **1.06×**
+- Full-model CUDA graph (graph_wrapper) does NOT engage: it uses StaticCache +
+  cache_position, and DeepSeek-V2's MLA caches asymmetric multi-head K/V (key
+  head_dim=192, value head_dim=128) that StaticCache (single head_dim) cannot
+  hold; its remote modeling uses the legacy DynamicCache API. So instead we
+  capture ONLY the launch-bound MoE-block compute (64 routed + shared expert)
+  per layer into 26 per-block CUDA graphs, leaving MLA attention eager (fp16,
+  DynamicCache). Isolated in deepseek_support.install_moe_block_graphs(); the
+  shared graph_wrapper is untouched. Graphed output is byte-identical to eager.
 - GPU memory: real-quant **6.74 GB** resident vs ~31 GB fp16 (~4.6× reduction);
   on-disk checkpoint 6.3 GB (stripped) vs 33 GB fake / ~31 GB original.
 
@@ -49,8 +56,10 @@ https://huggingface.co/Tsingyow/GLoRCQ-deepseek-v2-lite-real  (verified: 19 file
 cross_layer_info.pt, .stripped_real_quant, modeling_deepseek.py, index.json)
 
 ## Regression check (coordinator requirement)
-- Qwen1.5-MoE real-quant graph-only bs=1: 22.5 → 23.3 tok/s (post-refactor, == baseline ~22).
-  Sane text: "The capital of France is ... B. Paris ...". No regression from shared-line edits.
+- Qwen1.5-MoE real-quant graph-only bs=1: 22.5 tok/s (== baseline ~22) across all rounds.
+  moe_block.py / model_builder.py have zero diff from the last Qwen-verified commit; the
+  MoE-block-graph work is additive in deepseek_support.py + an opt-in eval flag only.
+  Sane text: "The capital of France is ... B. Paris ...". No regression.
 
 ## Sample decode (real-quant DeepSeek-V2-Lite)
 "The capital of France is Paris, and the country's official language is French."

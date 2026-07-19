@@ -45,6 +45,9 @@ def main():
     parser.add_argument("--metric_mode", default="auto",
                         choices=["auto", "acc", "acc_norm"],
                         help="Metric priority: auto=prefer acc_norm, acc=prefer raw acc, acc_norm=force normalized")
+    parser.add_argument("--add_bos", action="store_true", default=False,
+                        help="Prepend BOS (HFLM add_bos_token=True) — canonical "
+                             "Table-1 protocol. Default off preserves prior behavior.")
     args = parser.parse_args()
 
     from lm_eval import evaluator
@@ -61,7 +64,8 @@ def main():
     print(f"Tasks: {task_list}")
     print(f"Batch size: {args.batch_size}, num_fewshot: {args.num_fewshot}")
 
-    lm = HFLM(pretrained=model, tokenizer=tokenizer, batch_size=args.batch_size)
+    lm = HFLM(pretrained=model, tokenizer=tokenizer, batch_size=args.batch_size,
+              add_bos_token=args.add_bos)
 
     results = evaluator.simple_evaluate(
         model=lm,
