@@ -1,18 +1,29 @@
-"""DeepSeek-V2 (deepseek_v2) inference-support helpers.
+"""DeepSeek inference-support helpers (both `deepseek_v2` AND `deepseek` v1).
 
 Keeps the shared inference files (moe_block.py, model_builder.py) lean: the
 DeepSeek-specific behavior lives here and is called only behind an
 `if self._deepseek:` / `if is_deepseek_moe_block(mod):` guard. Runtime behavior
 for Qwen/Mixtral/Qwen3 is therefore unaffected — those paths never enter here.
 
-DeepSeek-V2-Lite specifics handled:
+Two DeepSeek families share this module (their block/router/decoder layouts are
+identical; only the attention differs — see the graph section at the bottom):
+  * `deepseek_v2` — DeepSeek-V2-Lite (arch DeepseekV2ForCausalLM), MLA attention
+    (asymmetric KV: key head_dim 192 / value 128, kv_lora_rank 512).
+  * `deepseek`    — DeepSeek-MoE-16B / Dai-2024 (arch DeepseekForCausalLM),
+    STANDARD symmetric MHA (num_attention_heads == num_key_value_heads,
+    head_dim = hidden/heads = 128). No MLA config fields.
+Both: 64 routed + 2 shared experts, top-6, first_k_dense_replace=1 (dense layer 0),
+moe_intermediate_size 1408, hidden 2048.
+
+Common specifics handled here (identical for v1 and v2):
   * Router is a custom `MoEGate` (returns (idx, weight, aux), not logits) whose
     config (norm_topk_prob, routed_scaling_factor) differs from Qwen. We compute
     routing directly from `gate.weight` so it works on flattened (N, h) inputs.
-  * norm_topk_prob is False on V2-Lite → scale top-k weights by
-    routed_scaling_factor instead of renormalizing (matches modeling_deepseek).
+  * norm_topk_prob is False → the top-k weights are the raw softmax probs scaled
+    by routed_scaling_factor (default 1.0; v1's MoEGate has no such attribute →
+    getattr default 1.0 keeps it a no-op, matching modeling_deepseek v1 exactly).
   * Plural, ungated `shared_experts` (a single wider MLP), added directly.
-  * DeepseekV2DecoderLayer expects `mlp(x)` to return a bare tensor, unlike the
+  * Deepseek(V2)DecoderLayer expects `mlp(x)` to return a bare tensor, unlike the
     Qwen/Mixtral decoders which unpack `(hidden_states, router_logits)`.
   * The remote modeling (written for tf ~4.36) calls DynamicCache.get_max_length()
     which was removed in tf 4.51 (renamed get_max_cache_shape). We shim it.
@@ -22,15 +33,22 @@ import torch.nn.functional as F
 
 
 def is_deepseek_block_obj(original_block) -> bool:
-    """True if this HF MoE block is a DeepSeek-V2 routed-expert block."""
+    """True if this HF MoE block is a DeepSeek routed-expert block (v1 or v2).
+    Class names are `DeepseekMoE` (v1) / `DeepseekV2MoE` (v2), both prefixed
+    `Deepseek`."""
     return type(original_block).__name__.startswith("Deepseek")
 
 
 def is_deepseek_moe_block(mod) -> bool:
-    """True only for the routed DeepseekV2MoE block (NOT the dense layer-0
-    DeepseekV2MLP, which has no `.experts`/`.gate`)."""
+    """True only for a routed DeepSeek MoE block (NOT the dense layer-0
+    Deepseek(V2)MLP, which has no `.experts`/`.gate`).
+
+    Matches both the v1 `DeepseekMoE` (DeepSeek-MoE-16B) and the v2
+    `DeepseekV2MoE` (DeepSeek-V2-Lite) class names; the dense first-layer MLP
+    (`DeepseekMLP` / `DeepseekV2MLP`) lacks `.experts`/`.gate` so it is excluded.
+    """
     return (
-        type(mod).__name__ == "DeepseekV2MoE"
+        type(mod).__name__ in ("DeepseekV2MoE", "DeepseekMoE")
         and hasattr(mod, "experts")
         and hasattr(mod, "gate")
     )
@@ -261,18 +279,105 @@ class _MLAStaticCache:
         return self.k_cache[layer_idx][:, :, :q], self.v_cache[layer_idx][:, :, :q]
 
 
+class _MHAStaticCache:
+    """Self-managed fixed-shape KV cache for DeepSeek-MoE-16B (v1) STANDARD MHA.
+
+    Symmetric variant of `_MLAStaticCache`: key and value share one head_dim
+    (= hidden_size / num_attention_heads, e.g. 2048/16 = 128), so both buffers
+    are (1, num_kv_heads, max_seq, head_dim). Exposes exactly the two methods the
+    stock `DeepseekAttention.forward` calls — `get_usable_length` and `update` —
+    so that attention runs UNCHANGED (decode output byte-identical to eager). The
+    prefill/decode mode semantics are identical to `_MLAStaticCache`:
+      * "prefill": get_usable_length -> 0, update writes [0:q_len] and returns the
+        real-length view (standard causal attention over the prompt).
+      * "decode":  get_usable_length -> max_seq - new_seq_length so kv_seq_len ==
+        max_seq (fixed, capture-safe); update writes one token at the static
+        cache_position and returns the FULL max_seq buffers. A static additive
+        mask (built from cache_position by the graph) masks the unwritten tail.
+
+    This is why DeepSeek-MoE-16B does NOT need the MLA asymmetric-KV hack: plain
+    symmetric MHA fits a single-head_dim static cache. (The remaining blocker to
+    the *shared* graph_wrapper StaticCache path is unrelated to dims — the tf-4.36
+    remote modeling has no `cache_position` kwarg and calls `get_usable_length`
+    instead of the StaticCache API — so we still bypass model.forward and drive
+    the stock decoder layers directly, exactly as the v2 path does.)
+    """
+
+    def __init__(self, config, max_seq, num_layers, device, dtype):
+        import torch
+        self.max_seq = max_seq
+        self.mode = "decode"
+        nkv = getattr(config, "num_key_value_heads", None) or config.num_attention_heads
+        head_dim = config.hidden_size // config.num_attention_heads   # 128
+        self.k_cache = [torch.zeros((1, nkv, max_seq, head_dim), device=device,
+                                    dtype=dtype) for _ in range(num_layers)]
+        self.v_cache = [torch.zeros((1, nkv, max_seq, head_dim), device=device,
+                                    dtype=dtype) for _ in range(num_layers)]
+        self.cache_position = torch.zeros((1,), dtype=torch.long, device=device)
+
+    def reset(self):
+        for k, v in zip(self.k_cache, self.v_cache):
+            k.zero_(); v.zero_()
+
+    def get_usable_length(self, new_seq_length, layer_idx=0):
+        if self.mode == "prefill":
+            return 0
+        return self.max_seq - new_seq_length  # decode: new=1 -> kv_seq_len=max_seq
+
+    def get_seq_length(self, layer_idx=0):
+        return self.max_seq
+
+    def get_max_length(self):
+        return self.max_seq
+
+    def update(self, key_states, value_states, layer_idx, cache_kwargs=None):
+        import torch
+        if self.mode == "decode":
+            self.k_cache[layer_idx].index_copy_(2, self.cache_position, key_states)
+            self.v_cache[layer_idx].index_copy_(2, self.cache_position, value_states)
+            return self.k_cache[layer_idx], self.v_cache[layer_idx]
+        q = key_states.shape[2]
+        idx = torch.arange(q, device=key_states.device)
+        self.k_cache[layer_idx].index_copy_(2, idx, key_states)
+        self.v_cache[layer_idx].index_copy_(2, idx, value_states)
+        return self.k_cache[layer_idx][:, :, :q], self.v_cache[layer_idx][:, :, :q]
+
+
+def _is_mla_config(config) -> bool:
+    """True for DeepSeek-V2 MLA attention (asymmetric KV), False for v1 MHA.
+
+    V2 configs carry `qk_nope_head_dim` / `v_head_dim` / `kv_lora_rank`; the v1
+    DeepSeek-MoE-16B config has none of these (plain symmetric MHA)."""
+    return getattr(config, "qk_nope_head_dim", None) is not None
+
+
+def _make_deepseek_static_cache(config, max_seq, num_layers, device, dtype):
+    """Pick the fixed-shape KV cache matching the attention type: `_MLAStaticCache`
+    for DeepSeek-V2 (asymmetric MLA KV), `_MHAStaticCache` for DeepSeek-MoE-16B
+    (symmetric MHA)."""
+    if _is_mla_config(config):
+        return _MLAStaticCache(config, max_seq, num_layers, device, dtype)
+    return _MHAStaticCache(config, max_seq, num_layers, device, dtype)
+
+
 class DeepseekFullDecodeGraph:
-    """Prefill (eager) + full decode-step CUDA-graph generator for DeepSeek-V2.
+    """Prefill (eager) + full decode-step CUDA-graph generator for DeepSeek
+    (both v1 MHA and v2 MLA).
 
     Captures embed -> layers -> norm -> lm_head for a single (bs=1, seq=1) decode
-    token into one CUDA graph, using _MLAStaticCache so MLA attention is included.
+    token into one CUDA graph. The KV cache is chosen by attention type
+    (`_MHAStaticCache` for v1 symmetric MHA, `_MLAStaticCache` for v2 MLA) so the
+    stock attention.forward is included in the graph, unchanged. This is the
+    "full-model decode graph" for DeepSeek-MoE-16B — the analogue of the Qwen
+    graph_wrapper path, but self-managed because the tf-4.36 remote modeling is
+    not StaticCache/cache_position compatible.
     """
 
     def __init__(self, model, max_seq_len=384, device="cuda:0"):
         import torch
         from .moe_block import GraphCompatibleMoeBlock
         self.model = model
-        self.base = model.model            # DeepseekV2Model
+        self.base = model.model            # Deepseek(V2)Model
         self.lm_head = model.lm_head
         self.layers = self.base.layers
         self.embed = self.base.embed_tokens
@@ -282,8 +387,8 @@ class DeepseekFullDecodeGraph:
         self.max_seq = max_seq_len
         cfg = model.config
         self.min_val = torch.finfo(self.dtype).min
-        self.cache = _MLAStaticCache(cfg, max_seq_len, len(self.layers),
-                                     device, self.dtype)
+        self.cache = _make_deepseek_static_cache(cfg, max_seq_len, len(self.layers),
+                                                 device, self.dtype)
         self._moe_blocks = [m for m in model.modules()
                             if isinstance(m, GraphCompatibleMoeBlock)]
         # Static decode buffers.
@@ -380,7 +485,13 @@ class DeepseekFullDecodeGraph:
 
 def install_full_decode_graph(model, max_seq_len=384, device="cuda:0"):
     """Build a DeepseekFullDecodeGraph (attention + MoE captured together). Returns
-    the runner; call runner.generate(input_ids, max_new_tokens=...)."""
+    the runner; call runner.generate(input_ids, max_new_tokens=...).
+
+    Works for both DeepSeek families: the runner auto-selects `_MHAStaticCache`
+    for DeepSeek-MoE-16B (v1, symmetric MHA) or `_MLAStaticCache` for
+    DeepSeek-V2-Lite (v2, MLA) from model.config. For v1 (plain MHA + many small
+    experts, like Qwen) this full-model graph is expected to give a larger bs=1
+    decode win than the v2 MLA case; the actual speedup MUST be confirmed on GPU."""
     return DeepseekFullDecodeGraph(model, max_seq_len=max_seq_len, device=device)
 
 

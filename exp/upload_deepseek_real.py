@@ -6,8 +6,14 @@ import os, sys, time
 from huggingface_hub import HfApi, HfFolder, upload_folder
 
 HF_USERNAME = "Tsingyow"
-REPO = f"{HF_USERNAME}/GLoRCQ-deepseek-v2-lite-real"
-LOCAL = "/mnt/Data/yqy/resource_dir/glorcq_paper_exp/deepseek_v2lite_real"
+# Defaults = V2-Lite (backward compatible). Override via env to reuse for other
+# DeepSeek checkpoints, e.g. DeepSeek-MoE-16B:
+#   GLORCQ_HF_REPO=Tsingyow/GLoRCQ-deepseek-moe-16b-real \
+#   GLORCQ_LOCAL_DIR=/mnt/Data/yqy/resource_dir/glorcq_paper_exp/deepseek_moe16b_real \
+#   HF_TOKEN=... python exp/upload_deepseek_real.py
+REPO = os.environ.get("GLORCQ_HF_REPO", f"{HF_USERNAME}/GLoRCQ-deepseek-v2-lite-real")
+LOCAL = os.environ.get("GLORCQ_LOCAL_DIR",
+                       "/mnt/Data/yqy/resource_dir/glorcq_paper_exp/deepseek_v2lite_real")
 
 tok = os.environ.get("HF_TOKEN", "")
 if tok:

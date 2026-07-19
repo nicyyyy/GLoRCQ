@@ -111,6 +111,19 @@ _MOE_ARCH_CONFIG = {
         "has_shared_expert": True,
         "expert_container": "mlp",
     },
+    "deepseek": {
+        # DeepSeek-MoE-16B (Dai 2024, the ORIGINAL v1 model, arch
+        # `DeepseekForCausalLM`): 64 routed + 2 shared experts, top-6, 28 layers,
+        # moe_intermediate_size=1408, hidden=2048 — expert dims IDENTICAL to
+        # DeepSeek-V2-Lite and Qwen1.5-MoE, so the VQ4 kernel / clustering need
+        # zero changes. Container=`mlp`; router `mlp.gate` is a custom MoEGate
+        # (not nn.Linear → auto-skipped by find_layers). Layer 0 is a plain dense
+        # DeepseekMLP (first_k_dense_replace=1) with no `.experts.`. Unlike
+        # V2-Lite this model uses STANDARD symmetric MHA (no MLA), which is why
+        # it is ported (enables the full-model decode graph path).
+        "has_shared_expert": True,
+        "expert_container": "mlp",
+    },
 }
 _DEFAULT_MOE_CONFIG = {
     "has_shared_expert": False,

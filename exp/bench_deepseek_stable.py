@@ -26,6 +26,7 @@ def timed_generate(gen_fn, prompt_len, gen_len):
 
 
 def main():
+    global REAL, FP16
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", choices=["eager", "moe_graph", "full_graph", "fp16"],
                     required=True)
@@ -34,7 +35,14 @@ def main():
     ap.add_argument("--max_seq_len", type=int, default=384)
     ap.add_argument("--warmup", type=int, default=2)
     ap.add_argument("--runs", type=int, default=3)
+    # Path overrides so the SAME harness serves both DeepSeek models. Defaults =
+    # V2-Lite (backward compatible); DeepSeek-MoE-16B passes its dirs explicitly.
+    ap.add_argument("--real_path", default=REAL,
+                    help="real-quant checkpoint dir (default: V2-Lite)")
+    ap.add_argument("--fp16_path", default=FP16,
+                    help="fp16 baseline dir (default: V2-Lite)")
     args = ap.parse_args()
+    REAL, FP16 = args.real_path, args.fp16_path
 
     from transformers import AutoTokenizer
     from inference import deepseek_support

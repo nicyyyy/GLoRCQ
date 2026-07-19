@@ -56,12 +56,16 @@ except ImportError:
 
 
 def _is_deepseek(model) -> bool:
-    """DeepSeek-V2/V3 load a custom `DeepseekV2ForCausalLM` via trust_remote_code
-    (not a transformers builtin), so isinstance() can't match. Detect by class
-    name or config.model_type. Container layout is Qwen-like: model.model.layers,
-    `mlp.experts.{j}.{gate,up,down}_proj`, `mlp.shared_experts`, router `mlp.gate`
-    (a custom MoEGate, not nn.Linear → auto-skipped by find_layers). Rotary is
-    per-attention-layer (no top-level model.model.rotary_emb)."""
+    """DeepSeek MoE models load a custom `Deepseek[V2]ForCausalLM` via
+    trust_remote_code (not a transformers builtin), so isinstance() can't match.
+    Detect by class name (prefix `Deepseek`) or config.model_type (prefix
+    `deepseek`) — covers BOTH v1 DeepSeek-MoE-16B (`deepseek`,
+    DeepseekForCausalLM) and v2 DeepSeek-V2-Lite (`deepseek_v2`,
+    DeepseekV2ForCausalLM). Container layout is Qwen-like for both:
+    model.model.layers, `mlp.experts.{j}.{gate,up,down}_proj`,
+    `mlp.shared_experts`, router `mlp.gate` (a custom MoEGate, not nn.Linear →
+    auto-skipped by find_layers). Rotary is per-attention-layer for both (no
+    top-level model.model.rotary_emb), so move_embed guards the attribute."""
     cls = model.__class__.__name__
     if cls.startswith("Deepseek"):
         return True
