@@ -160,3 +160,77 @@ def install_moe_block_graphs(model, device="cuda:0"):
             n += 1
     print(f"[deepseek] captured {n} per-MoE-block CUDA graphs (bs=1 decode)", flush=True)
     return runners
+
+
+# ---------------------------------------------------------------------------
+# torch.compile on the eager MLA attention (Inductor fusion, no fixed shapes)
+# ---------------------------------------------------------------------------
+# The full-model CUDA graph is blocked by MLA's asymmetric-KV / StaticCache. The
+# MoE-block graphs above remove the MoE launch overhead, but MLA attention still
+# runs eager, capping the win. torch.compile fuses attention's projection GEMMs /
+# RoPE / softmax and cuts Python+launch overhead WITHOUT needing StaticCache or
+# fixed shapes, so it sidesteps the blocker and composes with the MoE graphs
+# (attention = fused Inductor kernels launched eagerly; MoE = separate cudagraph
+# replay). We compile ONLY the attention submodule of each layer.
+#
+# IMPORTANT: use mode="default" (or "max-autotune"), NOT "reduce-overhead" — the
+# latter wraps the compiled region in cudagraphs, which would re-hit the
+# StaticCache/asymmetric-KV shape problem and/or clash with our MoE cudagraphs.
+# Fully DeepSeek-isolated; Qwen/Mixtral never call this.
+
+
+def enable_dynamo_graph_break_logs():
+    """Turn on torch._dynamo graph-break + recompile reporting (best-effort)."""
+    try:
+        import torch._logging as _tl
+        _tl.set_logs(graph_breaks=True, recompiles=True)
+    except Exception:
+        try:
+            import torch._dynamo as _dyn
+            _dyn.config.verbose = True
+        except Exception:
+            pass
+
+
+def dynamo_stats():
+    """Return a dict of dynamo counters (graph breaks, recompiles, etc.) so the
+    bench can quantify how cleanly attention compiled."""
+    try:
+        import torch._dynamo as _dyn
+        return {k: dict(v) for k, v in _dyn.utils.counters.items()}
+    except Exception:
+        return {}
+
+
+def install_attention_compile(model, mode="default", dynamic=True,
+                              report_graph_breaks=True):
+    """torch.compile each DeepSeek layer's `self_attn` submodule (Inductor
+    fusion). Leaves the MoE blocks on their _MoEBlockGraph path untouched, so
+    this composes with install_moe_block_graphs(). Returns the number compiled.
+
+    mode: "default" or "max-autotune" (both eager-launch, no cudagraphs). Do NOT
+          pass "reduce-overhead" (cudagraphs → re-hits the StaticCache blocker).
+    dynamic: True lets Inductor handle varying seq_len (prefill vs decode)
+             without recompiling per length.
+
+    Compilation is lazy — the first forward triggers it (slow warmup); call a
+    warmup generate() before timing.
+    """
+    import torch
+    if mode == "reduce-overhead":
+        raise ValueError(
+            "reduce-overhead uses cudagraphs → re-hits MLA StaticCache blocker; "
+            "use 'default' or 'max-autotune'.")
+    if report_graph_breaks:
+        enable_dynamo_graph_break_logs()
+    layers = getattr(model, "model", model).layers
+    n = 0
+    for layer in layers:
+        attn = getattr(layer, "self_attn", None)
+        if attn is None:
+            continue
+        layer.self_attn = torch.compile(attn, mode=mode, dynamic=dynamic)
+        n += 1
+    print(f"[deepseek] torch.compile applied to {n} attention modules "
+          f"(mode={mode}, dynamic={dynamic})", flush=True)
+    return n
