@@ -332,7 +332,7 @@ class GLoRCQGraphWrapper:
 # Speed benchmark
 # ---------------------------------------------------------------------------
 def run_speed_benchmark(model, tokenizer, max_batch_size=1, max_seq_len=2048,
-                        prompt_len=128, gen_len=128):
+                        prompt_len=128, gen_len=128, skip_standard=False):
     """
     Run speed benchmark comparing standard generation vs CUDA Graph.
 
@@ -343,6 +343,8 @@ def run_speed_benchmark(model, tokenizer, max_batch_size=1, max_seq_len=2048,
         max_seq_len: maximum sequence length
         prompt_len: length of random prompt
         gen_len: number of tokens to generate
+        skip_standard: if True, only run the CUDA-graph path (no standard
+            baseline) — faster when only the graph number is needed.
     """
     import random
     import string
@@ -370,23 +372,26 @@ def run_speed_benchmark(model, tokenizer, max_batch_size=1, max_seq_len=2048,
     print(f"  Batch size: {max_batch_size}")
     print(f"{'='*50}")
 
-    # Standard generation (no graph)
-    print("\n[1/2] Standard generation (no CUDA Graph) ...")
-    torch.cuda.synchronize()
-    t0 = time.time()
-    with torch.no_grad():
-        std_out = model.generate(
-            input_ids,
-            attention_mask=attn_mask,
-            max_new_tokens=gen_len,
-            do_sample=False,
-        )
-    torch.cuda.synchronize()
-    t_std = time.time() - t0
-    std_tps = gen_len / t_std
-
-    print(f"  Time: {t_std:.3f}s, Speed: {std_tps:.1f} tok/s (per-seq; "
-          f"total {std_tps*max_batch_size:.1f})")
+    # Standard generation (no graph) — skipped in graph-only mode
+    std_tps = None
+    if not skip_standard:
+        print("\n[1/2] Standard generation (no CUDA Graph) ...")
+        torch.cuda.synchronize()
+        t0 = time.time()
+        with torch.no_grad():
+            std_out = model.generate(
+                input_ids,
+                attention_mask=attn_mask,
+                max_new_tokens=gen_len,
+                do_sample=False,
+            )
+        torch.cuda.synchronize()
+        t_std = time.time() - t0
+        std_tps = gen_len / t_std
+        print(f"  Time: {t_std:.3f}s, Speed: {std_tps:.1f} tok/s (per-seq; "
+              f"total {std_tps*max_batch_size:.1f})")
+    else:
+        print("\n[1/2] Standard generation SKIPPED (graph-only mode)")
 
     # CUDA Graph generation
     print("\n[2/2] CUDA Graph generation ...")
@@ -403,11 +408,14 @@ def run_speed_benchmark(model, tokenizer, max_batch_size=1, max_seq_len=2048,
           f"total {graph_tps*max_batch_size:.1f})")
 
     # Summary
-    speedup = graph_tps / std_tps if std_tps > 0 else 0
+    speedup = (graph_tps / std_tps) if (std_tps and std_tps > 0) else 0
     print(f"\n{'='*50}")
-    print(f"  Standard: {std_tps:.1f} tok/s")
+    if std_tps is not None:
+        print(f"  Standard: {std_tps:.1f} tok/s")
+        print(f"  Speedup:  {speedup:.2f}x")
+    else:
+        print(f"  Standard: (skipped)")
     print(f"  Graph:    {graph_tps:.1f} tok/s")
-    print(f"  Speedup:  {speedup:.2f}x")
     print(f"{'='*50}")
 
     return {

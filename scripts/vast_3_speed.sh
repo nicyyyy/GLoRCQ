@@ -38,6 +38,12 @@ if [ ${#MODELS[@]} -eq 0 ]; then
 fi
 # Batch sizes to sweep (override: BATCH_SIZES="1 4" bash ...)
 BATCH_SIZES=${BATCH_SIZES:-"1 4 16 64"}
+# Graph-only by default (skip the standard/no-graph baseline — halves runtime;
+# the reported number is the CUDA-graph one). Set GRAPH_ONLY=0 to also time the
+# standard path (needed only if you want the graph-vs-standard speedup column).
+GRAPH_ONLY=${GRAPH_ONLY:-1}
+GRAPH_ONLY_FLAG=""
+[ "$GRAPH_ONLY" = "1" ] && GRAPH_ONLY_FLAG="--graph_only"
 
 # Prevent OOM from allocator fragmentation (both spellings: torch <=2.7 / >=2.8)
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
@@ -70,7 +76,7 @@ for m in "${MODELS[@]}"; do
         # batch may OOM (esp. Mixtral) — set +e above lets the sweep continue.
         CUDA_VISIBLE_DEVICES=$GPU $PY "$GLORCQ_ROOT/inference/eval_speed.py" \
             --model_path "$CKPT_DIR/$m" --batch_size "$bs" --prompt_len 128 --gen_len 128 \
-            --max_seq_len "$MAX_SEQ_LEN" \
+            --max_seq_len "$MAX_SEQ_LEN" $GRAPH_ONLY_FLAG \
             2>&1 | tee "speed_results/${m}_bs${bs}.log"
     done
 done

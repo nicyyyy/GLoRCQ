@@ -46,6 +46,8 @@ def main():
                         help="Load real-quantized model (default: True)")
     parser.add_argument("--no_real_quant", dest="real_quant", action="store_false",
                         help="Load fake-quantized model (standard HF)")
+    parser.add_argument("--graph_only", action="store_true", default=False,
+                        help="Only run the CUDA-graph path; skip the standard baseline")
     args = parser.parse_args()
 
     # Load model
@@ -89,6 +91,7 @@ def main():
         max_seq_len=args.max_seq_len,
         prompt_len=args.prompt_len,
         gen_len=args.gen_len,
+        skip_standard=args.graph_only,
     )
 
 
