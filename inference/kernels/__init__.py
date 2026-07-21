@@ -182,6 +182,33 @@ def vq4_dequant_grouped_gemv(x_grouped, codes_cat, centroids_cat,
     )
 
 
+_HAS_VQ4_GROUPED_GEMV_INDEXED = (
+    _vq4_cuda_ext is not None
+    and hasattr(_vq4_cuda_ext, "vq4_dequant_grouped_gemv_indexed")
+)
+
+
+def vq4_dequant_grouped_gemv_indexed(x_grouped, codes_all, centroids_all, sel,
+                                     G, N, n_cb, codes_per_cb):
+    """Expert-INDEXED grouped VQ4 GEMV: gathers the top-k expert weights inside
+    the kernel via `sel` (int32, (G,)), reading codes/centroids from the FULL
+    stacked (E_full-expert) tensors — no explicit index_select copy.
+    Args:
+        x_grouped:     (G, K) fp16 — per-slot rotated input
+        codes_all:     (E_full*N, K/vdim) uint8 — ALL experts
+        centroids_all: (E_full*n_cb, K_CB, vdim) fp16 — ALL experts
+        sel:           (G,) int32 — expert index per slot
+    Returns:
+        y_cat:         (G*N,) fp16
+    """
+    if not _HAS_VQ4_GROUPED_GEMV_INDEXED:
+        raise RuntimeError("VQ4 indexed grouped GEMV not available")
+    return _vq4_cuda_ext.vq4_dequant_grouped_gemv_indexed(
+        x_grouped, codes_all, centroids_all, sel,
+        int(G), int(N), int(n_cb), int(codes_per_cb),
+    )
+
+
 # ---------------------------------------------------------------------------
 # torch.compile custom op wrappers (allows Dynamo to trace through CUDA calls)
 # ---------------------------------------------------------------------------

@@ -116,6 +116,22 @@ class GraphCompatibleMoeBlock(nn.Module):
         # HUGE experts where gather pays off.
         self._gather_graph_max_experts = 16
         self._use_gather_graph = (self.num_experts <= self._gather_graph_max_experts)
+        # Opt-in experiment: enable the top-k gather graph for DeepSeek
+        # (many-small-expert, like Qwen) to test whether computing ONLY the top_k
+        # selected experts beats the all-experts path. Env-gated and further
+        # guarded on self._deepseek, so the DEFAULT behavior for every model
+        # (Qwen/Mixtral/Qwen3/DeepSeek-V2-Lite/DeepSeek-MoE-16B) is byte-identical
+        # and unaffected. Only DeepSeek blocks flip when the env var is set.
+        import os as _os
+        if self._deepseek and _os.environ.get("GLORCQ_DEEPSEEK_GATHER") == "1":
+            self._use_gather_graph = True
+        # DeepSeek-only: use the expert-indexed VQ4 kernel inside the gather path
+        # (gathers codes/centroids in-kernel, dropping the index_select copies).
+        # Gated on self._deepseek so Mixtral's gather path is byte-identical; ON
+        # by default for DeepSeek (disable with GLORCQ_DEEPSEEK_IDXKERNEL=0).
+        self._use_vq4_idx_kernel = (
+            self._deepseek
+            and _os.environ.get("GLORCQ_DEEPSEEK_IDXKERNEL", "1") == "1")
 
         # Global U pool (shared across all layers, set by model_builder)
         self._global_pool_gate = None  # (hidden_dim, K_total * rank)
@@ -1462,6 +1478,13 @@ class GraphCompatibleMoeBlock(nn.Module):
 
         G = self.top_k
         sel = selected_experts[0].to(torch.long)          # (G,) GPU index
+        # DeepSeek-only: expert-indexed VQ4 kernel gathers codes/centroids inside
+        # the GEMV (no index_select copy). Gated on self._use_vq4_idx_kernel
+        # (self._deepseek + env), so Mixtral's gather path is byte-identical.
+        _use_idx = getattr(self, '_use_vq4_idx_kernel', False)
+        if _use_idx:
+            from inference.kernels import vq4_dequant_grouped_gemv_indexed
+            sel_i32 = sel.to(torch.int32)
         x_h = hidden_states.half()                         # (1, hidden)
 
         def _proj_gather(prefix, x_in):
@@ -1478,21 +1501,33 @@ class GraphCompatibleMoeBlock(nn.Module):
             cpr = codes_all.shape[1]
             K_cb = cents_all.shape[1]
 
-            # Gather per-expert blocks for the top_k selected experts.
-            codes_g = codes_all.view(E, out_d, cpr).index_select(0, sel) \
-                               .reshape(G * out_d, cpr).contiguous()
-            cents_g = cents_all.view(E, n_cb, K_cb, vdim).index_select(0, sel) \
-                               .reshape(G * n_cb, K_cb, vdim).contiguous()
             sigma_g = getattr(self, f'_vq4_sigma_l_{prefix}').index_select(0, sel)  # (G, in_d)
 
             # Rotation: per-slot permute (gather) + shared diagI matmul.
             x_perm = torch.gather(x_in, 1, sigma_g)                    # (G, in_d)
             x_rot = x_perm @ getattr(self, f'_vq4_diagI_{prefix}')      # (G, in_d)
 
-            y = vq4_dequant_grouped_gemv(
-                x_rot, codes_g, cents_g, G, out_d, n_cb, cpcb).view(G, out_d)
+            if _use_idx:
+                # Codes/centroids gathered INSIDE the kernel via sel (int32) —
+                # reads the full (E*out_d) / (E*n_cb) tensors directly.
+                y = vq4_dequant_grouped_gemv_indexed(
+                    x_rot, codes_all, cents_all, sel_i32,
+                    G, out_d, n_cb, cpcb).view(G, out_d)
+            else:
+                # Explicit index_select gather of top_k experts' codes/centroids.
+                codes_g = codes_all.view(E, out_d, cpr).index_select(0, sel) \
+                                   .reshape(G * out_d, cpr).contiguous()
+                cents_g = cents_all.view(E, n_cb, K_cb, vdim).index_select(0, sel) \
+                                   .reshape(G * n_cb, K_cb, vdim).contiguous()
+                y = vq4_dequant_grouped_gemv(
+                    x_rot, codes_g, cents_g, G, out_d, n_cb, cpcb).view(G, out_d)
 
             # LoRA (Sa pre-fused into U_sa): a = x_in @ U_sa[e]; y += a @ SV.T
+            # NOTE: LoRA gather is kept as index_select + cuBLAS bmm. An indexed
+            # LoRA GEMV kernel (lora_grouped_gemv_indexed) was benchmarked but the
+            # small-rank (M=rank=16, K=in_d) GEMV is far slower than cuBLAS bmm,
+            # losing more than the gather copy saves (25.31 -> 18.26 tok/s). So
+            # only codes/centroids are gathered in-kernel (vq4 indexed above).
             U_sa_g = getattr(self, f'_vq4_U_sa_{prefix}').index_select(0, sel)  # (G, in_d, r)
             SV_T_g = getattr(self, f'_vq4_SV_T_{prefix}').index_select(0, sel)  # (G, r, out_d)
             a = torch.bmm(x_in.unsqueeze(1), U_sa_g)                    # (G, 1, r)

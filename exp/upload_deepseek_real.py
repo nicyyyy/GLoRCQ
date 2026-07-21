@@ -25,11 +25,15 @@ api = HfApi()
 api.create_repo(repo_id=REPO, private=False, exist_ok=True, repo_type="model")
 print(f"uploading {LOCAL} -> {REPO}", flush=True)
 t0 = time.time()
+COMMIT_MSG = os.environ.get(
+    "GLORCQ_COMMIT_MSG",
+    "Upload GLoRCQ DeepSeek-V2-Lite real-quant checkpoint (experts VQ4 + cross-layer Grassmann LoRA; attn/shared/dense fp16)",
+)
 upload_folder(
     folder_path=LOCAL,
     repo_id=REPO,
     repo_type="model",
-    commit_message="Upload GLoRCQ DeepSeek-V2-Lite real-quant checkpoint (experts VQ4 + cross-layer Grassmann LoRA; attn/shared/dense fp16)",
+    commit_message=COMMIT_MSG,
     ignore_patterns=[".cache/**", "*.log", "*_phase1_cache.pt"],
 )
 print(f"UPLOAD_DONE in {(time.time()-t0)/60:.1f} min -> https://huggingface.co/{REPO}", flush=True)

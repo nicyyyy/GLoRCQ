@@ -590,6 +590,136 @@ at::Tensor vq4_dequant_grouped_gemv_cuda(
 }
 
 // -------------------------------------------------------------------------
+// Kernel 3b: EXPERT-INDEXED grouped VQ dequant + GEMV (DeepSeek top-k gather).
+// Identical math to vq4_dequant_grouped_gemv_kernel, but codes/centroids are
+// read from the FULL (E_full-expert) tensors at row sel[g] instead of g. This
+// gathers the top-k expert weights INSIDE the GEMV (no explicit index_select
+// copy of codes/centroids). x_grouped and y are indexed by the local slot g;
+// only codes/centroids use sel.
+// -------------------------------------------------------------------------
+__global__ void vq4_dequant_grouped_gemv_indexed_kernel(
+    const __half* __restrict__ x_grouped,      // (G, K) fp16 — per-slot input
+    const uint8_t* __restrict__ codes_all,     // (E_full*N, K/VDIM) uint8
+    const __half* __restrict__ centroids_all,  // (E_full*n_cb, K_CB, VDIM) fp16
+    const int32_t* __restrict__ sel,           // (G,) int32 — expert index per slot
+    __half* __restrict__ y_cat,                // (G*N,) fp16
+    int G, int N, int K, int n_cb, int codes_per_cb,
+    int blocks_per_expert)
+{
+    const int warp_id_in_block = threadIdx.x / 32;
+    const int lane = threadIdx.x % 32;
+
+    const int slot_idx    = blockIdx.x / blocks_per_expert;   // 0..G-1 (local)
+    const int local_block = blockIdx.x % blocks_per_expert;
+    const int row_in_expert = local_block * WARPS_PER_BLOCK + warp_id_in_block;
+    if (slot_idx >= G) return;
+    const int src_expert = sel[slot_idx];                     // real expert row
+
+    const int codes_per_row = K / VDIM;
+
+    extern __shared__ __half smem_h[];
+    __half* x_smem  = smem_h;
+    __half* cb_smem = smem_h + K;
+    const int cb_total = n_cb * K_CB * VDIM;
+
+    const __half2* x_src = reinterpret_cast<const __half2*>(x_grouped) + (long long)slot_idx * (K/2);
+    __half2* x_dst = reinterpret_cast<__half2*>(x_smem);
+    for (int i = threadIdx.x; i < K/2; i += WARPS_PER_BLOCK * 32) x_dst[i] = x_src[i];
+    const __half2* cb_src = reinterpret_cast<const __half2*>(centroids_all)
+                          + (long long)src_expert * (cb_total / 2);
+    __half2* cb_dst = reinterpret_cast<__half2*>(cb_smem);
+    for (int i = threadIdx.x; i < cb_total/2; i += WARPS_PER_BLOCK * 32) cb_dst[i] = cb_src[i];
+    __syncthreads();
+
+    if (row_in_expert >= N) return;
+
+    const int src_row = src_expert * N + row_in_expert;
+    const int out_row = slot_idx  * N + row_in_expert;
+    const uint8_t* codes_row = codes_all + (long long)src_row * codes_per_row;
+
+    __half2 acc2 = __float2half2_rn(0.f);
+    const __half2* cb_h2 = reinterpret_cast<const __half2*>(cb_smem);
+    const __half2* x_h2  = reinterpret_cast<const __half2*>(x_smem);
+
+    if (n_cb == 1) {
+        const uint32_t* codes_row_u32 = reinterpret_cast<const uint32_t*>(codes_row);
+        const int n_u32 = codes_per_row >> 2;
+        for (int k4 = lane; k4 < n_u32; k4 += 32) {
+            uint32_t cw = __ldg(codes_row_u32 + k4);
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                int code = (cw >> (j * 8)) & 0xFF;
+                int k = (k4 << 2) + j;
+                __half2 c01 = cb_h2[code * 2 + 0];
+                __half2 c23 = cb_h2[code * 2 + 1];
+                __half2 x01 = x_h2[k * 2 + 0];
+                __half2 x23 = x_h2[k * 2 + 1];
+                acc2 = __hfma2(c01, x01, acc2);
+                acc2 = __hfma2(c23, x23, acc2);
+            }
+        }
+    } else {
+        for (int k = lane; k < codes_per_row; k += 32) {
+            int cb_id = k / codes_per_cb;
+            int code  = (int)codes_row[k];
+            int base  = (cb_id * K_CB + code) * 2;
+            __half2 c01 = cb_h2[base + 0];
+            __half2 c23 = cb_h2[base + 1];
+            __half2 x01 = x_h2[k * 2 + 0];
+            __half2 x23 = x_h2[k * 2 + 1];
+            acc2 = __hfma2(c01, x01, acc2);
+            acc2 = __hfma2(c23, x23, acc2);
+        }
+    }
+    float acc = __half2float(__hadd(__low2half(acc2), __high2half(acc2)));
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+        acc += __shfl_down_sync(0xffffffff, acc, off);
+    if (lane == 0) y_cat[out_row] = __float2half(acc);
+}
+
+at::Tensor vq4_dequant_grouped_gemv_indexed_cuda(
+    at::Tensor x_grouped,      // (G, K) fp16
+    at::Tensor codes_all,      // (E_full*N, K/VDIM) uint8
+    at::Tensor centroids_all,  // (E_full*n_cb, K_CB, VDIM) fp16
+    at::Tensor sel,            // (G,) int32
+    int64_t G,
+    int64_t N,
+    int64_t n_cb,
+    int64_t codes_per_cb)
+{
+    TORCH_CHECK(x_grouped.is_cuda(), "x_grouped must be CUDA");
+    TORCH_CHECK(x_grouped.dtype() == torch::kHalf, "x_grouped must be fp16");
+    TORCH_CHECK(codes_all.dtype() == torch::kUInt8, "codes must be uint8");
+    TORCH_CHECK(centroids_all.dtype() == torch::kHalf, "centroids must be fp16");
+    TORCH_CHECK(sel.dtype() == torch::kInt32, "sel must be int32");
+
+    x_grouped = x_grouped.contiguous();
+    codes_all = codes_all.contiguous();
+    centroids_all = centroids_all.contiguous();
+    sel = sel.contiguous();
+
+    const int K = x_grouped.size(1);
+    auto y_cat = torch::empty({G * N}, x_grouped.options());
+    int blocks_per_expert = ((int)N + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
+    dim3 block(WARPS_PER_BLOCK * 32);
+    dim3 grid((int)G * blocks_per_expert);
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    size_t smem = (K + n_cb * K_CB * VDIM) * sizeof(__half);
+    cudaFuncSetAttribute(
+        vq4_dequant_grouped_gemv_indexed_kernel,
+        cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
+    vq4_dequant_grouped_gemv_indexed_kernel<<<grid, block, smem, stream>>>(
+        reinterpret_cast<const __half*>(x_grouped.data_ptr<at::Half>()),
+        codes_all.data_ptr<uint8_t>(),
+        reinterpret_cast<const __half*>(centroids_all.data_ptr<at::Half>()),
+        sel.data_ptr<int32_t>(),
+        reinterpret_cast<__half*>(y_cat.data_ptr<at::Half>()),
+        (int)G, (int)N, K, (int)n_cb, (int)codes_per_cb, blocks_per_expert);
+    return y_cat;
+}
+
+// -------------------------------------------------------------------------
 // Kernel 4: LoRA Grouped-GEMV
 //
 // Replaces torch.bmm((E, 1, K), (E, K, M)) → (E, 1, M) with a single kernel.
@@ -685,6 +815,12 @@ at::Tensor lora_grouped_gemv_cuda(
 
     return Y;
 }
+
+// NOTE: an EXPERT-INDEXED LoRA grouped-GEMV (gather U/SV inside the kernel via
+// sel) was implemented and benchmarked, but the small-rank (M=rank=16, K=in_d)
+// GEMV is far slower than cuBLAS bmm — it regressed decode 25.31 -> 18.26 tok/s.
+// So the LoRA gather stays as index_select + bmm; only codes/centroids are
+// gathered in-kernel (vq4_dequant_grouped_gemv_indexed). Not added here.
 
 // -------------------------------------------------------------------------
 // Kernel 5: LoRA-U Grouped-GEMV (K-parallel reduce, rank-M output)
@@ -861,6 +997,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("codes_cat"),
           pybind11::arg("centroids_cat"),
           pybind11::arg("E"),
+          pybind11::arg("N"),
+          pybind11::arg("n_cb"),
+          pybind11::arg("codes_per_cb"));
+    m.def("vq4_dequant_grouped_gemv_indexed", &vq4_dequant_grouped_gemv_indexed_cuda,
+          "VQ4 grouped dequant+GEMV with expert indexing (top-k gather in kernel)",
+          pybind11::arg("x_grouped"),
+          pybind11::arg("codes_all"),
+          pybind11::arg("centroids_all"),
+          pybind11::arg("sel"),
+          pybind11::arg("G"),
           pybind11::arg("N"),
           pybind11::arg("n_cb"),
           pybind11::arg("codes_per_cb"));

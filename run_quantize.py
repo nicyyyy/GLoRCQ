@@ -693,8 +693,10 @@ def _wr_to_dev(WR, device):
 # ---------------------------------------------------------------------------
 @torch.no_grad()
 def gptq_attn_4bit(model, layers, dataloader, nsamples, attn_bits=4,
-                   groupsize=128, percdamp=0.01):
-    """Plain scalar GPTQ (no LoRA) for self_attn.{q,k,v,o}_proj layers."""
+                   groupsize=128, percdamp=0.01, shared_bits=16):
+    """Plain scalar GPTQ (no LoRA) for self_attn.{q,k,v,o}_proj layers, and —
+    when shared_bits<16 — also for the always-active shared-expert MLP linears
+    (fake-quant in place, for the fair-budget accuracy study)."""
     dtype  = next(iter(model.parameters())).dtype
     hidden = model.config.hidden_size
     seqlen = model.seqlen
@@ -719,6 +721,13 @@ def gptq_attn_4bit(model, layers, dataloader, nsamples, attn_bits=4,
             except KeyError:
                 raise AttributeError(name)
 
+    # embed_tokens must be on DEV for the Catcher forward. It is when this runs
+    # as Phase 2.5 (before Phase 3), but Phase 3 (gptvq_fwrd_lora) leaves it on
+    # CPU — so when this runs as Phase 3.5 (shared/dense, after Phase 3) we must
+    # move it back. Restored to its original device afterwards.
+    _embed = model.model.embed_tokens
+    _embed_dev = next(_embed.parameters()).device
+    model.model.embed_tokens = _embed.to(DEV)
     layers[0] = Catcher(layers[0])
     for batch in dataloader:
         try:
@@ -727,15 +736,43 @@ def gptq_attn_4bit(model, layers, dataloader, nsamples, attn_bits=4,
             pass
     layers[0] = layers[0].module
     layers[0] = layers[0].cpu()
+    model.model.embed_tokens = model.model.embed_tokens.to(_embed_dev)
     torch.cuda.empty_cache()
 
     outs = torch.zeros_like(inps)
-    for i in tqdm.tqdm(range(len(layers)), desc=f"Attn GPTQ {attn_bits}-bit"):
+    for i in tqdm.tqdm(range(len(layers)), desc=f"Attn GPTQ {attn_bits}-bit / shared {shared_bits}-bit"):
         layer      = layers[i].to(DEV)
         named_lins = get_named_linears(layer)
-        attn_names = [n for n in named_lins if 'self_attn' in n]
+        # Per-layer scalar GPTQ targets with per-name bit-width: attention at
+        # attn_bits, and (if shared_bits<16) the always-active shared-expert MLP
+        # at shared_bits. Shared quant is a fake-quant in place (weight.data set)
+        # used for the accuracy/bit-budget study; NO gptq_packed is stored for
+        # shared, so the real-quant strip/export path (which only handles
+        # self_attn packs) is untouched and shared stays fp16-STORAGE (its values
+        # are the quantized ones). attn/shared name selection is gated by the
+        # respective *_bits<16 so non-DeepSeek runs (shared_bits default 16) are
+        # unaffected.
+        targets = {}
+        if attn_bits < 16:
+            for n in named_lins:
+                if 'self_attn' in n:
+                    targets[n] = attn_bits
+        if shared_bits < 16:
+            # All NON-routed FFN linears: the shared-expert MLP AND the dense
+            # layer-0 MLP (first_k_dense_replace). Routed experts (matched by the
+            # dotted '.experts.' segment) are excluded — they go through VQ4+LoRA.
+            # This makes the fair-budget scope (attn + FFN, excl embed/lm_head)
+            # honest: every always-active FFN weight is actually quantized.
+            for n in named_lins:
+                if '.experts.' in n:
+                    continue
+                is_shared = 'shared_expert' in n
+                is_dense_ffn = ('mlp' in n and any(
+                    p in n for p in ('gate_proj', 'up_proj', 'down_proj')))
+                if is_shared or is_dense_ffn:
+                    targets[n] = shared_bits
 
-        if not attn_names:
+        if not targets:
             for j in range(nsamples):
                 outs[j] = layer(inps[j].unsqueeze(0), **layer_kwargs)[0]
             inps, outs = outs, inps
@@ -744,11 +781,11 @@ def gptq_attn_4bit(model, layers, dataloader, nsamples, attn_bits=4,
             torch.cuda.empty_cache()
             continue
 
-        gptq = {n: GPTQJoint(named_lins[n], nbits=attn_bits, sym=False, mse=True)
-                for n in attn_names}
+        gptq = {n: GPTQJoint(named_lins[n], nbits=targets[n], sym=False, mse=True)
+                for n in targets}
 
         handles = []
-        for n in attn_names:
+        for n in targets:
             def _hook(m, inp, out, _n=n):
                 gptq[_n].add_batch(inp[0], out)
             handles.append(named_lins[n].register_forward_hook(_hook))
@@ -757,11 +794,12 @@ def gptq_attn_4bit(model, layers, dataloader, nsamples, attn_bits=4,
         for h in handles:
             h.remove()
 
-        for n in attn_names:
+        for n in targets:
             gptq[n].prepare_hessian(percdamp=percdamp, act_alpha=0.0)
             _, Q_W, packed = gptq[n].fasterquant(W_lora=None, groupsize=groupsize, real_quant=True)
             named_lins[n].weight.data = Q_W.to(dtype).to(DEV)
-            named_lins[n].gptq_packed = packed
+            if 'self_attn' in n:
+                named_lins[n].gptq_packed = packed   # only attn packs exported/stripped
 
         # Advance inps with quantized attention weights
         for j in range(nsamples):
@@ -1136,6 +1174,7 @@ def _set_all_seeds(seed: int):
 def run_tileq_glorcq(model_path, output_path, qbit=2, fix_rank=32, G=128,
                      group_size=128, lora_bit=16, lora_iter=8,
                      ha_bsize=256, id_bsize=256, use_cache=True, attn_bits=16,
+                     shared_bits=16,
                      phase1_cache_path=None, int8_lora=False, int8_lora_v=False,
                      export_real_quant=True, pool_kmeans=False,
                      strip_fp16_quantized=False, max_err_threshold=60.0,
@@ -1230,11 +1269,12 @@ def run_tileq_glorcq(model_path, output_path, qbit=2, fix_rank=32, G=128,
     gc.collect()
     torch.cuda.empty_cache()
 
-    # ---- Phase 2.5: scalar GPTQ for attention (if requested) ----
+    # ---- Phase 2.5: scalar GPTQ for attention (BEFORE routed VQ, proven order) ----
     if attn_bits < 16:
         print(f"\n[Phase 2.5] {attn_bits}-bit GPTQ for attention layers ...", flush=True)
         gptq_attn_4bit(model, layers, dataloader, nsamples,
-                       attn_bits=attn_bits, groupsize=group_size, percdamp=0.01)
+                       attn_bits=attn_bits, groupsize=group_size, percdamp=0.01,
+                       shared_bits=16)   # attn only here; shared handled after Phase 3
 
     # ---- Phase 3: VQ quantization (TileQ unchanged) ----
     print("\n[Phase 3] VQ quantization of residuals ...", flush=True)
@@ -1253,6 +1293,19 @@ def run_tileq_glorcq(model_path, output_path, qbit=2, fix_rank=32, G=128,
         pool_kmeans    = pool_kmeans,
     )
     gptvq_fwrd_lora(model, WR, dataloader, DEV, p3_args)
+
+    # ---- Phase 3.5: scalar GPTQ for shared experts + dense layer-0 FFN ----
+    # MUST run AFTER routed VQ (Phase 3): quantizing the always-active FFN
+    # (esp. the large layer-0 dense down_proj) BEFORE Phase 3 corrupts the
+    # routed-expert calibration activations (degraded/NaN Hessians → GPTVQ
+    # no-ops → routed left fp16). Running it here keeps Phase 3 on a clean
+    # fp16-FFN model (identical to the attn-only path, which is proven), then
+    # quantizes the FFN for the honest fair-budget accounting.
+    if shared_bits < 16:
+        print(f"\n[Phase 3.5] {shared_bits}-bit GPTQ for shared + dense-FFN ...", flush=True)
+        gptq_attn_4bit(model, layers, dataloader, nsamples,
+                       attn_bits=16, groupsize=group_size, percdamp=0.01,
+                       shared_bits=shared_bits)   # shared/dense only (attn_bits=16 → attn skipped)
 
     # ---- Bit stats ----
     q_bit    = 16.0 * (quant_infos['quant_size'] / quant_infos['total_size']) if quant_infos['total_size'] > 0 else 0
@@ -1274,14 +1327,24 @@ def run_tileq_glorcq(model_path, output_path, qbit=2, fix_rank=32, G=128,
         total_wbits = attn_wbits + moe_wbits
         total_lora  = attn_lora + moe_lora
         total_p     = attn_p + moe_p
+        # Shared experts: fp16 by default, but quantized at shared_bits when
+        # --shared_bits<16 (fair-budget mode). Include honestly in that case.
+        _shared_quantized = shared_bits < 16 and shared_p > 0
+        if _shared_quantized:
+            shared_wbits = shared_p * shared_bits
+            total_wbits += shared_wbits
+            total_p     += shared_p
         avg_weight  = total_wbits / total_p
         avg_lora    = total_lora / total_p
         avg_bits    = (total_wbits + total_lora) / total_p
-        print(f"\n  [Corrected avg bits over (attn+MoE routing) params, shared_expert excluded]")
-        print(f"    attn:   {attn_p/1e6:>7.1f} M params  @ {_attn_wbit_actual}-bit weight  ({attn_wbits/1e6:>10.1f} M bits)")
-        print(f"    MoE:    {moe_p/1e9:>7.2f} B params  @ {qbit}-bit weight  ({moe_wbits/1e6:>10.1f} M bits)")
-        if shared_p > 0:
-            print(f"    shared: {shared_p/1e6:>7.1f} M params  @ FP16 (excluded from avg)")
+        _scope = "attn+MoE+shared+dense-FFN" if _shared_quantized else "attn+MoE routing, shared_expert excluded"
+        print(f"\n  [Corrected avg bits over ({_scope}) params, excl embed/lm_head]")
+        print(f"    attn+dense: {attn_p/1e6:>7.1f} M params  @ {_attn_wbit_actual}-bit weight  ({attn_wbits/1e6:>10.1f} M bits)")
+        print(f"    MoE:        {moe_p/1e9:>7.2f} B params  @ {qbit}-bit weight  ({moe_wbits/1e6:>10.1f} M bits)")
+        if _shared_quantized:
+            print(f"    shared:     {shared_p/1e6:>7.1f} M params  @ {shared_bits}-bit weight  ({shared_p*shared_bits/1e6:>10.1f} M bits)")
+        elif shared_p > 0:
+            print(f"    shared:     {shared_p/1e6:>7.1f} M params  @ FP16 (excluded from avg)")
         print(f"    LoRA:   attn={attn_lora/1e6:.1f}M + MoE={moe_lora/1e6:.1f}M = {total_lora/1e6:.1f} M bits")
         print(f"    → weight={avg_weight:.4f}  lora={avg_lora:.4f}  TOTAL={avg_bits:.4f} bits/param"
               f"  (Extra above qbit={qbit}: {avg_bits - qbit:+.4f})")
@@ -1326,6 +1389,11 @@ def parse_args():
                    help='force recompute Phase 1 even if cache exists')
     p.add_argument('--attn_bits',   type=int, default=16,
                    help='scalar GPTQ bits for attention layers (16=disable)')
+    p.add_argument('--shared_bits', type=int, default=16,
+                   help='scalar GPTQ bits for the always-active shared-expert MLP '
+                        '(16=keep fp16, default). <16 fake-quantizes shared for the '
+                        'fair-budget accuracy study; only affects models with a '
+                        'shared_expert (DeepSeek/Qwen1.5) when explicitly set.')
     p.add_argument('--phase1_cache_path', type=str, default=None,
                    help='override Phase 1 cache path (default: output_path + _phase1_cache.pt)')
     p.add_argument('--int8_lora', action='store_true', default=False,
@@ -1379,6 +1447,7 @@ if __name__ == '__main__':
         id_bsize    = args.id_bsize,
         use_cache   = not args.no_cache,
         attn_bits   = args.attn_bits,
+        shared_bits = args.shared_bits,
         phase1_cache_path = args.phase1_cache_path,
         int8_lora   = args.int8_lora,
         int8_lora_v = args.int8_lora_v,
