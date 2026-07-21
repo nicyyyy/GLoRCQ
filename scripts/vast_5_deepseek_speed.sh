@@ -74,12 +74,21 @@ if [ "$HAS_IDX" != "1" ]; then
     # system default nvcc (e.g. 13.0) — build_ext then errors on version mismatch.
     # If a matching /usr/local/cuda-<torch.version.cuda> toolkit exists, use its nvcc.
     TCUDA=$("$PY" -c "import torch; print(torch.version.cuda or '')" 2>/dev/null)
-    CT="/usr/local/cuda-$TCUDA"
+    # Search /usr/local AND conda envs for an nvcc whose release == torch's CUDA.
+    NVCC_MATCH=""
+    for n in $(which -a nvcc 2>/dev/null) "/usr/local/cuda-$TCUDA/bin/nvcc" \
+             /opt/conda/bin/nvcc /opt/conda/envs/*/bin/nvcc \
+             "$HOME"/miniconda3/bin/nvcc "$HOME"/miniconda3/envs/*/bin/nvcc \
+             "$HOME"/anaconda3/bin/nvcc "$HOME"/anaconda3/envs/*/bin/nvcc; do
+        [ -x "$n" ] || continue
+        v=$("$n" --version 2>/dev/null | grep -oP 'release \K[0-9]+\.[0-9]+')
+        if [ -n "$TCUDA" ] && [ "$v" = "$TCUDA" ]; then NVCC_MATCH="$n"; break; fi
+    done
     (
         cd "$GLORCQ_ROOT/inference/kernels" && rm -rf build ./*.so
-        if [ -n "$TCUDA" ] && [ -x "$CT/bin/nvcc" ]; then
-            echo "  using matching CUDA $TCUDA toolkit at $CT for the build"
-            export CUDA_HOME="$CT" PATH="$CT/bin:$PATH"
+        if [ -n "$NVCC_MATCH" ]; then
+            echo "  using matching CUDA $TCUDA nvcc at $NVCC_MATCH"
+            export CUDA_HOME="$(dirname "$(dirname "$NVCC_MATCH")")" PATH="$(dirname "$NVCC_MATCH"):$PATH"
         fi
         "$PY" setup.py build_ext --inplace 2>&1 | tail -12
     )
