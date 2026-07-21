@@ -69,8 +69,23 @@ except Exception:
 PYEOF
 )
 if [ "$HAS_IDX" != "1" ]; then
-    echo "  vq4-indexed kernel MISSING from built .so — rebuilding (git pull first if you haven't)"
-    ( cd "$GLORCQ_ROOT/inference/kernels" && "$PY" setup.py build_ext --inplace 2>&1 | tail -6 )
+    echo "  vq4-indexed kernel MISSING from built .so — FORCE clean rebuild (nuke stale build cache)"
+    ( cd "$GLORCQ_ROOT/inference/kernels" && rm -rf build ./*.so && "$PY" setup.py build_ext --inplace 2>&1 | tail -12 )
+    HAS_IDX=$("$PY" - <<'PYEOF' 2>/dev/null
+try:
+    from inference import kernels as k
+    print(1 if hasattr(getattr(k, "_vq4_cuda_ext", None), "vq4_dequant_grouped_gemv_indexed") else 0)
+except Exception:
+    print(0)
+PYEOF
+)
+    if [ "$HAS_IDX" = "1" ]; then
+        echo "  rebuild OK — vq4-indexed kernel now present ✓"
+    else
+        echo "  WARN: rebuild did NOT produce the vq4-indexed symbol (check nvcc errors above)."
+        echo "        full_graph will fall back below; you can also run it with"
+        echo "        GLORCQ_DEEPSEEK_IDXKERNEL=0 (non-indexed gather path, slightly slower)."
+    fi
 else
     echo "  vq4-indexed kernel present ✓"
 fi
