@@ -70,7 +70,19 @@ PYEOF
 )
 if [ "$HAS_IDX" != "1" ]; then
     echo "  vq4-indexed kernel MISSING from built .so — FORCE clean rebuild (nuke stale build cache)"
-    ( cd "$GLORCQ_ROOT/inference/kernels" && rm -rf build ./*.so && "$PY" setup.py build_ext --inplace 2>&1 | tail -12 )
+    # torch is pinned to a CUDA version (e.g. cu128) that may differ from the
+    # system default nvcc (e.g. 13.0) — build_ext then errors on version mismatch.
+    # If a matching /usr/local/cuda-<torch.version.cuda> toolkit exists, use its nvcc.
+    TCUDA=$("$PY" -c "import torch; print(torch.version.cuda or '')" 2>/dev/null)
+    CT="/usr/local/cuda-$TCUDA"
+    (
+        cd "$GLORCQ_ROOT/inference/kernels" && rm -rf build ./*.so
+        if [ -n "$TCUDA" ] && [ -x "$CT/bin/nvcc" ]; then
+            echo "  using matching CUDA $TCUDA toolkit at $CT for the build"
+            export CUDA_HOME="$CT" PATH="$CT/bin:$PATH"
+        fi
+        "$PY" setup.py build_ext --inplace 2>&1 | tail -12
+    )
     HAS_IDX=$("$PY" - <<'PYEOF' 2>/dev/null
 try:
     from inference import kernels as k
