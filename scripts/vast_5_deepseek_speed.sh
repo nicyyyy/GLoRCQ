@@ -82,13 +82,15 @@ PYEOF
     if [ "$HAS_IDX" = "1" ]; then
         echo "  rebuild OK — vq4-indexed kernel now present ✓"
     else
-        echo "  WARN: rebuild did NOT produce the vq4-indexed symbol (check nvcc errors above)."
-        echo "        full_graph will fall back below; you can also run it with"
-        echo "        GLORCQ_DEEPSEEK_IDXKERNEL=0 (non-indexed gather path, slightly slower)."
+        echo "  NOTE: could not build the vq4-indexed kernel (e.g. CUDA toolkit vs torch"
+        echo "        version mismatch). Falling back to the non-indexed gather path"
+        echo "        (GLORCQ_DEEPSEEK_IDXKERNEL=0) — valid gather-graph number, ~a few % below peak."
     fi
 else
     echo "  vq4-indexed kernel present ✓"
 fi
+# idx kernel on only if the symbol is actually available; else non-indexed gather fallback
+IDXVAL=$([ "$HAS_IDX" = "1" ] && echo 1 || echo 0)
 
 # ── Download checkpoints ──
 echo ""
@@ -131,14 +133,15 @@ for cfg in $CONFIGS; do
             --prompt_len "$PROMPT" --gen_len "$GEN" --max_seq_len "$MAX_SEQ_LEN" \
             --warmup "$WARMUP" --runs "$RUNS" 2>&1 | tee "$LOG"
     elif [ "$cfg" = "full_graph" ]; then
-        # best real-quant path: gather-graph + vq4-indexed kernel (both DeepSeek-gated)
-        CUDA_VISIBLE_DEVICES=$GPU GLORCQ_DEEPSEEK_GATHER=1 GLORCQ_DEEPSEEK_IDXKERNEL=1 \
+        # best real-quant path: gather-graph + vq4-indexed kernel (IDXVAL=0 => non-indexed fallback)
+        echo "  (GLORCQ_DEEPSEEK_GATHER=1 GLORCQ_DEEPSEEK_IDXKERNEL=$IDXVAL)"
+        CUDA_VISIBLE_DEVICES=$GPU GLORCQ_DEEPSEEK_GATHER=1 GLORCQ_DEEPSEEK_IDXKERNEL=$IDXVAL \
             "$PY" "$GLORCQ_ROOT/exp/bench_deepseek_stable.py" \
             --config full_graph --real_path "$REAL_DIR" \
             --prompt_len "$PROMPT" --gen_len "$GEN" --max_seq_len "$MAX_SEQ_LEN" \
             --warmup "$WARMUP" --runs "$RUNS" 2>&1 | tee "$LOG"
-    else   # eager | moe_graph (real-quant, idx-kernel default on, no gather graph)
-        CUDA_VISIBLE_DEVICES=$GPU GLORCQ_DEEPSEEK_IDXKERNEL=1 \
+    else   # eager | moe_graph (real-quant; idx-kernel if available, else fallback)
+        CUDA_VISIBLE_DEVICES=$GPU GLORCQ_DEEPSEEK_IDXKERNEL=$IDXVAL \
             "$PY" "$GLORCQ_ROOT/exp/bench_deepseek_stable.py" \
             --config "$cfg" --real_path "$REAL_DIR" \
             --prompt_len "$PROMPT" --gen_len "$GEN" --max_seq_len "$MAX_SEQ_LEN" \
