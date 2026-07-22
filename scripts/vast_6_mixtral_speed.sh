@@ -122,13 +122,13 @@ for cfg in $CONFIGS; do
       A)     CUDA_VISIBLE_DEVICES=$GPU GLORCQ_MIXTRAL_INLINE_LORA=0 "$PY" "$ES" --model_path "$REAL_DIR" $COMMON 2>&1 | tee "$LOG" ;;
       B)     CUDA_VISIBLE_DEVICES=$GPU GLORCQ_MIXTRAL_INLINE_LORA=1 "$PY" "$ES" --model_path "$REAL_DIR" $COMMON 2>&1 | tee "$LOG" ;;
       C)     CUDA_VISIBLE_DEVICES=$GPU GLORCQ_MIXTRAL_GRAPH=1 GLORCQ_MIXTRAL_IDXKERNEL=1 \
-             GLORCQ_PREFILL_DEQUANT=1 "$PY" "$ES" --model_path "$REAL_DIR" $COMMON 2>&1 | tee "$LOG" ;;
+             GLORCQ_PREFILL_DEQUANT=1 GLORCQ_GPTQ_ILP=1 "$PY" "$ES" --model_path "$REAL_DIR" $COMMON 2>&1 | tee "$LOG" ;;
       # long-gen variants: prefill amortizes over more tokens => decode advantage shows
       FP16_G512) [ "${SKIP_FP16:-0}" = "1" ] && continue
              CUDA_VISIBLE_DEVICES=$GPU "$PY" "$ES" --model_path "$BASE_DIR" --no_real_quant \
              --batch_size 1 --prompt_len $PROMPT --gen_len 512 --max_seq_len 768 2>&1 | tee "$LOG" ;;
       C_G512) CUDA_VISIBLE_DEVICES=$GPU GLORCQ_MIXTRAL_GRAPH=1 GLORCQ_MIXTRAL_IDXKERNEL=1 \
-             GLORCQ_PREFILL_DEQUANT=1 "$PY" "$ES" --model_path "$REAL_DIR" \
+             GLORCQ_PREFILL_DEQUANT=1 GLORCQ_GPTQ_ILP=1 "$PY" "$ES" --model_path "$REAL_DIR" \
              --batch_size 1 --prompt_len $PROMPT --gen_len 512 --max_seq_len 768 2>&1 | tee "$LOG" ;;
     esac
 done

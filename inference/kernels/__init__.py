@@ -8,9 +8,17 @@ warning, and transparently retries with the pure-PyTorch path.
 """
 
 import logging
+import os as _os
+
 import torch
 
 logger = logging.getLogger(__name__)
+
+# Opt-in ILP variant of the GPTQ decode GEMV (uint32 weight loads + float4 x +
+# 4 accumulators). Reorders fp32 accumulation => NOT byte-identical with the
+# default scalar loop, so it is env-gated and DEFAULT OFF: Qwen/DeepSeek attn
+# keep bit-exact numbers unless GLORCQ_GPTQ_ILP=1 is set (Mixtral speed runs).
+_GPTQ_ILP = 1 if _os.environ.get("GLORCQ_GPTQ_ILP", "0") == "1" else 0
 
 # Cache for empty placeholder tensors (keyed by (device, dtype)).
 # Avoids ~240 aten::empty_strided CPU calls/step when lora_USV is always None.
@@ -250,13 +258,16 @@ if _gptq_cuda_ext is not None:
         groupsize: int,
         sym: bool,
         lora_out: torch.Tensor,
+        reorder_ok: int = 0,
     ) -> torch.Tensor:
         return _gptq_cuda_ext.gptq_dequant_matmul(
             x, qweight_i8, scales, zeros, groupsize, sym, lora_out,
+            reorder_ok,
         )
 
     @_gptq_dequant_matmul_op.register_fake
-    def _gptq_fake(x, qweight_i8, scales, zeros, groupsize, sym, lora_out):
+    def _gptq_fake(x, qweight_i8, scales, zeros, groupsize, sym, lora_out,
+                   reorder_ok=0):
         return torch.empty(
             x.shape[0], qweight_i8.shape[0],
             dtype=torch.float32, device=x.device,
@@ -481,6 +492,7 @@ def gptq_dequant_matmul_fused(x, qweight_int, scales, zeros,
                 groupsize,
                 sym,
                 lora_out.contiguous(),
+                _GPTQ_ILP,   # reorder_ok: opt-in ILP GEMV (reorders fp32 acc)
             )
         except RuntimeError as e:
             B = x.shape[0]

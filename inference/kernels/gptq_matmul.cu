@@ -50,7 +50,8 @@ __global__ void gptq_dequant_gemv_kernel(
     int groupsize,
     int n_groups,
     int sym,
-    int lora_valid)
+    int lora_valid,
+    int reorder_ok)
 {
     const int warp_id_in_block = threadIdx.x / 32;
     const int lane = threadIdx.x % 32;
@@ -67,6 +68,30 @@ __global__ void gptq_dequant_gemv_kernel(
 
     float acc = 0.0f;
 
+    if (reorder_ok && (K & 3) == 0 && (groupsize & 3) == 0) {
+        // ILP variant (opt-in): uint32 weight loads (4 int8/load), float4 x
+        // loads, ONE groupsize divide per aligned-4 group (a 4-aligned span
+        // never straddles a group when groupsize%4==0), 4 independent
+        // accumulators. Reorders fp32 accumulation => NOT byte-identical with
+        // the scalar loop; callers wanting bit-exactness pass reorder_ok=0.
+        const uint32_t* q32 = reinterpret_cast<const uint32_t*>(qrow);
+        const float4* x4 = reinterpret_cast<const float4*>(x_row);
+        const int n_u32 = K >> 2;
+        float acc0 = 0.f, acc1 = 0.f, acc2 = 0.f, acc3 = 0.f;
+        for (int k4 = lane; k4 < n_u32; k4 += 32) {
+            uint32_t w4 = __ldg(q32 + k4);
+            const int gi = (k4 << 2) / groupsize;
+            const float s = __half2float(scale_row[gi]);
+            const float z = sym ? 0.0f : __half2float(zero_row[gi]);
+            char4 c = *reinterpret_cast<const char4*>(&w4);
+            float4 xv = __ldg(x4 + k4);
+            acc0 += ((float)c.x - z) * s * xv.x;
+            acc1 += ((float)c.y - z) * s * xv.y;
+            acc2 += ((float)c.z - z) * s * xv.z;
+            acc3 += ((float)c.w - z) * s * xv.w;
+        }
+        acc = (acc0 + acc1) + (acc2 + acc3);
+    } else {
     // Each lane processes elements lane, lane+32, lane+64, ...
     // Process in groups: preload scale/zero per group boundary
     int prev_gi = -1;
@@ -84,6 +109,7 @@ __global__ void gptq_dequant_gemv_kernel(
         float q = static_cast<float>(qrow[k]);
         float w = (q - z_val) * s_val;
         acc += w * x_row[k];
+    }
     }
 
     // Warp reduction
@@ -227,7 +253,8 @@ torch::Tensor gptq_dequant_matmul_cuda(
     torch::Tensor zeros,          // (N, n_groups) fp16
     int groupsize,
     bool sym,
-    torch::Tensor lora_out)       // (B, N) fp32 or empty
+    torch::Tensor lora_out,       // (B, N) fp32 or empty
+    int64_t reorder_ok)
 {
     CHECK_CUDA(x);
     CHECK_CUDA(qweight_i8);
@@ -293,7 +320,8 @@ torch::Tensor gptq_dequant_matmul_cuda(
             groupsize,
             n_groups,
             sym_int,
-            lora_valid);
+            lora_valid,
+            (int)reorder_ok);
     } else {
         dim3 block(GEMM_THREADS);
         dim3 grid((B + BM - 1) / BM, (N + BN - 1) / BN);
@@ -323,5 +351,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("zeros"),
           py::arg("groupsize"),
           py::arg("sym"),
-          py::arg("lora_out"));
+          py::arg("lora_out"),
+          py::arg("reorder_ok") = 0);
 }
