@@ -383,7 +383,8 @@ def run_speed_benchmark(model, tokenizer, max_batch_size=1, max_seq_len=2048,
                 input_ids,
                 attention_mask=attn_mask,
                 max_new_tokens=gen_len,
-                do_sample=False,
+                min_new_tokens=gen_len,   # forbid early EOS stop — tok/s divides
+                do_sample=False,          # by gen_len, so a short gen inflates it
             )
         torch.cuda.synchronize()
         t_std = time.time() - t0

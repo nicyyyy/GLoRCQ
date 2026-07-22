@@ -7,6 +7,8 @@ Replaces nn.Linear with a quantized version that supports:
   - LoRA compensation: x @ U * S @ V^T added to quantized output
 """
 
+import os
+
 import torch
 
 
@@ -277,6 +279,7 @@ class GLoRCQLinear(nn.Module):
         # VQ4 (vdim=4 group-shared codebook) backend
         self.vq_codes = None         # (out_d, in_d/vdim) uint8
         self.vq_centroids = None     # (n_blocks, K, vdim) fp16
+        self._vq4_py_offs = None     # cached cb-offset index for python dequant
         self.vq_perm = None          # (in_d,) long
         self.vq_diag_signs = None    # (in_d,) fp16
         self.vq_vdim = None
@@ -505,19 +508,27 @@ class GLoRCQLinear(nn.Module):
         # overflows fp16 range → inf → NaN. fp16 in/out but fp32 accumulation.
         x_rot = (x[..., self.vq_perm_sigma].float() @ self.vq_diagI.float())
         if self.vq_codes is not None and self.vq_centroids is not None:
-            # Rebuild Q from codes + centroids
+            # Rebuild Q from codes + centroids with ONE fused gather (the per-cb
+            # python loop was ~n_cb kernel launches per call — a large share of
+            # prefill time). global idx = cb_id*K + code; identical fp16 Q values
+            # and the same matmul afterwards => byte-identical to the old loop.
             out_d, codes_per_row = self.vq_codes.shape
             n_cb, K, vdim = self.vq_centroids.shape
             codes_per_cb = codes_per_row // n_cb
-            in_d = codes_per_row * vdim
-            Q = torch.empty(out_d, in_d, dtype=torch.float16, device=x_rot.device)
-            for cb_idx in range(n_cb):
-                c0 = cb_idx * codes_per_cb
-                c1 = c0 + codes_per_cb
-                cb = self.vq_centroids[cb_idx]                          # (K, vdim) fp16
-                codes_blk = self.vq_codes[:, c0:c1].long()              # (out_d, codes_per_cb)
-                looked = cb[codes_blk]                                   # (out_d, codes_per_cb, vdim)
-                Q[:, c0*vdim:c1*vdim] = looked.reshape(out_d, codes_per_cb * vdim)
+            offs = self._vq4_py_offs
+            if offs is None or offs.shape[0] != codes_per_row or offs.device != x_rot.device:
+                offs = (torch.arange(codes_per_row, device=x_rot.device)
+                        // codes_per_cb) * K                     # (codes_per_row,) long
+                self._vq4_py_offs = offs
+            idx = self.vq_codes.long() + offs.unsqueeze(0)       # (out_d, codes_per_row)
+            Q = self.vq_centroids.reshape(n_cb * K, vdim)[idx]   # (out_d, cpr, vdim) fp16
+            Q = Q.reshape(out_d, codes_per_row * vdim)
+            if os.environ.get("GLORCQ_PREFILL_DEQUANT", "0") == "1":
+                # fp16 tensor-core GEMM. cuBLAS accumulates half matmuls in fp32
+                # internally (no fp16-accumulation overflow), and fp16 x_rot is
+                # exactly what the fused-kernel path already feeds. Skips the
+                # 2x fp32 Q conversion + runs ~10x faster than fp32 sgemm.
+                return (x_rot.half() @ Q.T).float()
             return x_rot @ Q.float().T          # fp32 (caller casts at the very end)
         return x_rot @ self.vq_Q_rotated.float().T   # fp32
 
@@ -581,10 +592,18 @@ class GLoRCQLinear(nn.Module):
             K_in = self.in_features
             shmem_bytes = (K_in + n_cb * K_cb * vdim) * 2
             _MAX_SHMEM = 96 * 1024  # 96 KB safe margin below 100 KB A100 limit
+            # Prefill fast path (opt-in): for multi-token inputs the naive fused
+            # GEMM kernel is ~200x off cuBLAS; dequant-to-fp16 + cuBLAS (the same
+            # _vq4_matmul_python used by large-shmem projections) is far faster.
+            # Env-gated, default OFF => byte-identical everywhere unless set.
+            _prefill_dequant = (
+                x.shape[0] > 4
+                and os.environ.get("GLORCQ_PREFILL_DEQUANT", "0") == "1")
             can_use_kernel = (
                 _HAS_VQ4_FUSED_KERNEL
                 and self.vq_codes is not None
                 and shmem_bytes <= _MAX_SHMEM
+                and not _prefill_dequant
             )
             if can_use_kernel:
                 # Rotate x (or reuse precomputed_x_rot), then call fused kernel

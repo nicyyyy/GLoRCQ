@@ -36,8 +36,9 @@ CKPT_DIR=${CKPT_DIR:-$WORK/ckpts}
 GPU=${CUDA_VISIBLE_DEVICES:-0}
 MAX_SEQ_LEN=${MAX_SEQ_LEN:-384}
 PROMPT=${PROMPT:-128}; GEN=${GEN:-128}
-# Which configs: FP16 baseline + C (our best). Add A/B for the full ablation.
-CONFIGS=${CONFIGS:-"FP16 C"}
+# Which configs: FP16 baseline + C (our best, incl. prefill-dequant) at gen=128
+# AND gen=512 (prefill amortizes => the decode advantage shows). A/B = ablation.
+CONFIGS=${CONFIGS:-"FP16 C FP16_G512 C_G512"}
 mkdir -p "$HF_HOME" "$CKPT_DIR" "$WORK/speed_results"
 cd "$WORK"
 if [ ! -x "$PY" ]; then echo "ERROR: python not at $PY. Run vast_1_install.sh first."; exit 1; fi
@@ -120,7 +121,15 @@ for cfg in $CONFIGS; do
              CUDA_VISIBLE_DEVICES=$GPU "$PY" "$ES" --model_path "$BASE_DIR" --no_real_quant $COMMON 2>&1 | tee "$LOG" ;;
       A)     CUDA_VISIBLE_DEVICES=$GPU GLORCQ_MIXTRAL_INLINE_LORA=0 "$PY" "$ES" --model_path "$REAL_DIR" $COMMON 2>&1 | tee "$LOG" ;;
       B)     CUDA_VISIBLE_DEVICES=$GPU GLORCQ_MIXTRAL_INLINE_LORA=1 "$PY" "$ES" --model_path "$REAL_DIR" $COMMON 2>&1 | tee "$LOG" ;;
-      C)     CUDA_VISIBLE_DEVICES=$GPU GLORCQ_MIXTRAL_GRAPH=1 GLORCQ_MIXTRAL_IDXKERNEL=1 "$PY" "$ES" --model_path "$REAL_DIR" $COMMON 2>&1 | tee "$LOG" ;;
+      C)     CUDA_VISIBLE_DEVICES=$GPU GLORCQ_MIXTRAL_GRAPH=1 GLORCQ_MIXTRAL_IDXKERNEL=1 \
+             GLORCQ_PREFILL_DEQUANT=1 "$PY" "$ES" --model_path "$REAL_DIR" $COMMON 2>&1 | tee "$LOG" ;;
+      # long-gen variants: prefill amortizes over more tokens => decode advantage shows
+      FP16_G512) [ "${SKIP_FP16:-0}" = "1" ] && continue
+             CUDA_VISIBLE_DEVICES=$GPU "$PY" "$ES" --model_path "$BASE_DIR" --no_real_quant \
+             --batch_size 1 --prompt_len $PROMPT --gen_len 512 --max_seq_len 768 2>&1 | tee "$LOG" ;;
+      C_G512) CUDA_VISIBLE_DEVICES=$GPU GLORCQ_MIXTRAL_GRAPH=1 GLORCQ_MIXTRAL_IDXKERNEL=1 \
+             GLORCQ_PREFILL_DEQUANT=1 "$PY" "$ES" --model_path "$REAL_DIR" \
+             --batch_size 1 --prompt_len $PROMPT --gen_len 512 --max_seq_len 768 2>&1 | tee "$LOG" ;;
     esac
 done
 
