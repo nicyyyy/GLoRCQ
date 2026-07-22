@@ -372,14 +372,13 @@ def run_speed_benchmark(model, tokenizer, max_batch_size=1, max_seq_len=2048,
     print(f"  Batch size: {max_batch_size}")
     print(f"{'='*50}")
 
-    # Standard generation (no graph) — skipped in graph-only mode
-    std_tps = None
-    if not skip_standard:
-        print("\n[1/2] Standard generation (no CUDA Graph) ...")
+    import statistics
+
+    def _timed_std():
         torch.cuda.synchronize()
         t0 = time.time()
         with torch.no_grad():
-            std_out = model.generate(
+            model.generate(
                 input_ids,
                 attention_mask=attn_mask,
                 max_new_tokens=gen_len,
@@ -387,26 +386,46 @@ def run_speed_benchmark(model, tokenizer, max_batch_size=1, max_seq_len=2048,
                 do_sample=False,          # by gen_len, so a short gen inflates it
             )
         torch.cuda.synchronize()
-        t_std = time.time() - t0
+        return time.time() - t0
+
+    # Standard generation (no graph) — skipped in graph-only mode.
+    # Warmup 1 + median of 3: the FIRST pass after load pays kernel autotune /
+    # workspace allocs (observed inflating fp16 "Standard" vs its warm rerun by
+    # ~5-10%). Both paths use the same protocol so ratios are steady-state.
+    std_tps = None
+    if not skip_standard:
+        print("\n[1/2] Standard generation (no CUDA Graph; warmup 1 + median of 3) ...")
+        _ = _timed_std()                       # warmup (discard)
+        _ts = [_timed_std() for _ in range(3)]
+        t_std = statistics.median(_ts)
         std_tps = gen_len / t_std
-        print(f"  Time: {t_std:.3f}s, Speed: {std_tps:.1f} tok/s (per-seq; "
-              f"total {std_tps*max_batch_size:.1f})")
+        print(f"  Time: {t_std:.3f}s (median; all {[round(t,3) for t in _ts]}), "
+              f"Speed: {std_tps:.1f} tok/s (per-seq; total {std_tps*max_batch_size:.1f})")
     else:
         print("\n[1/2] Standard generation SKIPPED (graph-only mode)")
 
-    # CUDA Graph generation
+    # CUDA Graph generation (same warmup 1 + median of 3 protocol)
     print("\n[2/2] CUDA Graph generation ...")
     wrapper = GLoRCQGraphWrapper(model, max_batch_size=max_batch_size,
                                   max_seq_len=max_seq_len)
     wrapper.capture_graph()
+    graph_disabled = wrapper.graph is None   # e.g. Mixtral default: falls back
+                                             # to the SAME standard decode (warm)
 
     torch.cuda.synchronize()
-    graph_out, t_graph = wrapper.generate(input_ids,
-                                           max_new_tokens=gen_len)
+    _ = wrapper.generate(input_ids, max_new_tokens=gen_len)   # warmup (discard)
+    _tg = []
+    for _ in range(3):
+        _out, t_g = wrapper.generate(input_ids, max_new_tokens=gen_len)
+        _tg.append(t_g)
+    t_graph = statistics.median(_tg)
     graph_tps = gen_len / t_graph
 
-    print(f"  Time: {t_graph:.3f}s, Speed: {graph_tps:.1f} tok/s (per-seq; "
-          f"total {graph_tps*max_batch_size:.1f})")
+    _glabel = (" [graph DISABLED -> this is a warm STANDARD rerun, not a graph]"
+               if graph_disabled else "")
+    print(f"  Time: {t_graph:.3f}s (median; all {[round(t,3) for t in _tg]}), "
+          f"Speed: {graph_tps:.1f} tok/s (per-seq; total {graph_tps*max_batch_size:.1f})"
+          f"{_glabel}")
 
     # Summary
     speedup = (graph_tps / std_tps) if (std_tps and std_tps > 0) else 0
@@ -416,7 +435,7 @@ def run_speed_benchmark(model, tokenizer, max_batch_size=1, max_seq_len=2048,
         print(f"  Speedup:  {speedup:.2f}x")
     else:
         print(f"  Standard: (skipped)")
-    print(f"  Graph:    {graph_tps:.1f} tok/s")
+    print(f"  Graph:    {graph_tps:.1f} tok/s{_glabel}")
     print(f"{'='*50}")
 
     return {
