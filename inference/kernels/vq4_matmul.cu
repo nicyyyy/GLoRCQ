@@ -604,7 +604,7 @@ __global__ void vq4_dequant_grouped_gemv_indexed_kernel(
     const int32_t* __restrict__ sel,           // (G,) int32 — expert index per slot
     __half* __restrict__ y_cat,                // (G*N,) fp16
     int G, int N, int K, int n_cb, int codes_per_cb,
-    int blocks_per_expert)
+    int blocks_per_expert, int reorder_ok)
 {
     const int warp_id_in_block = threadIdx.x / 32;
     const int lane = threadIdx.x % 32;
@@ -658,6 +658,37 @@ __global__ void vq4_dequant_grouped_gemv_indexed_kernel(
                 acc2 = __hfma2(c23, x23, acc2);
             }
         }
+    } else if (reorder_ok && ((codes_per_row | codes_per_cb) & 3) == 0) {
+        // ILP variant (opt-in via reorder_ok): uint32 code loads (4/load), ONE
+        // cb_id divide per aligned-4 group, 4 independent accumulators to break
+        // the fma dependency chain and hide the data-dependent codebook-gather
+        // latency (the profiled bound; +5.5% e2e on Mixtral decode). REORDERS
+        // fp16 accumulation (per-lane partition + acc tree) -> NOT byte-identical
+        // with the scalar branch; callers wanting bit-exactness (DeepSeek) pass
+        // reorder_ok=0 and take the unchanged scalar loop below.
+        const uint32_t* codes_u32 = reinterpret_cast<const uint32_t*>(codes_row);
+        const int n_u32 = codes_per_row >> 2;
+        __half2 acc2a = __float2half2_rn(0.f), acc2b = __float2half2_rn(0.f);
+        __half2 acc2c = __float2half2_rn(0.f), acc2d = __float2half2_rn(0.f);
+        for (int k4 = lane; k4 < n_u32; k4 += 32) {
+            uint32_t cw   = __ldg(codes_u32 + k4);
+            const int k0  = k4 << 2;
+            const int cboff = (k0 / codes_per_cb) * K_CB;
+            int b0 = (cboff + ( cw        & 0xFF)) * 2;
+            int b1 = (cboff + ((cw >> 8)  & 0xFF)) * 2;
+            int b2 = (cboff + ((cw >> 16) & 0xFF)) * 2;
+            int b3 = (cboff + ((cw >> 24) & 0xFF)) * 2;
+            __half2 g0=cb_h2[b0], g1=cb_h2[b0+1], g2=cb_h2[b1], g3=cb_h2[b1+1];
+            __half2 g4=cb_h2[b2], g5=cb_h2[b2+1], g6=cb_h2[b3], g7=cb_h2[b3+1];
+            const int xo = k0 << 1;
+            __half2 x0=x_h2[xo],   x1=x_h2[xo+1], x2=x_h2[xo+2], x3=x_h2[xo+3];
+            __half2 x4=x_h2[xo+4], x5=x_h2[xo+5], x6=x_h2[xo+6], x7=x_h2[xo+7];
+            acc2a=__hfma2(g0,x0,acc2a); acc2a=__hfma2(g1,x1,acc2a);
+            acc2b=__hfma2(g2,x2,acc2b); acc2b=__hfma2(g3,x3,acc2b);
+            acc2c=__hfma2(g4,x4,acc2c); acc2c=__hfma2(g5,x5,acc2c);
+            acc2d=__hfma2(g6,x6,acc2d); acc2d=__hfma2(g7,x7,acc2d);
+        }
+        acc2 = __hadd2(__hadd2(acc2a, acc2b), __hadd2(acc2c, acc2d));
     } else {
         for (int k = lane; k < codes_per_row; k += 32) {
             int cb_id = k / codes_per_cb;
@@ -686,7 +717,8 @@ at::Tensor vq4_dequant_grouped_gemv_indexed_cuda(
     int64_t G,
     int64_t N,
     int64_t n_cb,
-    int64_t codes_per_cb)
+    int64_t codes_per_cb,
+    int64_t reorder_ok)
 {
     TORCH_CHECK(x_grouped.is_cuda(), "x_grouped must be CUDA");
     TORCH_CHECK(x_grouped.dtype() == torch::kHalf, "x_grouped must be fp16");
@@ -715,7 +747,8 @@ at::Tensor vq4_dequant_grouped_gemv_indexed_cuda(
         reinterpret_cast<const __half*>(centroids_all.data_ptr<at::Half>()),
         sel.data_ptr<int32_t>(),
         reinterpret_cast<__half*>(y_cat.data_ptr<at::Half>()),
-        (int)G, (int)N, K, (int)n_cb, (int)codes_per_cb, blocks_per_expert);
+        (int)G, (int)N, K, (int)n_cb, (int)codes_per_cb, blocks_per_expert,
+        (int)reorder_ok);
     return y_cat;
 }
 
@@ -1009,7 +1042,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("G"),
           pybind11::arg("N"),
           pybind11::arg("n_cb"),
-          pybind11::arg("codes_per_cb"));
+          pybind11::arg("codes_per_cb"),
+          pybind11::arg("reorder_ok") = 0);
     m.def("vq4_fused_gather_gemv", &vq4_fused_gather_gemv_cuda,
           "VQ4 fused gather + dequant + matmul (Walsh pre-done outside)",
           pybind11::arg("x_walshed"),

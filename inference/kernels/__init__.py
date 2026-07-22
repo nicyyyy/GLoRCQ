@@ -189,7 +189,7 @@ _HAS_VQ4_GROUPED_GEMV_INDEXED = (
 
 
 def vq4_dequant_grouped_gemv_indexed(x_grouped, codes_all, centroids_all, sel,
-                                     G, N, n_cb, codes_per_cb):
+                                     G, N, n_cb, codes_per_cb, reorder_ok=0):
     """Expert-INDEXED grouped VQ4 GEMV: gathers the top-k expert weights inside
     the kernel via `sel` (int32, (G,)), reading codes/centroids from the FULL
     stacked (E_full-expert) tensors — no explicit index_select copy.
@@ -198,6 +198,10 @@ def vq4_dequant_grouped_gemv_indexed(x_grouped, codes_all, centroids_all, sel,
         codes_all:     (E_full*N, K/vdim) uint8 — ALL experts
         centroids_all: (E_full*n_cb, K_CB, vdim) fp16 — ALL experts
         sel:           (G,) int32 — expert index per slot
+        reorder_ok:    1 => allow the faster ILP inner loop (uint32 code loads +
+                       4 accumulators). REORDERS fp16 accumulation, so NOT
+                       byte-identical with reorder_ok=0; callers needing bit
+                       exactness (DeepSeek) keep the default 0.
     Returns:
         y_cat:         (G*N,) fp16
     """
@@ -205,7 +209,7 @@ def vq4_dequant_grouped_gemv_indexed(x_grouped, codes_all, centroids_all, sel,
         raise RuntimeError("VQ4 indexed grouped GEMV not available")
     return _vq4_cuda_ext.vq4_dequant_grouped_gemv_indexed(
         x_grouped, codes_all, centroids_all, sel,
-        int(G), int(N), int(n_cb), int(codes_per_cb),
+        int(G), int(N), int(n_cb), int(codes_per_cb), int(reorder_ok),
     )
 
 

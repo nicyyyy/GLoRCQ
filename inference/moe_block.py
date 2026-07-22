@@ -1517,6 +1517,11 @@ class GraphCompatibleMoeBlock(nn.Module):
         if _use_idx:
             from inference.kernels import vq4_dequant_grouped_gemv_indexed
             sel_i32 = sel.to(torch.int32)
+            # ILP inner loop (uint32 loads + 4 accumulators, +5.5% e2e) reorders
+            # fp16 accumulation => enable for Mixtral only; DeepSeek keeps
+            # reorder_ok=0 = the unchanged scalar loop (bit-exact with its
+            # committed numbers).
+            _reorder_ok = 0 if self._deepseek else 1
         x_h = hidden_states.half()                         # (1, hidden)
 
         def _proj_gather(prefix, x_in):
@@ -1544,7 +1549,7 @@ class GraphCompatibleMoeBlock(nn.Module):
                 # reads the full (E*out_d) / (E*n_cb) tensors directly.
                 y = vq4_dequant_grouped_gemv_indexed(
                     x_rot, codes_all, cents_all, sel_i32,
-                    G, out_d, n_cb, cpcb).view(G, out_d)
+                    G, out_d, n_cb, cpcb, reorder_ok=_reorder_ok).view(G, out_d)
             else:
                 # Explicit index_select gather of top_k experts' codes/centroids.
                 codes_g = codes_all.view(E, out_d, cpr).index_select(0, sel) \

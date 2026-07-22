@@ -484,11 +484,20 @@ class GLoRCQLinear(nn.Module):
     def _dequant_gptq(self):
         """Dequantize GPTQ weights to fp16."""
         out_d, in_d = self.qweight_int.shape
-        W = torch.zeros(out_d, in_d, dtype=torch.float16, device=self.qweight_int.device)
         n_groups = self.scales.shape[1]
+        gs = self.gptq_groupsize
+        if in_d == n_groups * gs:
+            # Vectorized (no per-group python loop): same values as the loop.
+            q = self.qweight_int.view(out_d, n_groups, gs).half()
+            if self.gptq_sym:
+                W = q * self.scales.unsqueeze(2)
+            else:
+                W = (q - self.zeros.unsqueeze(2)) * self.scales.unsqueeze(2)
+            return W.reshape(out_d, in_d)
+        W = torch.zeros(out_d, in_d, dtype=torch.float16, device=self.qweight_int.device)
         for gi in range(n_groups):
-            col0 = gi * self.gptq_groupsize
-            col1 = min(col0 + self.gptq_groupsize, in_d)
+            col0 = gi * gs
+            col1 = min(col0 + gs, in_d)
             q_slice = self.qweight_int[:, col0:col1].half()
             if self.gptq_sym:
                 W[:, col0:col1] = q_slice * self.scales[:, gi:gi+1]
@@ -506,7 +515,14 @@ class GLoRCQLinear(nn.Module):
         # Accumulate the reduction in fp32: this fallback fires only for large-in_d
         # projections (e.g. Mixtral w2, in_d=14336) where an fp16-accumulated matmul
         # overflows fp16 range → inf → NaN. fp16 in/out but fp32 accumulation.
-        x_rot = (x[..., self.vq_perm_sigma].float() @ self.vq_diagI.float())
+        _pfd = os.environ.get("GLORCQ_PREFILL_DEQUANT", "0") == "1"
+        if _pfd:
+            # fp16 tensor-core rotation — the same dtype the fused-kernel path
+            # feeds (x.half()[..., sigma] @ diagI). ~8x faster than the fp32
+            # GEMM below for in_d=14336, x768 calls per prefill.
+            x_rot = x.half()[..., self.vq_perm_sigma] @ self.vq_diagI
+        else:
+            x_rot = (x[..., self.vq_perm_sigma].float() @ self.vq_diagI.float())
         if self.vq_codes is not None and self.vq_centroids is not None:
             # Rebuild Q from codes + centroids with ONE fused gather (the per-cb
             # python loop was ~n_cb kernel launches per call — a large share of
@@ -530,7 +546,7 @@ class GLoRCQLinear(nn.Module):
                 # 2x fp32 Q conversion + runs ~10x faster than fp32 sgemm.
                 return (x_rot.half() @ Q.T).float()
             return x_rot @ Q.float().T          # fp32 (caller casts at the very end)
-        return x_rot @ self.vq_Q_rotated.float().T   # fp32
+        return x_rot.float() @ self.vq_Q_rotated.float().T   # fp32
 
 
     def forward(self, x, precomputed_xU=None, precomputed_x_rot=None):
@@ -555,7 +571,11 @@ class GLoRCQLinear(nn.Module):
         # 1. Quantized weight matmul (S is pre-fused into SV, so no kernel-level
         # LoRA fusion needed — LoRA is always computed in Python below).
         if self.quant_type == "gptq":
-            if _HAS_GPTQ_FUSED_KERNEL:
+            # Prefill fast path (opt-in, same flag as vq4): dequant + cuBLAS for
+            # multi-token inputs — the fused kernel is a decode-shaped GEMV.
+            _pfd_gptq = (x.shape[0] > 4
+                         and os.environ.get("GLORCQ_PREFILL_DEQUANT", "0") == "1")
+            if _HAS_GPTQ_FUSED_KERNEL and not _pfd_gptq:
                 y = gptq_dequant_matmul_fused(
                     x, self.qweight_int, self.scales, self.zeros,
                     self.gptq_groupsize, self.gptq_sym, lora_USV=None)
