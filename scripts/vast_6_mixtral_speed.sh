@@ -98,6 +98,20 @@ fi
 # ── Download ──
 echo ""
 echo "===== [$(date)] Download Mixtral real-quant + fp16 base ====="
+# Disk precheck: fp16 base ~94GB + real 21GB (+ transient hub/xet cache). The
+# cache is cleaned after each download below, but you still need the headline
+# space. Bail early instead of dying mid-download with a full disk.
+FREE_GB=$(df -BG --output=avail "$WORK" | tail -1 | tr -dc '0-9')
+_want_fp16_pre=0; for c in $CONFIGS; do case "$c" in FP16*) _want_fp16_pre=1;; esac; done
+NEED_GB=30; [ "$_want_fp16_pre" = "1" ] && [ "${SKIP_FP16:-0}" != "1" ] && NEED_GB=130
+# already-downloaded base counts toward the need
+[ -d "$BASE_DIR" ] && NEED_GB=$((NEED_GB - $(du -sBG "$BASE_DIR" 2>/dev/null | tr -dc '0-9' || echo 0)))
+if [ -n "$FREE_GB" ] && [ "$FREE_GB" -lt "$NEED_GB" ]; then
+    echo "ERROR: only ${FREE_GB}GB free at $WORK but ~${NEED_GB}GB needed"
+    echo "       (fp16 Mixtral is ~94GB). Use a bigger-disk instance, free space,"
+    echo "       or run with SKIP_FP16=1 (real-quant only)."
+    exit 1
+fi
 if [ -f "$REAL_DIR/cross_layer_info.pt" ]; then
     echo "  real-quant present ($(du -sh "$REAL_DIR" 2>/dev/null | cut -f1))"
 else
@@ -113,6 +127,10 @@ if [ "$WANT_FP16" = "1" ] && [ "${SKIP_FP16:-0}" != "1" ]; then
         "$VIRTUAL_ENV/bin/huggingface-cli" download "$BASE_REPO" --local-dir "$BASE_DIR" --max-workers 8 "${TOKEN_ARGS[@]}" 2>&1 | tail -3
     fi
 fi
+# hf download to --local-dir ALSO fills the hub/xet cache with the same bytes —
+# on a tight disk that doubles the footprint. The local dirs are the source of
+# truth for the bench; drop the transient cache.
+rm -rf "$HF_HOME/xet" "$HF_HOME/hub" 2>/dev/null || true
 
 # ── Bench ──
 echo ""
