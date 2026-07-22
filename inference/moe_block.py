@@ -130,8 +130,26 @@ class GraphCompatibleMoeBlock(nn.Module):
         # Gated on self._deepseek so Mixtral's gather path is byte-identical; ON
         # by default for DeepSeek (disable with GLORCQ_DEEPSEEK_IDXKERNEL=0).
         self._use_vq4_idx_kernel = (
-            self._deepseek
-            and _os.environ.get("GLORCQ_DEEPSEEK_IDXKERNEL", "1") == "1")
+            (self._deepseek
+             and _os.environ.get("GLORCQ_DEEPSEEK_IDXKERNEL", "1") == "1")
+            # Mixtral (few-huge-expert): opt-in test of the in-kernel indexed
+            # gather in the gather path (drops the index_select copy of the HUGE
+            # expert codes). Default OFF (env-gated) => byte-identical unless set.
+            or (self.num_experts <= self._gather_graph_max_experts
+                and not self._deepseek
+                and _os.environ.get("GLORCQ_MIXTRAL_IDXKERNEL") == "1"))
+
+        # Few-huge-expert (Mixtral) STANDARD decode: run LoRA inline on the main
+        # stream instead of forking a side stream. At top_k<=2 the stream
+        # fork + event-sync overhead exceeds the overlap benefit at bs=1 (96
+        # fork/sync pairs/token). Numerically identical (same LoRA math/order,
+        # just main stream). Gated on num_experts<=16 so Qwen1.5(60)/Qwen3(128)/
+        # DeepSeek(64) keep the side-stream path BYTE-IDENTICAL.
+        # NOTE: benchmarked no speed gain for Mixtral (8.8->8.6, slightly worse) —
+        # default OFF; kept opt-in for experiments. Byte-identical either way.
+        self._inline_lora = (self.num_experts <= self._gather_graph_max_experts
+                             and not self._deepseek
+                             and _os.environ.get("GLORCQ_MIXTRAL_INLINE_LORA", "0") == "1")
 
         # Global U pool (shared across all layers, set by model_builder)
         self._global_pool_gate = None  # (hidden_dim, K_total * rank)
@@ -1109,12 +1127,18 @@ class GraphCompatibleMoeBlock(nn.Module):
         # Sa breaks cluster-parallel: any expert with Sa needs its own (x*Sa) @ U
         any_has_sa = any(experts_data[k].Sa is not None for k in range(K_exp))
 
-        # ---- Side stream: LoRA computation ----
-        side = self._get_side_stream()
+        # ---- LoRA computation: side stream, OR inline on main (few-huge Mixtral) ----
+        import contextlib
         lora_outs = [None] * K_exp
         lora_cat = None
+        if self._inline_lora:
+            side = None
+            _lora_ctx = contextlib.nullcontext()
+        else:
+            side = self._get_side_stream()
+            _lora_ctx = torch.cuda.stream(side)
 
-        with torch.cuda.stream(side):
+        with _lora_ctx:
             if all_same_cluster and all_have_sv and not any_has_sa:
                 cid = cids[0]
                 a = (xU_cache.get(proj_name) or {}).get(cid)
@@ -1194,7 +1218,8 @@ class GraphCompatibleMoeBlock(nn.Module):
             y_cat = torch.cat(y_pieces, dim=0)   # (K, out_d) if same, else concat
 
         # ---- Sync side stream and add LoRA ----
-        torch.cuda.current_stream().wait_stream(side)
+        if side is not None:
+            torch.cuda.current_stream().wait_stream(side)
 
         if lora_cat is not None:
             # lora_cat: (1, K*out_d) → reshape to (K, out_d)
@@ -1353,10 +1378,16 @@ class GraphCompatibleMoeBlock(nn.Module):
         all_have_sv = all(p.SV is not None for p in experts_data)
         any_has_sa = any(experts_data[k].Sa is not None for k in range(K_exp))
 
-        side = self._get_side_stream()
+        import contextlib
         lora_outs = [None] * K_exp
+        if self._inline_lora:
+            side = None
+            _lora_ctx = contextlib.nullcontext()
+        else:
+            side = self._get_side_stream()
+            _lora_ctx = torch.cuda.stream(side)
 
-        with torch.cuda.stream(side):
+        with _lora_ctx:
             if all_have_sv and all_same_cluster and p0.U is not None and not any_has_sa:
                 h_cat_lora = torch.cat(h_list, dim=0)     # (K, inter_d)
                 a_stacked = h_cat_lora @ p0.U             # (K, rank)
@@ -1404,7 +1435,8 @@ class GraphCompatibleMoeBlock(nn.Module):
                                           n_cb, codes_per_cb)
                 results.append(y_k)
 
-        torch.cuda.current_stream().wait_stream(side)
+        if side is not None:
+            torch.cuda.current_stream().wait_stream(side)
         for k in range(K_exp):
             if lora_outs[k] is not None:
                 results[k] = results[k] + lora_outs[k]

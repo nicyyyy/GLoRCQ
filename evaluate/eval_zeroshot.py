@@ -48,6 +48,12 @@ def main():
     parser.add_argument("--add_bos", action="store_true", default=False,
                         help="Prepend BOS (HFLM add_bos_token=True) — canonical "
                              "Table-1 protocol. Default off preserves prior behavior.")
+    parser.add_argument("--real_quant", action="store_true", default=False,
+                        help="Load via GLoRCQ real-quant path (cross_layer_info.pt). "
+                             "Needed for models too large to eval as fp16 fake-quant.")
+    parser.add_argument("--limit", type=float, default=None,
+                        help="Limit examples per task (int count or 0<frac<=1). "
+                             "For fast triage; omit for full eval.")
     args = parser.parse_args()
 
     from lm_eval import evaluator
@@ -57,7 +63,7 @@ def main():
 
     print(f"Loading fake-quant model from {args.model_path} ...")
     model, tokenizer = load_model_and_tokenizer(
-        args.model_path, device=args.device, real_quant=False,
+        args.model_path, device=args.device, real_quant=args.real_quant,
     )
 
     task_list = [t.strip() for t in args.tasks.split(",")]
@@ -72,6 +78,7 @@ def main():
         tasks=task_list,
         num_fewshot=args.num_fewshot,
         batch_size=args.batch_size,
+        limit=args.limit,
     )
 
     # Print summary table
