@@ -77,7 +77,7 @@ if [ "$HAS_IDX" != "1" ]; then
     # Search /usr/local AND conda envs for an nvcc whose release == torch's CUDA.
     NVCC_MATCH=""
     for n in $(which -a nvcc 2>/dev/null) "/usr/local/cuda-$TCUDA/bin/nvcc" \
-             /opt/conda/bin/nvcc /opt/conda/envs/*/bin/nvcc \
+             /opt/conda/bin/nvcc /opt/conda/envs/*/bin/nvcc /venv/*/bin/nvcc \
              "$HOME"/miniconda3/bin/nvcc "$HOME"/miniconda3/envs/*/bin/nvcc \
              "$HOME"/anaconda3/bin/nvcc "$HOME"/anaconda3/envs/*/bin/nvcc; do
         [ -x "$n" ] || continue
