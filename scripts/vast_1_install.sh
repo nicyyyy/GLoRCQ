@@ -93,6 +93,29 @@ echo "===== [$(date)] Build CUDA kernels ====="
 # setup.py bakes -gencode for sm_80/86/89/90 (A100/A6000/4090/H100/H200).
 # NOTE: TORCH_CUDA_ARCH_LIST is ignored (explicit gencodes win). For Blackwell
 # (sm_100/120) add the arch to the gencode list in inference/kernels/setup.py.
+#
+# torch's cpp_extension REFUSES to build if the nvcc major version mismatches
+# torch's CUDA (e.g. system nvcc 13.0 vs torch cu128). Auto-detect a matching
+# nvcc in /usr/local AND conda envs (install one with:
+#   conda create -n cuda128 -y -c nvidia cuda-toolkit=12.8 ).
+TCUDA=$($PY -c "import torch; print(torch.version.cuda or '')" 2>/dev/null)
+NVCC_MATCH=""
+for n in $(which -a nvcc 2>/dev/null) "/usr/local/cuda-$TCUDA/bin/nvcc" \
+         /opt/conda/bin/nvcc /opt/conda/envs/*/bin/nvcc \
+         "$HOME"/miniconda3/bin/nvcc "$HOME"/miniconda3/envs/*/bin/nvcc \
+         "$HOME"/anaconda3/bin/nvcc "$HOME"/anaconda3/envs/*/bin/nvcc; do
+    [ -x "$n" ] || continue
+    v=$("$n" --version 2>/dev/null | grep -oP 'release \K[0-9]+\.[0-9]+')
+    if [ -n "$TCUDA" ] && [ "$v" = "$TCUDA" ]; then NVCC_MATCH="$n"; break; fi
+done
+if [ -n "$NVCC_MATCH" ]; then
+    echo "  using matching CUDA $TCUDA nvcc: $NVCC_MATCH"
+    export CUDA_HOME="$(dirname "$(dirname "$NVCC_MATCH")")"
+    export PATH="$(dirname "$NVCC_MATCH"):$PATH"
+else
+    echo "  WARN: no nvcc matching torch CUDA $TCUDA found; build may fail on a"
+    echo "        version-mismatch. Install one: conda create -n cuda$( echo $TCUDA | tr -d . ) -y -c nvidia cuda-toolkit=$TCUDA"
+fi
 cd "$GLORCQ_ROOT/inference/kernels"
 $PY setup.py build_ext --inplace 2>&1 | tee /tmp/kernel_build.log | tail -8
 echo "---"

@@ -61,8 +61,14 @@ BASE_DIR=$CKPT_DIR/mixtral-fp16
 echo "===== [$(date)] Check CUDA kernel (vq4-indexed) ====="
 HAS_IDX=$("$PY" - <<'PYEOF' 2>/dev/null
 try:
+    import inspect
     from inference import kernels as k
-    print(1 if hasattr(getattr(k, "_vq4_cuda_ext", None), "vq4_dequant_grouped_gemv_indexed") else 0)
+    ok = hasattr(getattr(k, "_vq4_cuda_ext", None), "vq4_dequant_grouped_gemv_indexed")
+    # also require the r6 gptq kernel signature (reorder_ok) — an older .so has
+    # the vq4 symbol but a 7-arg gptq op, which would silently fall back to python
+    gp = getattr(k, "_gptq_cuda_ext", None)
+    ok = ok and gp is not None and "reorder_ok" in (gp.gptq_dequant_matmul.__doc__ or "")
+    print(1 if ok else 0)
 except Exception:
     print(0)
 PYEOF
