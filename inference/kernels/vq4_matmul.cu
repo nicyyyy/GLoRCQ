@@ -709,6 +709,90 @@ __global__ void vq4_dequant_grouped_gemv_indexed_kernel(
     if (lane == 0) y_cat[out_row] = __float2half(acc);
 }
 
+// No-smem-codebook variant for LARGE codebooks (Mixtral down n_cb=56: the
+// 112KB smem fill per 4-row block costs ~8x the useful code traffic and the
+// 143KB smem caps occupancy at 1 block/SM). Reads centroids straight from
+// GLOBAL (fully L2-resident at 112KB, broadcast-friendly); only x lives in
+// smem (28KB -> ~5 blocks/SM). Same values, same per-lane order and fma
+// sequence as the ILP branch => byte-identical to it.
+__global__ void vq4_dequant_grouped_gemv_indexed_nocb_kernel(
+    const __half* __restrict__ x_grouped,
+    const uint8_t* __restrict__ codes_all,
+    const __half* __restrict__ centroids_all,
+    const int32_t* __restrict__ sel,
+    __half* __restrict__ y_cat,
+    int G, int N, int K, int n_cb, int codes_per_cb,
+    int blocks_per_expert, int reorder_ok)
+{
+    const int warp_id_in_block = threadIdx.x / 32;
+    const int lane = threadIdx.x % 32;
+    const int slot_idx    = blockIdx.x / blocks_per_expert;
+    const int local_block = blockIdx.x % blocks_per_expert;
+    const int row_in_expert = local_block * WARPS_PER_BLOCK + warp_id_in_block;
+    if (slot_idx >= G) return;
+    const int src_expert = sel[slot_idx];
+    const int codes_per_row = K / VDIM;
+
+    extern __shared__ __half smem_h[];
+    __half* x_smem = smem_h;
+    const __half2* x_src = reinterpret_cast<const __half2*>(x_grouped) + (long long)slot_idx * (K/2);
+    __half2* x_dst = reinterpret_cast<__half2*>(x_smem);
+    for (int i = threadIdx.x; i < K/2; i += WARPS_PER_BLOCK * 32) x_dst[i] = x_src[i];
+    __syncthreads();
+
+    if (row_in_expert >= N) return;
+    const int src_row = src_expert * N + row_in_expert;
+    const int out_row = slot_idx  * N + row_in_expert;
+    const uint8_t* codes_row = codes_all + (long long)src_row * codes_per_row;
+    const __half2* cbg = reinterpret_cast<const __half2*>(centroids_all)
+                       + (long long)src_expert * ((long long)n_cb * K_CB * VDIM / 2);
+    const __half2* x_h2 = reinterpret_cast<const __half2*>(x_smem);
+
+    __half2 acc2 = __float2half2_rn(0.f);
+    if (reorder_ok && ((codes_per_row | codes_per_cb) & 3) == 0) {
+        const uint32_t* codes_u32 = reinterpret_cast<const uint32_t*>(codes_row);
+        const int n_u32 = codes_per_row >> 2;
+        __half2 acc2a = __float2half2_rn(0.f), acc2b = __float2half2_rn(0.f);
+        __half2 acc2c = __float2half2_rn(0.f), acc2d = __float2half2_rn(0.f);
+        for (int k4 = lane; k4 < n_u32; k4 += 32) {
+            uint32_t cw   = __ldg(codes_u32 + k4);
+            const int k0  = k4 << 2;
+            const int cboff = (k0 / codes_per_cb) * K_CB;
+            int b0 = (cboff + ( cw        & 0xFF)) * 2;
+            int b1 = (cboff + ((cw >> 8)  & 0xFF)) * 2;
+            int b2 = (cboff + ((cw >> 16) & 0xFF)) * 2;
+            int b3 = (cboff + ((cw >> 24) & 0xFF)) * 2;
+            __half2 g0=__ldg(cbg+b0), g1=__ldg(cbg+b0+1), g2=__ldg(cbg+b1), g3=__ldg(cbg+b1+1);
+            __half2 g4=__ldg(cbg+b2), g5=__ldg(cbg+b2+1), g6=__ldg(cbg+b3), g7=__ldg(cbg+b3+1);
+            const int xo = k0 << 1;
+            __half2 x0=x_h2[xo],   x1=x_h2[xo+1], x2=x_h2[xo+2], x3=x_h2[xo+3];
+            __half2 x4=x_h2[xo+4], x5=x_h2[xo+5], x6=x_h2[xo+6], x7=x_h2[xo+7];
+            acc2a=__hfma2(g0,x0,acc2a); acc2a=__hfma2(g1,x1,acc2a);
+            acc2b=__hfma2(g2,x2,acc2b); acc2b=__hfma2(g3,x3,acc2b);
+            acc2c=__hfma2(g4,x4,acc2c); acc2c=__hfma2(g5,x5,acc2c);
+            acc2d=__hfma2(g6,x6,acc2d); acc2d=__hfma2(g7,x7,acc2d);
+        }
+        acc2 = __hadd2(__hadd2(acc2a, acc2b), __hadd2(acc2c, acc2d));
+    } else {
+        for (int k = lane; k < codes_per_row; k += 32) {
+            int cb_id = k / codes_per_cb;
+            int code  = (int)codes_row[k];
+            int base  = (cb_id * K_CB + code) * 2;
+            __half2 c01 = __ldg(cbg + base);
+            __half2 c23 = __ldg(cbg + base + 1);
+            __half2 x01 = x_h2[k * 2 + 0];
+            __half2 x23 = x_h2[k * 2 + 1];
+            acc2 = __hfma2(c01, x01, acc2);
+            acc2 = __hfma2(c23, x23, acc2);
+        }
+    }
+    float acc = __half2float(__hadd(__low2half(acc2), __high2half(acc2)));
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+        acc += __shfl_down_sync(0xffffffff, acc, off);
+    if (lane == 0) y_cat[out_row] = __float2half(acc);
+}
+
 at::Tensor vq4_dequant_grouped_gemv_indexed_cuda(
     at::Tensor x_grouped,      // (G, K) fp16
     at::Tensor codes_all,      // (E_full*N, K/VDIM) uint8
@@ -737,6 +821,23 @@ at::Tensor vq4_dequant_grouped_gemv_indexed_cuda(
     dim3 block(WARPS_PER_BLOCK * 32);
     dim3 grid((int)G * blocks_per_expert);
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    if (n_cb >= 32) {
+        // LARGE codebook (Mixtral down n_cb=56): the per-block 112KB smem fill
+        // costs ~8x the useful code traffic and the 143KB smem caps occupancy
+        // at 1 block/SM. Read centroids from GLOBAL (fully L2-resident) instead;
+        // only x lives in smem. Byte-identical values/order. Small codebooks
+        // (gate/up n_cb=16, DeepSeek n_cb=11) keep the smem kernel — unaffected.
+        size_t smem_x = (size_t)K * sizeof(__half);
+        vq4_dequant_grouped_gemv_indexed_nocb_kernel<<<grid, block, smem_x, stream>>>(
+            reinterpret_cast<const __half*>(x_grouped.data_ptr<at::Half>()),
+            codes_all.data_ptr<uint8_t>(),
+            reinterpret_cast<const __half*>(centroids_all.data_ptr<at::Half>()),
+            sel.data_ptr<int32_t>(),
+            reinterpret_cast<__half*>(y_cat.data_ptr<at::Half>()),
+            (int)G, (int)N, K, (int)n_cb, (int)codes_per_cb, blocks_per_expert,
+            (int)reorder_ok);
+        return y_cat;
+    }
     size_t smem = (K + n_cb * K_CB * VDIM) * sizeof(__half);
     cudaFuncSetAttribute(
         vq4_dequant_grouped_gemv_indexed_kernel,
