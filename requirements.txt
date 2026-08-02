@@ -1,0 +1,14 @@
+# Install torch first, from the CUDA 12.4 wheel index (see install.sh):
+#   pip install torch==2.6.0 --index-url https://download.pytorch.org/whl/cu124
+transformers==4.51.3
+accelerate>=1.0.0
+datasets>=2.20.0
+safetensors
+lm-eval==0.4.11
+scikit-learn>=1.5.0
+matplotlib
+numpy
+tqdm
+sentencepiece
+# CUDA extension; needs nvcc matching the torch CUDA version (12.x)
+fast-hadamard-transform

@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+*.so
+outputs/
+.venv/
+inference/kernels/build/
